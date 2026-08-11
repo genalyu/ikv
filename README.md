@@ -8,7 +8,7 @@
 
 <h2 align="center">🔥 N<sub>0</sub>-TWAM Has Been Released! 🔥</h2>
 
-<p align="center"><strong>The pretrained checkpoint, inference server, and post-training toolkit are now available.</strong></p>
+<p align="center"><strong>The pretrained & post-trained checkpoint (simulation), inference server, and post-training toolkit are now available.</strong></p>
 
 $N_0$-TWAM is a Vision–Tactile–Action world-action model. Vision, tactile, and
 action are jointly modeled by a Mixture-of-Transformers (MoT) under a single
