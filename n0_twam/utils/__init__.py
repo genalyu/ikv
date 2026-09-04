@@ -3,8 +3,16 @@ from .logging import init_logger, logger
 from .scheduler import FlowMatchScheduler
 from .server_utils import run_async_server_mode
 from .utils import data_seq_to_patch, get_mesh_id, save_async, sample_timestep_id, warmup_constant_lambda, warmup_cosine_lambda
+from .geometry import (
+    backproject_pixels,
+    project_points,
+    relative_camera_transform,
+    reproject_current_grid_to_previous,
+)
 
 __all__ = [
     'logger', 'init_logger', 'get_mesh_id', 'save_async', 'data_seq_to_patch', 'warmup_cosine_lambda',
-    'FlowMatchScheduler', 'run_async_server_mode', 'sample_timestep_id', 'warmup_constant_lambda'
+    'FlowMatchScheduler', 'run_async_server_mode', 'sample_timestep_id',
+    'warmup_constant_lambda', 'backproject_pixels', 'project_points',
+    'relative_camera_transform', 'reproject_current_grid_to_previous',
 ]

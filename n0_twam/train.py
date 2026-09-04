@@ -49,7 +49,25 @@ import gc
 
 
 class Trainer:
+    @staticmethod
+    def _validate_rgb_motion_training_config(config):
+        """Reject RGB-motion training configurations that cannot be served.
+
+        Sparse video padding and the semantic K/V sidecar are implemented by
+        the MoT shared-attention cache.  Letting a dense/legacy backbone train
+        with sparse RGB tokens would produce a checkpoint that the server must
+        reject later, after an expensive training run.
+        """
+        if (bool(getattr(config, 'use_rgb_motion_tokens', False))
+                and not bool(getattr(config, 'use_mot', False))):
+            raise ValueError(
+                "use_rgb_motion_tokens=True requires use_mot=True: the RGB "
+                "path relies on the Video/Tactile/Action experts and their "
+                "shared-attention semantic KV sidecar."
+            )
+
     def __init__(self, config, inference_only=False):
+        self._validate_rgb_motion_training_config(config)
         if config.enable_wandb and config.rank == 0 and not inference_only:
             # self-hosted wandb via WANDB_BASE_URL/WANDB_API_KEY; else standard wandb.ai
             if os.getenv('WANDB_BASE_URL') and os.getenv('WANDB_API_KEY'):
@@ -129,6 +147,9 @@ class Trainer:
             contact_gate_layers=int(getattr(config, 'contact_gate_layers', 2)),
             contact_gate_heads=int(getattr(config, 'contact_gate_heads', 8)),
             contact_gate_stop_grad=bool(getattr(config, 'contact_gate_stop_grad', True)),
+            use_rgb_motion_tokens=bool(getattr(config, 'use_rgb_motion_tokens', False)),
+            rgb_motion_require_index=bool(getattr(
+                config, 'rgb_motion_require_index', True)),
         )
         if bool(getattr(config, 'use_mot', False)):
             # Mixture-of-Transformers: 3 per-modality experts warm-started from the
@@ -153,7 +174,8 @@ class Trainer:
                     k: _mot_kwargs[k]
                     for k in ('use_local_tactile', 'use_contact_gate',
                               'contact_gate_layers', 'contact_gate_heads',
-                              'contact_gate_stop_grad')
+                              'contact_gate_stop_grad', 'use_rgb_motion_tokens',
+                              'rgb_motion_require_index')
                     if k in _mot_kwargs
                 }
                 self.transformer = load_mot_checkpoint(
@@ -391,6 +413,19 @@ class Trainer:
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
+        # RGB-motion sidecar.  These tensors remain metadata; the transformer
+        # only uses the indices/valid mask to gather the *existing* WAN content
+        # embeddings.  DINO/NeoForce/source are retained independently for
+        # semantic cache management and are never folded into the value tensor.
+        for key in (
+            'rgb_motion_patch_indices', 'rgb_motion_indices',
+            'rgb_motion_valid_mask', 'motion_indices', 'motion_valid_mask',
+            'world_time_id', 'dino_features', 'neoforce_features',
+            'observation_flag', 'visual_valid', 'tactile_valid',
+            'motion_scores', 'camera_ids', 'patch_uv',
+        ):
+            if key in batch_dict:
+                latent_dict[key] = batch_dict[key]
         # Tactile inputs (shared CFG-drop mechanism):
         #   - tactile_cond_drop is explicit CFG dropout; when set, no tactile
         #     tensors are passed to the model so tactile modules get no grad
@@ -484,6 +519,108 @@ class Trainer:
 
     def _compute_latent_loss(self, input_dict, latent_pred):
         latent_target = input_dict['latent_dict']['targets']
+        latent_dict = input_dict['latent_dict']
+        motion_local = latent_dict.get('rgb_motion_patch_indices')
+        if motion_local is None:
+            motion_local = latent_dict.get('motion_indices')
+        motion_flat = latent_dict.get('rgb_motion_indices')
+        if motion_local is not None or motion_flat is not None:
+            # Sparse RGB supervision.  proj_out still emits the original WAN
+            # patch payload (one C-vector per p_t*p_h*p_w latent cell); compare
+            # it only with the gathered dense FlowMatch targets.  DINO,
+            # NeoForce and observed/predicted remain index metadata and are not
+            # mixed into this content loss.
+            B, C, F_lat, H_lat, W_lat = latent_target.shape
+            p_t, p_h, p_w = self.patch_size
+            Fp, Hp, Wp = F_lat // p_t, H_lat // p_h, W_lat // p_w
+            spatial = Hp * Wp
+            patch_volume = p_t * p_h * p_w
+
+            if motion_flat is None:
+                idx = motion_local
+                if idx.dim() == 2 and B == 1:
+                    idx = idx.unsqueeze(0)
+                valid = latent_dict.get('rgb_motion_valid_mask')
+                if valid is None:
+                    valid = latent_dict.get('motion_valid_mask')
+                valid = ((idx >= 0) if valid is None else
+                         valid.to(torch.bool) & (idx >= 0))
+                bad = valid & ((idx < 0) | (idx >= spatial))
+                if bad.any():
+                    raise IndexError(
+                        f"RGB-motion spatial index out of range [0,{spatial}): "
+                        f"{idx[bad][:8].tolist()}")
+                frame = torch.arange(Fp, device=idx.device)[None, :, None].expand_as(idx)
+                safe_idx = torch.where(valid, idx, torch.zeros_like(idx))
+                flat_idx = (frame * spatial + safe_idx).reshape(B, -1)
+                frame = frame.reshape(B, -1)
+                valid = valid.reshape(B, -1)
+            else:
+                flat_idx = motion_flat
+                if flat_idx.dim() == 1 and B == 1:
+                    flat_idx = flat_idx.unsqueeze(0)
+                valid = latent_dict.get('rgb_motion_valid_mask')
+                if valid is None:
+                    valid = latent_dict.get('motion_valid_mask')
+                valid = ((flat_idx >= 0) if valid is None else
+                         valid.reshape_as(flat_idx).to(torch.bool) & (flat_idx >= 0))
+                total = Fp * spatial
+                bad = valid & ((flat_idx < 0) | (flat_idx >= total))
+                if bad.any():
+                    raise IndexError(
+                        f"RGB-motion flattened index out of range [0,{total}): "
+                        f"{flat_idx[bad][:8].tolist()}")
+                flat_idx = torch.where(
+                    valid, flat_idx, torch.zeros_like(flat_idx))
+                frame = flat_idx // spatial
+
+            target_patches = rearrange(
+                latent_target,
+                'b c (f pt) (h ph) (w pw) -> b (f h w) (pt ph pw) c',
+                pt=p_t, ph=p_h, pw=p_w)
+            gather_idx = flat_idx[:, :, None, None].expand(
+                -1, -1, patch_volume, C)
+            target_patches = torch.gather(target_patches, 1, gather_idx)
+            pred_patches = latent_pred.reshape(B, flat_idx.shape[1],
+                                               patch_volume, C)
+            if pred_patches.shape != target_patches.shape:
+                raise ValueError(
+                    "Sparse RGB prediction/target mismatch: "
+                    f"pred={tuple(pred_patches.shape)} "
+                    f"target={tuple(target_patches.shape)}")
+
+            per_element = F.mse_loss(
+                pred_patches.float(), target_patches.float().detach(),
+                reduction='none')
+            per_patch = per_element.mean(dim=(-1, -2))
+            Bn, Fn = latent_dict['timesteps'].shape
+            frame_weight = self.train_scheduler_latent.training_weight(
+                latent_dict['timesteps'].flatten()).reshape(Bn, Fn)
+            if not bool(valid.any()):
+                return latent_pred.sum().float() * 0.0
+
+            # Preserve the legacy loss scale: first average selected patches
+            # inside each (batch, frame), multiply by that frame's scheduler
+            # weight, then average the active frames.  Consequently selecting
+            # every WAN patch is exactly the dense objective; normalising by
+            # the *sum of weights* would silently change that objective.
+            frame = frame.clamp(min=0, max=Fn - 1)
+            linear_frame = (
+                torch.arange(B, device=frame.device)[:, None] * Fn + frame
+            ).reshape(-1)
+            flat_valid = valid.reshape(-1)
+            frame_error_sum = per_patch.new_zeros(B * Fn)
+            frame_patch_count = per_patch.new_zeros(B * Fn)
+            frame_error_sum.scatter_add_(
+                0, linear_frame[flat_valid], per_patch.reshape(-1)[flat_valid])
+            frame_patch_count.scatter_add_(
+                0, linear_frame[flat_valid],
+                torch.ones_like(per_patch.reshape(-1)[flat_valid]))
+            active = frame_patch_count > 0
+            frame_error = frame_error_sum / frame_patch_count.clamp_min(1)
+            weighted = frame_error * frame_weight.reshape(-1)
+            return weighted[active].mean()
+
         # Transformer video output is a patch sequence:
         #   latent_pred_seq: [B, N_video_tokens, C_patch]
         # Convert it back to dense FlowMatch target layout:
@@ -738,6 +875,14 @@ class Trainer:
                     'use_local_tactile': bool(getattr(_c, 'use_local_tactile', False)),
                     'local_tactile_mode': getattr(_c, 'local_tactile_mode', None),
                     'tactile_global_zero': bool(getattr(_c, 'tactile_global_zero', False)),
+                    'use_rgb_motion_tokens': bool(getattr(
+                        _c, 'use_rgb_motion_tokens', False)),
+                    'rgb_motion_require_index': bool(getattr(
+                        _c, 'rgb_motion_require_index', True)),
+                    'rgb_motion_max_tokens': int(getattr(
+                        _c, 'rgb_motion_max_tokens', 32)),
+                    'patch_size': [int(v) for v in getattr(
+                        _c, 'patch_size', (1, 2, 2))],
                     'obs_cam_keys': list(getattr(_c, 'obs_cam_keys', [])),
                     'tactile_keys': list(getattr(_c, 'tactile_keys', [])),
                     'eval_prompt': getattr(_c, 'eval_prompt', None),

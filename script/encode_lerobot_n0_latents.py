@@ -33,6 +33,10 @@ if str(REPO_ROOT) not in sys.path:
 from n0_twam.models.utils import load_text_encoder, load_tokenizer, load_vae
 
 
+WAN_TEMPORAL_PROVENANCE_SCHEMA_VERSION = 1
+WAN_CAUSAL_ANCHOR_SEMANTICS = "causal_chunk_end"
+
+
 @dataclass
 class EpisodeRequest:
     episode_index: int
@@ -197,6 +201,71 @@ def ensure_complete(frames: Iterable) -> None:
         raise RuntimeError("Missing decoded frame while collecting sampled video frames")
 
 
+def build_wan_temporal_provenance(
+    frame_ids: Iterable[int],
+    latent_num_frames: int,
+    temporal_stride: int,
+) -> dict:
+    """Bind each causal WAN latent token to its latest source video frame.
+
+    ``AutoencoderKLWan._encode`` encodes the first video frame alone, then
+    consumes causal chunks of ``scale_factor_temporal`` frames.  A latent token
+    therefore summarizes history ending at raw input positions
+    ``0, stride, 2*stride, ...``; it is not a copy of that single image.  This
+    helper records both those positions and their episode-local ``frame_ids``.
+
+    The shape checks are intentionally strict.  If a different VAE produces a
+    different temporal layout, this encoder must learn that layout explicitly
+    rather than writing plausible-looking but unverified anchors.
+    """
+    source_frame_ids = [int(frame_id) for frame_id in frame_ids]
+    latent_num_frames = int(latent_num_frames)
+    temporal_stride = int(temporal_stride)
+    if latent_num_frames < 1:
+        raise ValueError(
+            f"latent_num_frames must be positive, got {latent_num_frames}"
+        )
+    if temporal_stride < 1:
+        raise ValueError(f"temporal_stride must be positive, got {temporal_stride}")
+
+    expected_video_frames = 1 + (latent_num_frames - 1) * temporal_stride
+    if len(source_frame_ids) != expected_video_frames:
+        raise RuntimeError(
+            "WAN temporal layout is not the expected first-frame-plus-causal-"
+            f"chunks schedule: video frames={len(source_frame_ids)}, latent "
+            f"frames={latent_num_frames}, temporal stride={temporal_stride}, "
+            f"expected video frames={expected_video_frames}. Refusing to guess "
+            "latent anchors."
+        )
+
+    anchor_indices = [index * temporal_stride for index in range(latent_num_frames)]
+    anchor_frame_ids = [source_frame_ids[index] for index in anchor_indices]
+    return {
+        "schema_version": WAN_TEMPORAL_PROVENANCE_SCHEMA_VERSION,
+        "anchor_semantics": WAN_CAUSAL_ANCHOR_SEMANTICS,
+        "temporal_stride": temporal_stride,
+        "latent_anchor_indices": anchor_indices,
+        "latent_anchor_frame_ids": anchor_frame_ids,
+    }
+
+
+def _vae_temporal_stride(vae) -> int:
+    value = getattr(vae.config, "scale_factor_temporal", None)
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(
+            "Wan VAE config.scale_factor_temporal must be an integer so latent "
+            "frame anchors can be recorded without guessing"
+        )
+    stride = int(value)
+    if stride != 4:
+        raise ValueError(
+            "encode_lerobot_n0_latents.py samples first-frame-plus-4-frame "
+            "chunks, but the loaded VAE declares scale_factor_temporal="
+            f"{stride}. Refusing to write unverified temporal provenance."
+        )
+    return stride
+
+
 def extract_episode_frames(
     request: EpisodeRequest,
     width: int,
@@ -252,11 +321,17 @@ def extract_episode_frames(
 
 def encode_video(
     frames: list,
+    frame_ids: list[int],
     vae,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, int, int, int]:
+) -> tuple[torch.Tensor, int, int, int, dict]:
     ensure_complete(frames)
+    if len(frames) != len(frame_ids):
+        raise ValueError(
+            f"frames and frame_ids must have equal length, got {len(frames)} "
+            f"and {len(frame_ids)}"
+        )
     video = torch.from_numpy(np.stack(frames)).permute(3, 0, 1, 2).unsqueeze(0)
     video = video.to(torch.float32) / 127.5 - 1.0
     with torch.no_grad():
@@ -264,7 +339,18 @@ def encode_video(
         latents = normalize_latents(posterior.mean, vae)[0]
     latent_num_frames, latent_height, latent_width = latents.shape[1:]
     flat_latent = rearrange(latents, "c f h w -> (f h w) c").contiguous().cpu()
-    return flat_latent, latent_num_frames, latent_height, latent_width
+    temporal_provenance = build_wan_temporal_provenance(
+        frame_ids,
+        latent_num_frames,
+        _vae_temporal_stride(vae),
+    )
+    return (
+        flat_latent,
+        latent_num_frames,
+        latent_height,
+        latent_width,
+        temporal_provenance,
+    )
 
 
 def maybe_write_episodes_jsonl(dataset_root: Path, episodes_df: pd.DataFrame) -> None:
@@ -408,8 +494,15 @@ def main() -> None:
                 target_fps=args.target_fps,
                 ori_fps=ori_fps,
             )
-            flat_latent, latent_num_frames, latent_height, latent_width = encode_video(
+            (
+                flat_latent,
+                latent_num_frames,
+                latent_height,
+                latent_width,
+                temporal_provenance,
+            ) = encode_video(
                 frames=frames,
+                frame_ids=local_frame_ids,
                 vae=vae,
                 device=device,
                 dtype=dtype,
@@ -434,6 +527,7 @@ def main() -> None:
                 "text_emb": text_emb.to(torch.bfloat16),
                 "text": request.prompt,
                 "frame_ids": list(local_frame_ids),
+                "temporal_provenance": temporal_provenance,
                 "start_frame": 0,
                 "end_frame": int(request.length),
                 "fps": int(args.target_fps),

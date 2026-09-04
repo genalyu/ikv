@@ -132,18 +132,37 @@ class FlexAttnFunc(nn.Module):
         tactile_noisy_token_length=0,  # symdiff-tactile only: noisy half
         include_action_tokens=True,
         tactile_grid_shape=None,       # (B, S, Fp, Hp, Wp) → frame-aligned tactile
+        latent_token_frame_ids=None,   # optional sparse video layout: (B, N)
+        latent_token_valid_mask=None,  # optional sparse video padding mask: (B, N)
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
         _, _, A_F, A_H, A_W = action_shape
 
-        latent_seq_id = torch.arange(B)[:, None, None, None].\
-            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
-        # latent_frame_id must be ONE entry per latent TOKEN (temporal token count =
-        # L_F // patch_size[0]), to match latent_seq_id's length. arange(L_F) only
-        # matched because patch_size[0]==1; use the patched temporal count so a future
-        # temporal patch (patch_size[0]>1) can't desync the id-tensor lengths.
-        latent_frame_id = torch.arange(L_F // patch_size[0])[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
+        if latent_token_frame_ids is None:
+            latent_seq_id = torch.arange(B)[:, None, None, None].\
+                expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
+            # latent_frame_id must be ONE entry per latent TOKEN (temporal token count =
+            # L_F // patch_size[0]), to match latent_seq_id's length. arange(L_F) only
+            # matched because patch_size[0]==1; use the patched temporal count so a future
+            # temporal patch (patch_size[0]>1) can't desync the id-tensor lengths.
+            latent_frame_id = torch.arange(L_F // patch_size[0])[None, :, None, None].expand(
+                B, -1, L_H // patch_size[1], L_W // patch_size[2]).flatten()
+        else:
+            # RGB-motion path: video tokens were gathered from the dense WAN grid,
+            # so their count is no longer F*H*W.  The caller supplies one frame id
+            # per gathered token and (when a batch is padded) an explicit validity
+            # mask.  Keep the packed-batch convention used by the dense path:
+            # sample 0 tokens, then sample 1 tokens, ... .
+            latent_token_frame_ids = latent_token_frame_ids.reshape(B, -1).to("cpu")
+            sparse_n = latent_token_frame_ids.shape[1]
+            latent_seq_id = torch.arange(B)[:, None].expand(-1, sparse_n)
+            if latent_token_valid_mask is not None:
+                valid = latent_token_valid_mask.reshape(B, sparse_n).to(
+                    device=latent_seq_id.device, dtype=torch.bool)
+                latent_seq_id = latent_seq_id.masked_fill(~valid, -1)
+            latent_seq_id = latent_seq_id.flatten()
+            latent_frame_id = latent_token_frame_ids.flatten()
         seq_ids = torch.cat([latent_seq_id] * 2)
         frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2)
         noise_ids = torch.cat(
@@ -958,13 +977,22 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  use_contact_gate=False,
                  contact_gate_layers=2,
                  contact_gate_heads=8,
-                 contact_gate_stop_grad=True):
+                 contact_gate_stop_grad=True,
+                 use_rgb_motion_tokens=False,
+                 rgb_motion_require_index=True):
         super().__init__()
         self.patch_size = patch_size
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         self.tactile_num_tokens = tactile_num_tokens
         self.max_tactile_streams = max_tactile_streams
+        # Optional sparse-RGB path.  This does not add an "index embedding" to
+        # the original WAN content embedding: it only gathers selected WAN patch
+        # embeddings before the experts.  The semantic index
+        # {world_time, DINO, NeoForce, observed/predicted} travels separately as
+        # cache metadata (see rgb_motion.py / semantic_cache.py).
+        self.use_rgb_motion_tokens = bool(use_rgb_motion_tokens)
+        self.rgb_motion_require_index = bool(rgb_motion_require_index)
         # use_local_tactile: build + use the LocalTactile cross-attn branch into the
         # action head. Default True (existing ckpts have it). Set False for pretrain
         # (GlobalTactile alone) — then post-train flips it on and the branch is
@@ -1106,7 +1134,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                       self.num_attention_heads,
                                       self.attention_head_dim, device, dtype, batch_size)
     
-    def _input_embed(self, latents, input_type='latent'):
+    def _input_embed(self, latents, input_type='latent', motion_layout=None):
         if input_type == 'latent':
             hidden_states = rearrange(
                 latents,
@@ -1114,6 +1142,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 p1=self.patch_size[0],
                 p2=self.patch_size[1],
                 p3=self.patch_size[2])
+            # Gather raw WAN patches *before* the existing input projection.
+            # This is mathematically equivalent to gathering projected tokens
+            # (the projection is token-wise), but also avoids doing the Linear
+            # on static regions and follows the explicit RGB-motion data flow.
+            hidden_states = self._gather_rgb_motion_tokens(
+                hidden_states, motion_layout)
             hidden_states = self.patch_embedding_mlp(hidden_states)
         elif input_type == 'action':
             hidden_states = rearrange(latents, 'b c f h w -> b (f h w) c')
@@ -1123,6 +1157,289 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         else:
             raise ValueError(f"Unsupported input type: {input_type}")
         return hidden_states
+
+    def _rgb_motion_layout(self, latent_dict, latent_shape):
+        """Normalise RGB-motion indices without touching the token content.
+
+        Two on-disk/caller layouts are accepted:
+
+        * ``rgb_motion_patch_indices`` / ``motion_indices`` with shape
+          ``(B,F,K)``: indices are local to an H'×W' transformer-patch grid.
+        * ``rgb_motion_indices`` with shape ``(B,N)``: indices already address
+          the flattened ``(F,H',W')`` grid.
+
+        ``-1`` is padding.  Returning the frame id separately is important: the
+        sparse attention mask must retain the dense model's temporal causality.
+        Index metadata (DINO/NeoForce/source) is deliberately not consumed here;
+        it remains a sidecar and therefore cannot alter the original WAN content
+        embedding or value projection.
+        """
+        if not self.use_rgb_motion_tokens:
+            return None
+
+        local = latent_dict.get('rgb_motion_patch_indices')
+        if local is None:
+            local = latent_dict.get('motion_indices')
+        flat = latent_dict.get('rgb_motion_indices')
+        if (local is None) == (flat is None):
+            raise KeyError(
+                "use_rgb_motion_tokens=True requires exactly one of "
+                "'rgb_motion_patch_indices'/'motion_indices' (B,F,K local "
+                "spatial indices) and 'rgb_motion_indices' (B,N flattened "
+                "indices).")
+
+        B, _, F_lat, H_lat, W_lat = latent_shape
+        p_f, p_h, p_w = self.patch_size
+        Fp, Hp, Wp = F_lat // p_f, H_lat // p_h, W_lat // p_w
+        spatial = Hp * Wp
+        total = Fp * spatial
+        device = latent_dict['noisy_latents'].device
+
+        def _integer_tensor(value, name, check_mask=None):
+            tensor = torch.as_tensor(value, device=device)
+            if tensor.dtype == torch.bool or tensor.is_complex():
+                raise TypeError(f"{name} must contain integer values")
+            checked = tensor if check_mask is None else tensor[check_mask]
+            if torch.is_floating_point(tensor) and checked.numel():
+                if (not torch.isfinite(checked).all()
+                        or not torch.equal(checked, checked.round())):
+                    raise ValueError(
+                        f"{name} must contain finite integer values")
+            if check_mask is not None:
+                tensor = torch.where(check_mask, tensor, torch.zeros_like(tensor))
+            return tensor.long()
+
+        def _binary_tensor(value, name, check_mask=None):
+            tensor = torch.as_tensor(value, device=device)
+            if tensor.is_complex():
+                raise ValueError(f"{name} must contain only 0 or 1")
+            checked = tensor if check_mask is None else tensor[check_mask]
+            if checked.numel() and not torch.all(
+                    (checked == 0) | (checked == 1)):
+                raise ValueError(f"{name} must contain only 0 or 1")
+            return tensor.bool()
+
+        if flat is None:
+            local = _integer_tensor(local, 'rgb motion local indices')
+            if local.dim() == 2 and B == 1:
+                local = local.unsqueeze(0)
+            if local.dim() != 3 or local.shape[0] != B or local.shape[1] != Fp:
+                raise ValueError(
+                    "rgb motion local indices must have shape "
+                    f"({B}, {Fp}, K), got {tuple(local.shape)}")
+            valid = latent_dict.get('rgb_motion_valid_mask')
+            if valid is None:
+                valid = latent_dict.get('motion_valid_mask')
+            if valid is None:
+                valid = local >= 0
+            else:
+                valid = _binary_tensor(valid, 'rgb_motion_valid_mask')
+                if valid.dim() == 2 and B == 1:
+                    valid = valid.unsqueeze(0)
+                if valid.shape != local.shape:
+                    raise ValueError(
+                        "rgb_motion_valid_mask must match local indices: "
+                        f"{tuple(valid.shape)} vs {tuple(local.shape)}")
+                valid = valid & (local >= 0)
+            bad = valid & ((local < 0) | (local >= spatial))
+            if bad.any():
+                raise IndexError(
+                    f"RGB-motion spatial index out of range [0,{spatial}): "
+                    f"{local[bad][:8].tolist()}")
+            for batch_index in range(B):
+                for frame_index in range(Fp):
+                    selected = local[
+                        batch_index, frame_index, valid[batch_index, frame_index]
+                    ]
+                    if selected.numel() != torch.unique(selected).numel():
+                        raise ValueError(
+                            "RGB-motion local indices contain duplicate valid "
+                            f"addresses at batch={batch_index}, frame={frame_index}")
+            frame = torch.arange(Fp, device=local.device)[None, :, None].expand_as(local)
+            # torch.gather validates every address before the result can be
+            # masked.  Canonicalise *all* invalid slots, including callers that
+            # use an explicit validity mask with a stale positive index, to a
+            # safe per-frame address.  A valid out-of-range address was already
+            # rejected above.
+            safe_local = torch.where(valid, local, torch.zeros_like(local))
+            flat = frame * spatial + safe_local
+            flat = flat.reshape(B, -1)
+            frame = frame.reshape(B, -1)
+            valid = valid.reshape(B, -1)
+            source_prefix = tuple(local.shape)
+        else:
+            flat = _integer_tensor(flat, 'rgb_motion_indices')
+            if flat.dim() == 1 and B == 1:
+                flat = flat.unsqueeze(0)
+            if flat.dim() != 2 or flat.shape[0] != B:
+                raise ValueError(
+                    f"rgb_motion_indices must have shape ({B}, N), got "
+                    f"{tuple(flat.shape)}")
+            valid = latent_dict.get('rgb_motion_valid_mask')
+            if valid is None:
+                valid = latent_dict.get('motion_valid_mask')
+            if valid is None:
+                valid = flat >= 0
+            else:
+                valid = _binary_tensor(valid, 'rgb_motion_valid_mask')
+                if valid.dim() == 1 and B == 1:
+                    valid = valid.unsqueeze(0)
+                if valid.shape != flat.shape:
+                    raise ValueError(
+                        "rgb_motion_valid_mask must match flattened indices: "
+                        f"{tuple(valid.shape)} vs {tuple(flat.shape)}")
+                valid = valid & (flat >= 0)
+            bad = valid & (flat >= total)
+            if bad.any():
+                raise IndexError(
+                    f"RGB-motion flattened index out of range [0,{total}): "
+                    f"{flat[bad][:8].tolist()}")
+            for batch_index in range(B):
+                selected = flat[batch_index, valid[batch_index]]
+                if selected.numel() != torch.unique(selected).numel():
+                    raise ValueError(
+                        "RGB-motion flattened indices contain duplicate valid "
+                        f"addresses at batch={batch_index}")
+            # As above, invalid entries still have to be legal gather addresses.
+            # Do not merely clamp the lower bound: an explicitly invalid stale
+            # positive index may also exceed the dense token count.
+            flat = torch.where(valid, flat, torch.zeros_like(flat))
+            frame = flat // spatial
+            source_prefix = tuple(flat.shape)
+
+        semantic = None
+        semantic_names = (
+            'world_time_id', 'dino_features', 'neoforce_features',
+            'observation_flag', 'visual_valid', 'tactile_valid')
+        present = [name in latent_dict for name in semantic_names]
+        if any(present) or self.rgb_motion_require_index:
+            missing = [name for name, exists in zip(semantic_names, present)
+                       if not exists]
+            if missing:
+                raise KeyError(
+                    "RGB-motion semantic index is incomplete; missing "
+                    f"{missing}. Required index is "
+                    "{world_time_id,DINO,NeoForce,observation_flag} plus "
+                    "visual/tactile presence masks.")
+
+            def _scalar(name):
+                value = torch.as_tensor(latent_dict[name], device=flat.device)
+                if tuple(value.shape) != source_prefix:
+                    raise ValueError(
+                        f"{name} must match motion index layout {source_prefix}, "
+                        f"got {tuple(value.shape)}")
+                return value.reshape(B, -1)
+
+            def _feature(name):
+                value = torch.as_tensor(latent_dict[name], device=flat.device)
+                if value.dim() != len(source_prefix) + 1 or tuple(
+                        value.shape[:-1]) != source_prefix:
+                    raise ValueError(
+                        f"{name} must have shape {source_prefix}+(D,), got "
+                        f"{tuple(value.shape)}")
+                if value.is_complex():
+                    raise TypeError(f"{name} must be real-valued")
+                if not torch.is_floating_point(value):
+                    value = value.float()
+                # Spell out the token count: reshape(B, -1, 0) is ambiguous
+                # for the valid RGB-only representation NeoForce[..., 0].
+                return value.reshape(B, flat.shape[1], value.shape[-1])
+
+            world_time = _integer_tensor(
+                _scalar('world_time_id'), 'world_time_id', valid).reshape(B, -1)
+            if (world_time[valid] < 0).any():
+                raise ValueError(
+                    "world_time_id must be non-negative for valid tokens")
+            observation = _binary_tensor(
+                _scalar('observation_flag'), 'observation_flag', valid
+            ).reshape(B, -1).long()
+            visual = _binary_tensor(
+                _scalar('visual_valid'), 'visual_valid', valid
+            ).reshape(B, -1) & valid
+            tactile = _binary_tensor(
+                _scalar('tactile_valid'), 'tactile_valid', valid
+            ).reshape(B, -1) & valid
+            dino = _feature('dino_features')
+            neoforce = _feature('neoforce_features')
+            if dino.shape[-1] == 0 and visual.any():
+                raise ValueError("visual_valid cannot be true when DINO width is zero")
+            if neoforce.shape[-1] == 0 and tactile.any():
+                raise ValueError(
+                    "tactile_valid cannot be true when NeoForce width is zero")
+            if (valid & ~(visual | tactile)).any():
+                raise ValueError(
+                    "every valid RGB-motion token needs DINO or NeoForce")
+            if visual.any() and not torch.isfinite(dino[visual]).all():
+                raise ValueError(
+                    "dino_features must be finite wherever visual_valid is true")
+            if tactile.any() and not torch.isfinite(neoforce[tactile]).all():
+                raise ValueError(
+                    "neoforce_features must be finite wherever tactile_valid is true")
+            semantic = {
+                'world_time_id': world_time.masked_fill(~valid, -1),
+                'dino': dino.masked_fill(~valid[..., None], 0),
+                'neoforce': neoforce.masked_fill(~valid[..., None], 0),
+                'observation_flag': observation.masked_fill(~valid, 0),
+                'visual_valid': visual,
+                'tactile_valid': tactile,
+            }
+
+        return {
+            'indices': flat.long(),
+            'valid_mask': valid.bool(),
+            'frame_ids': frame.long(),
+            'grid_shape': (Fp, Hp, Wp),
+            'semantic_index': semantic,
+        }
+
+    @staticmethod
+    def _gather_rgb_motion_tokens(tokens, layout):
+        """Gather ``(B,L,D...)`` tensors with a common sparse video layout."""
+        if layout is None:
+            return tokens
+        indices = layout['indices']
+        if tokens.shape[0] != indices.shape[0]:
+            raise ValueError(
+                f"motion-index batch {indices.shape[0]} != token batch {tokens.shape[0]}")
+        view = indices[(...,) + (None,) * (tokens.dim() - 2)]
+        view = view.expand(indices.shape + tokens.shape[2:])
+        gathered = torch.gather(tokens, 1, view)
+        mask = layout['valid_mask'][(...,) + (None,) * (tokens.dim() - 2)]
+        return gathered.masked_fill(~mask, 0)
+
+    @staticmethod
+    def _gather_rgb_motion_grid(grid_id, layout):
+        """Gather grid ids shaped ``(B,4,L)`` to ``(B,4,N)``."""
+        if layout is None:
+            return grid_id
+        indices = layout['indices'][:, None].expand(-1, grid_id.shape[1], -1)
+        gathered = torch.gather(grid_id, 2, indices)
+        return gathered.masked_fill(~layout['valid_mask'][:, None], 0)
+
+    @staticmethod
+    def _inference_video_frame_start(dense_grid_id, gathered_grid_id,
+                                     motion_layout):
+        """Get tactile's RoPE origin without treating sparse padding as time 0."""
+        if motion_layout is None:
+            frame_values = gathered_grid_id[0, 0]
+        else:
+            valid = motion_layout['valid_mask']
+            if valid.shape != gathered_grid_id[:, 0].shape:
+                raise ValueError(
+                    "motion valid/grid shape mismatch while deriving frame start: "
+                    f"valid={tuple(valid.shape)}, "
+                    f"grid={tuple(gathered_grid_id[:, 0].shape)}")
+            first_batch_valid = valid[0]
+            if first_batch_valid.any():
+                frame_values = gathered_grid_id[0, 0, first_batch_valid]
+            else:
+                # An all-empty motion mask still belongs to this streaming
+                # chunk.  Recover its time from the untouched dense grid;
+                # gathered padding has deliberately been canonicalized to zero.
+                frame_values = dense_grid_id[0, 0]
+        if frame_values.numel() == 0:
+            raise ValueError("cannot derive frame start from an empty video grid")
+        return int(frame_values.min().item())
 
     def _encode_text_condition(self, text_emb):
         return self._input_embed(text_emb, input_type='text')
@@ -1511,12 +1828,18 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         action_dict = input_dict['action_dict']
         batch_size = latent_dict['noisy_latents'].shape[0]
 
-        latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
+        motion_layout = self._rgb_motion_layout(
+            latent_dict, latent_dict['noisy_latents'].shape)
+        latent_hidden_states = self._input_embed(
+            latent_dict['noisy_latents'], input_type='latent',
+            motion_layout=motion_layout).flatten(0, 1)[None]
         action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
         text_hidden_states = self._encode_text_condition(latent_dict["text_emb"])
         encoder_hidden_states = text_hidden_states.flatten(0, 1)[None]
 
-        condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
+        condition_latent_hidden_states = self._input_embed(
+            latent_dict['latent'], input_type='latent',
+            motion_layout=motion_layout).flatten(0, 1)[None]
         condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
 
         drop_tactile = self._should_drop_tactile_condition(action_dict)
@@ -1614,6 +1937,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             tactile_zero_anchor=tactile_zero_anchor,
             text_hidden_states=text_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
+            motion_layout=motion_layout,
         )
 
     def _build_stage_position_inputs(self,
@@ -1624,18 +1948,50 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                      tactile_token_length=0,
                                      tactile_noisy_token_length=0,
                                      tactile_clean_token_length=0,
-                                     tactile_grid_shape=None):
-        latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
+                                     tactile_grid_shape=None,
+                                     motion_layout=None):
+        latent_grid = self._gather_rgb_motion_grid(
+            latent_dict['grid_id'], motion_layout)
+        latent_grid_id = latent_grid.permute(1, 0, 2).flatten(1)[None]
         full_grid_id = torch.cat([latent_grid_id] * 2, dim=2)
 
-        latent_time_steps = torch.cat(
-            [latent_dict['timesteps'].flatten(0, 1), latent_dict['cond_timesteps'].flatten(0, 1)]
-        )[None]
-        temb, timestep_proj = self._time_embed(latent_time_steps,
-                                               latent_dict['noisy_latents'].shape[-2],
-                                               latent_dict['noisy_latents'].shape[-1],
-                                               dtype=dtype,
-                                               action_mode=False)
+        if motion_layout is None:
+            latent_time_steps = torch.cat(
+                [latent_dict['timesteps'].flatten(0, 1),
+                 latent_dict['cond_timesteps'].flatten(0, 1)]
+            )[None]
+            temb, timestep_proj = self._time_embed(
+                latent_time_steps,
+                latent_dict['noisy_latents'].shape[-2],
+                latent_dict['noisy_latents'].shape[-1],
+                dtype=dtype,
+                action_mode=False)
+        else:
+            # Build the exact same dense per-patch timestep embeddings as the
+            # legacy path, then gather them with the WAN content tokens.  This
+            # keeps diffusion time conditioning separate from semantic world time.
+            noisy_temb, noisy_proj = self._time_embed(
+                latent_dict['timesteps'],
+                latent_dict['noisy_latents'].shape[-2],
+                latent_dict['noisy_latents'].shape[-1],
+                dtype=dtype,
+                action_mode=False)
+            clean_temb, clean_proj = self._time_embed(
+                latent_dict['cond_timesteps'],
+                latent_dict['noisy_latents'].shape[-2],
+                latent_dict['noisy_latents'].shape[-1],
+                dtype=dtype,
+                action_mode=False)
+            noisy_temb = self._gather_rgb_motion_tokens(
+                noisy_temb, motion_layout).flatten(0, 1)[None]
+            clean_temb = self._gather_rgb_motion_tokens(
+                clean_temb, motion_layout).flatten(0, 1)[None]
+            noisy_proj = self._gather_rgb_motion_tokens(
+                noisy_proj, motion_layout).flatten(0, 1)[None]
+            clean_proj = self._gather_rgb_motion_tokens(
+                clean_proj, motion_layout).flatten(0, 1)[None]
+            temb = torch.cat([noisy_temb, clean_temb], dim=1)
+            timestep_proj = torch.cat([noisy_proj, clean_proj], dim=1)
 
         if include_action_tokens:
             action_grid_id = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
@@ -1742,7 +2098,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
     def _run_main_blocks(self, hidden_states, encoder_hidden_states, timestep_proj,
                          temb, rotary_emb, update_cache, cache_name, action_mode,
-                         main_token_count, tactile_token_count):
+                         main_token_count, tactile_token_count,
+                         semantic_index=None, token_valid_mask=None):
         """Streaming-inference block loop, extracted as an overridable hook so the
         MoT variant swaps the single shared stack for per-modality experts (mirrors
         _run_backbone for the training path). Default = legacy shared stack."""
@@ -1758,6 +2115,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                cross_attention_mask: BlockMask | None):
         for block in block_slice:
             block.set_flex_attention_masks(self_attention_mask, cross_attention_mask)
+
+    def _clear_inference_attention_masks(self):
+        """Remove length-specific masks left by a preceding training forward."""
+        if hasattr(self, 'blocks'):
+            self._set_block_slice_masks(self.blocks, None, None)
+        elif hasattr(self, 'mot'):
+            self.mot.set_masks(
+                self_block_mask=None,
+                dense_self_mask=None,
+                cross_masks=None,
+            )
 
     def _run_backbone(self, hidden_states, encoder_hidden_states, timestep_proj,
                       rotary_emb, self_attention_mask, cross_attention_mask,
@@ -1826,6 +2194,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             tactile_noisy_token_length=prepared.get('tactile_noisy_token_length', 0),
             tactile_clean_token_length=prepared.get('tactile_clean_token_length', 0),
             tactile_grid_shape=prepared.get('tactile_grid_shape'),
+            motion_layout=prepared.get('motion_layout'),
         )
         hidden_states, rotary_emb, temb, timestep_proj, padded_length = self._pad_stage_tensors(
             hidden_states, rotary_emb, temb, timestep_proj)
@@ -1853,6 +2222,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             tactile_noisy_token_length=prepared.get('tactile_noisy_token_length', 0),
             include_action_tokens=True,
             tactile_grid_shape=prepared.get('tactile_grid_shape'),
+            latent_token_frame_ids=(
+                prepared['motion_layout']['frame_ids']
+                if prepared.get('motion_layout') is not None else None),
+            latent_token_valid_mask=(
+                prepared['motion_layout']['valid_mask']
+                if prepared.get('motion_layout') is not None else None),
         )
         hidden_states = self._run_backbone(
             hidden_states,
@@ -1957,12 +2332,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         if train_mode:
             return self.forward_train(input_dict)
 
-        # Training installs length-specific FlexAttention masks on the blocks.
-        # Inference uses its own KV-cache masking, so clear any stale train mask.
-        # MoT deletes self.blocks (per-modality experts instead); a pure serve only
-        # ever infers, so there is no stale train mask to clear -> skip for MoT.
-        if hasattr(self, 'blocks'):
-            self._set_block_slice_masks(self.blocks, None, None)
+        # Training installs length-specific attention/cross-attention masks.
+        # Inference uses its own KV-cache masking, so clear stale state for both
+        # the legacy shared stack and MoT. This matters for train -> eval/infer in
+        # one process even though a separately loaded serving model starts clean.
+        self._clear_inference_attention_masks()
+
+        motion_layout = None
+        if not action_mode:
+            motion_layout = self._rgb_motion_layout(
+                input_dict, input_dict['noisy_latents'].shape)
 
         if action_mode:  # action input emb
             latent_hidden_states = rearrange(input_dict['noisy_latents'],
@@ -1976,6 +2355,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 p1=self.patch_size[0],
                 p2=self.patch_size[1],
                 p3=self.patch_size[2])
+            latent_hidden_states = self._gather_rgb_motion_tokens(
+                latent_hidden_states, motion_layout)
             latent_hidden_states = self.patch_embedding_mlp(
                 latent_hidden_states)
         text_hidden_states = self._encode_text_condition(input_dict["text_emb"])
@@ -2071,13 +2452,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # Symdiff tactile: tactile tokens carry REAL spatial/temporal RoPE
         # positions (matching forward_train), so the model localises which sensor
         # / frame / spatial patch each tactile token belongs to.
-        latent_grid_id = input_dict['grid_id']
+        latent_grid_id = self._gather_rgb_motion_grid(
+            input_dict['grid_id'], motion_layout)
         _, S_t, Fp_t, Hp_t, Wp_t = self._tactile_patch_grid_shape(global_tactile_latent)
         B_g = latent_grid_id.shape[0]
         # Derive the tactile frame_start FROM the video grid so tactile RoPE
         # frames advance with the video's on every path (a pinned 0 here
         # collapses all cached tactile history onto t=0).
-        _vid_frame_start = int(latent_grid_id[0, 0].min().item())
+        _vid_frame_start = self._inference_video_frame_start(
+            input_dict['grid_id'], latent_grid_id, motion_layout)
         tactile_grid_id = self._build_tactile_grid_id(
             B_g, S_t, Fp_t, Hp_t, Wp_t,
             device=latent_grid_id.device, dtype=latent_grid_id.dtype,
@@ -2091,14 +2474,27 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         pach_scale_h, pach_scale_w = (1, 1) if action_mode else (
             self.patch_size[1], self.patch_size[2])
 
-        latent_time_steps = torch.repeat_interleave(
-            input_dict['timesteps'],
-            (input_dict['noisy_latents'].shape[-2] // pach_scale_h) *
-            (input_dict['noisy_latents'].shape[-1] // pach_scale_w), dim=1)  # L
-        current_condition_embedder = self.condition_embedder_action if action_mode else self.condition_embedder
-        temb, timestep_proj = current_condition_embedder(
-            latent_time_steps, dtype=latent_hidden_states.dtype)
-        timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
+        if motion_layout is None:
+            latent_time_steps = torch.repeat_interleave(
+                input_dict['timesteps'],
+                (input_dict['noisy_latents'].shape[-2] // pach_scale_h) *
+                (input_dict['noisy_latents'].shape[-1] // pach_scale_w), dim=1)  # L
+            current_condition_embedder = (
+                self.condition_embedder_action if action_mode
+                else self.condition_embedder)
+            temb, timestep_proj = current_condition_embedder(
+                latent_time_steps, dtype=latent_hidden_states.dtype)
+            timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
+        else:
+            temb, timestep_proj = self._time_embed(
+                input_dict['timesteps'],
+                input_dict['noisy_latents'].shape[-2],
+                input_dict['noisy_latents'].shape[-1],
+                dtype=latent_hidden_states.dtype,
+                action_mode=False)
+            temb = self._gather_rgb_motion_tokens(temb, motion_layout)
+            timestep_proj = self._gather_rgb_motion_tokens(
+                timestep_proj, motion_layout)
 
         p_h, p_w = self.patch_size[1], self.patch_size[2]
         if denoise_tactile:
@@ -2129,7 +2525,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         latent_hidden_states = self._run_main_blocks(
             latent_hidden_states, text_hidden_states, timestep_proj, temb,
             rotary_emb, update_cache, cache_name, action_mode,
-            main_token_count, tactile_token_count)
+            main_token_count, tactile_token_count,
+            semantic_index=(
+                None if (motion_layout is None or
+                         motion_layout['semantic_index'] is None) else {
+                    **motion_layout['semantic_index'],
+                    'valid_mask': motion_layout['valid_mask'],
+                }),
+            token_valid_mask=(
+                None if motion_layout is None
+                else motion_layout['valid_mask']
+            ))
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

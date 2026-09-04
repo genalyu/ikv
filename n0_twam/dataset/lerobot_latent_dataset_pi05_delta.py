@@ -382,9 +382,22 @@ class Pi05DeltaLatentLeRobotDataset(LatentLeRobotDataset):
         local_end_frame = end_frame
 
         ori_data_dict = self._get_range_latent_data(start_frame, end_frame, episode_index)
+        camera_wan_grid_shapes = (
+            self._camera_wan_grid_shapes(ori_data_dict)
+            if self.use_rgb_motion_tokens
+            else None
+        )
 
         latent_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
         num_latent_frames = ori_data_dict[f"{self.used_video_keys[0]}.latent_num_frames"]
+        # Preserve full-segment WAN-step ordinals before this variant applies
+        # its random latent crop. The sidecar receives the same crop below, so
+        # cropped samples are not renumbered from zero.
+        latent_world_time_ids = (
+            self._latent_world_time_ids(latent_frame_ids, int(num_latent_frames))
+            if self.use_rgb_motion_tokens
+            else None
+        )
 
         start_lat = None
         end_lat = None
@@ -414,6 +427,20 @@ class Pi05DeltaLatentLeRobotDataset(LatentLeRobotDataset):
         hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
+        self._maybe_load_rgb_motion(
+            out_dict,
+            episode_index=episode_index,
+            local_start_frame=local_start_frame,
+            local_end_frame=local_end_frame,
+            expected_full_frames=int(num_latent_frames),
+            latent_world_time_ids=latent_world_time_ids,
+            latent_frame_ids=ori_data_dict[
+                f"{self.used_video_keys[0]}.frame_ids"
+            ],
+            camera_wan_grid_shapes=camera_wan_grid_shapes,
+            truncate_start=start_lat,
+            truncate_end=end_lat,
+        )
 
         if self.has_tactile_condition and self.used_tactile_keys:
             tactile_payload = self._load_tactile_latents(

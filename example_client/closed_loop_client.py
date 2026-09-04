@@ -504,20 +504,44 @@ class TwamClient:
         self._client.infer(request)
         self._cold_chunk = True
 
-    def infer_chunk(self, cams: Dict, tactile: Dict, current_state) -> ActionChunk:
+    def infer_chunk(
+        self,
+        cams: Dict,
+        tactile: Dict,
+        current_state,
+        *,
+        rgb_motion: Optional[Dict] = None,
+        rgb_motion_inputs: Optional[Dict] = None,
+    ) -> ActionChunk:
         """Request one action chunk for the current observation.
 
         Sends a single (current) frame per camera and tactile sensor: the
         server's cold seed takes exactly one frame, and more would break its
         streaming VAE shortcut. Multi-frame history goes through
         :meth:`commit_kv_cache` instead.
+
+        ``rgb_motion`` is an optional precomputed canonical sidecar;
+        ``rgb_motion_inputs`` is an optional raw RGB-D payload following the
+        server's schema. Both are forwarded unchanged. If both are supplied,
+        the server uses the precomputed sidecar and ignores raw preprocessing;
+        the client deliberately does not choose or rewrite either payload.
+        Camera poses and intrinsics must come from the camera calibration/pose
+        source, never from ``current_state`` (the robot end effector).
+        Prefer to omit ``anchor_indices``: the server derives ``[0]`` for the
+        cold one-frame seed and causal chunk-end anchors such as ``[3, 7]`` for
+        a warm eight-frame call at WAN temporal stride 4.
         """
-        response = self._client.infer({
+        request = {
             "obs": self.pack_images(cams, self.cam_names, "camera"),
             "tactile": self.pack_images(tactile, self.tactile_names, "tactile"),
             "current_state": self._as_state_list(current_state),
             "prompt": self.prompt,
-        })
+        }
+        if rgb_motion is not None:
+            request["rgb_motion"] = rgb_motion
+        if rgb_motion_inputs is not None:
+            request["rgb_motion_inputs"] = rgb_motion_inputs
+        response = self._client.infer(request)
         if "action" not in response:
             raise RuntimeError(
                 f"server returned no 'action' field (keys: {sorted(response)})")
@@ -535,7 +559,9 @@ class TwamClient:
 
     def commit_kv_cache(self, video_keyframes: List[Dict],
                         tactile_keyframes: List[Dict], action: np.ndarray,
-                        current_state) -> None:
+                        current_state, *,
+                        rgb_motion: Optional[Dict] = None,
+                        rgb_motion_inputs: Optional[Dict] = None) -> None:
         """Re-ground the KV cache on what was actually observed and executed.
 
         This is what closes the loop. Skipping it — or swallowing its failure —
@@ -547,11 +573,20 @@ class TwamClient:
         transport does not retry, which is exactly the semantics needed: a
         replay after a lost response would double-count the time axis. **If you
         add retries to** ``WebsocketClientPolicy``, exempt this call.
+
+        ``rgb_motion`` forwards a precomputed canonical sidecar and
+        ``rgb_motion_inputs`` forwards raw RGB-D by reference, without
+        normalization or inferred calibration fields. If both are present the
+        server gives ``rgb_motion`` precedence; the client retains both
+        objects unchanged. Raw input must describe ``video_keyframes``. In
+        particular, do not reuse the offline whole-video anchor schedule here;
+        omit ``anchor_indices`` so the server derives the warm streaming-VAE
+        causal ends, or provide exactly those derived values.
         """
         if self.tactile_keyframes > 0:
             tactile_keyframes = tactile_keyframes[-self.tactile_keyframes:]
         try:
-            self._client.infer({
+            request = {
                 "obs": video_keyframes,
                 "tactile": tactile_keyframes,
                 "state": np.asarray(action, dtype=np.float32),
@@ -559,7 +594,12 @@ class TwamClient:
                 "compute_kv_cache": True,
                 "imagine": False,
                 "prompt": self.prompt,
-            })
+            }
+            if rgb_motion is not None:
+                request["rgb_motion"] = rgb_motion
+            if rgb_motion_inputs is not None:
+                request["rgb_motion_inputs"] = rgb_motion_inputs
+            self._client.infer(request)
         except Exception as e:
             raise RuntimeError(
                 f"compute_kv_cache commit failed ({type(e).__name__}: {e}); "
@@ -594,6 +634,19 @@ class TwamClient:
         current_state,
         execute: Callable[[List[EEPose], SlotContext], Optional[bool]],
         observe: Callable[[], Tuple[Dict, Dict]],
+        *,
+        make_infer_rgb_motion: Optional[
+            Callable[[Dict], Optional[Dict]]
+        ] = None,
+        make_commit_rgb_motion: Optional[
+            Callable[[List[Dict]], Optional[Dict]]
+        ] = None,
+        make_infer_rgb_motion_inputs: Optional[
+            Callable[[Dict], Optional[Dict]]
+        ] = None,
+        make_commit_rgb_motion_inputs: Optional[
+            Callable[[List[Dict]], Optional[Dict]]
+        ] = None,
     ) -> ChunkResult:
         """One full closed-loop bracket: infer -> execute -> re-ground.
 
@@ -605,8 +658,38 @@ class TwamClient:
         On abort the KV cache is deliberately **not** committed: the executed
         prefix does not correspond to a complete chunk, and grounding on it
         would desynchronize the server's time axis from the robot's.
+
+        The optional builders preserve the long-standing
+        ``observe() -> (cams, tactile)`` contract. ``make_*_rgb_motion`` builds
+        precomputed canonical sidecars; ``make_*_rgb_motion_inputs`` builds raw
+        RGB-D payloads. Infer builders receive the current short-name camera
+        dict, while commit builders receive the ordered camera dicts sampled at
+        keyframe slots. Each returns the exact object to forward or ``None``.
+        The raw infer builder runs only for the cold seed because warm infer is
+        imagination and the server does not consume raw observations there;
+        the canonical infer builder runs for every chunk so callers may provide
+        explicit future support. If both kinds are returned, both are sent and
+        the server gives the canonical sidecar precedence. Builders remain
+        responsible for synchronized depth, camera poses and intrinsics; robot
+        end-effector state is never passed as camera geometry.
         """
-        chunk = self.infer_chunk(cams, tactile, current_state)
+        infer_rgb_motion = (
+            make_infer_rgb_motion(cams)
+            if make_infer_rgb_motion is not None
+            else None
+        )
+        infer_rgb_motion_inputs = (
+            make_infer_rgb_motion_inputs(cams)
+            if make_infer_rgb_motion_inputs is not None and self._cold_chunk
+            else None
+        )
+        chunk = self.infer_chunk(
+            cams,
+            tactile,
+            current_state,
+            rgb_motion=infer_rgb_motion,
+            rgb_motion_inputs=infer_rgb_motion_inputs,
+        )
         # Freeze the chunk-start state: the commit must carry the SAME anchor
         # the inference used, or the server's delta<->absolute round-trip on
         # pi05_delta channels no longer cancels.
@@ -618,6 +701,7 @@ class TwamClient:
         self._cold_chunk = False
 
         video_keyframes: List[Dict] = []
+        raw_video_keyframes: List[Dict] = []
         tactile_keyframes: List[Dict] = []
         executed = 0
 
@@ -634,6 +718,7 @@ class TwamClient:
                 executed += 1
                 if ctx.is_keyframe:
                     k_cams, k_tactile = observe()
+                    raw_video_keyframes.append(k_cams)
                     video_keyframes.append(
                         self.pack_images(k_cams, self.cam_names, "camera"))
                     tactile_keyframes.append(
@@ -642,8 +727,20 @@ class TwamClient:
 
         committed = False
         if video_keyframes:
+            commit_rgb_motion = (
+                make_commit_rgb_motion(raw_video_keyframes)
+                if make_commit_rgb_motion is not None
+                else None
+            )
+            commit_rgb_motion_inputs = (
+                make_commit_rgb_motion_inputs(raw_video_keyframes)
+                if make_commit_rgb_motion_inputs is not None
+                else None
+            )
             self.commit_kv_cache(video_keyframes, tactile_keyframes, chunk.raw,
-                                 anchor_state)
+                                 anchor_state,
+                                 rgb_motion=commit_rgb_motion,
+                                 rgb_motion_inputs=commit_rgb_motion_inputs)
             committed = True
         return ChunkResult(chunk=chunk, executed_slots=executed,
                            stopped=False, committed=committed,
@@ -656,17 +753,41 @@ class TwamClient:
         execute: Callable[[List[EEPose], SlotContext], Optional[bool]],
         max_chunks: int = 1000,
         seed: Optional[int] = None,
+        *,
+        make_infer_rgb_motion: Optional[
+            Callable[[Dict], Optional[Dict]]
+        ] = None,
+        make_commit_rgb_motion: Optional[
+            Callable[[List[Dict]], Optional[Dict]]
+        ] = None,
+        make_infer_rgb_motion_inputs: Optional[
+            Callable[[Dict], Optional[Dict]]
+        ] = None,
+        make_commit_rgb_motion_inputs: Optional[
+            Callable[[List[Dict]], Optional[Dict]]
+        ] = None,
     ) -> int:
         """Reset, then loop :meth:`run_chunk` until ``execute`` aborts.
 
         Returns the number of chunks run. Thin convenience wrapper — drive
-        :meth:`run_chunk` yourself when you need per-chunk bookkeeping.
+        :meth:`run_chunk` yourself when you need per-chunk bookkeeping. The
+        optional RGB-motion builders have the same contract as
+        :meth:`run_chunk` and are invoked afresh for every chunk.
         """
         self.reset(seed=seed)
         for i in range(max_chunks):
             cams, tactile = observe()
-            if self.run_chunk(cams, tactile, get_state(), execute,
-                              observe).stopped:
+            if self.run_chunk(
+                cams,
+                tactile,
+                get_state(),
+                execute,
+                observe,
+                make_infer_rgb_motion=make_infer_rgb_motion,
+                make_commit_rgb_motion=make_commit_rgb_motion,
+                make_infer_rgb_motion_inputs=make_infer_rgb_motion_inputs,
+                make_commit_rgb_motion_inputs=make_commit_rgb_motion_inputs,
+            ).stopped:
                 return i + 1
         return max_chunks
 

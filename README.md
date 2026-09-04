@@ -36,6 +36,7 @@ robot and tasks. It does not ship the large-scale pretraining pipeline.
 - Load the pretrained $N_0$-TWAM checkpoint (`n0_twam.models.utils.load_mot_checkpoint`).
 - Post-train it on your own demonstrations (`n0_twam/train.py`) — see [POST_TRAINING.md](docs/POST_TRAINING.md).
 - Serve it over a websocket and get actions from observations (`n0_twam/n0_twam_server.py`) — see [DEPLOY.md](docs/DEPLOY.md).
+- Experiment with sparse motion-only WAN tokens and an independent semantic KV index — see [RGB_MOTION.md](docs/RGB_MOTION.md).
 - Evaluate it closed-loop in the [NeoSim](https://github.com/neoteai/NeoSim) vision–tactile benchmark — see [Evaluate in NeoSim](#evaluate-in-neosim-closed-loop).
 - Drive it closed-loop from your own robot or simulator (`example_client/closed_loop_client.py`, numpy-only) — see [DEPLOY.md](docs/DEPLOY.md#5-close-the-loop).
 
@@ -90,7 +91,7 @@ n0-twam/
 ├── diagrams/ · example_client/     # figures, example observations,
 │                                   #   simple_client.py (open-loop smoke),
 │                                   #   closed_loop_client.py (drive your robot)
-├── docs/                           # INSTALL.md · POST_TRAINING.md · DEPLOY.md
+├── docs/                           # INSTALL.md · POST_TRAINING.md · DEPLOY.md · RGB_MOTION.md
 ├── requirements.txt · pyproject.toml · LICENSE
 ```
 
@@ -158,7 +159,8 @@ incompatible dependency stacks, which is what the websocket split is for.
 **2. Launch the inference server** (bundle + config: [DEPLOY.md](docs/DEPLOY.md)):
 
 ```bash
-python -m n0_twam.n0_twam_server --config-name posttrain_server --port 29601
+PYTHONPATH=$PWD:$PWD/n0_twam \
+  python -m n0_twam.n0_twam_server --config-name posttrain_server --port 29601
 ```
 
 **3. Run the evaluation client** in the NeoSim repo (held-out protocol =
