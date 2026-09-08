@@ -611,7 +611,7 @@ def test_committed_cache_rolls_back_when_attention_backend_fails() -> None:
     assert cache["semantic"] is None
 
 
-def test_cache_transaction_restores_prediction_clear() -> None:
+def test_failed_grounding_append_preserves_existing_prediction() -> None:
     model = WanMoTTransformer3DModel(
         patch_size=(1, 2, 2),
         num_attention_heads=1,
@@ -663,8 +663,14 @@ def test_cache_transaction_restores_prediction_clear() -> None:
 
     with pytest.raises(RuntimeError, match="later grounding failure"):
         with model.cache_transaction("clear-rollback"):
-            model.clear_pred_cache("clear-rollback")
-            assert not cache["mask"].any()
+            attention(
+                predicted, predicted + 30, predicted + 40,
+                update_cache=2, cache_name="clear-rollback",
+                semantic_index=_semantic_index(torch.ones(3, dtype=torch.bool)),
+                cache_transaction=model.mot.active_cache_transaction_entries("clear-rollback"),
+            )
+            assert cache["mask"].sum() == 6
+            assert (cache["mask"] & cache["is_pred"]).sum() == 3
             raise RuntimeError("later grounding failure")
 
     for name, expected in before.items():

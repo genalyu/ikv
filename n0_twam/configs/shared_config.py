@@ -12,6 +12,25 @@ twam_shared_cfg.save_root = './train_out'
 
 twam_shared_cfg.patch_size = (1, 2, 2)
 
+# Full RGB + independent index metadata + one retention budget for all experts.
+# Set "fifo" to restore the legacy serving cache (also required by old sparse
+# RGB-motion experiments). No new model weights or training losses are added.
+twam_shared_cfg.kv_cache_policy = 'global'
+twam_shared_cfg.kv_retention = dict(
+    top_k=128, time_scale=8.0, contact_weight=1.0, visual_weight=1.0,
+    time_weight=1.0, query_weight=1.0, repetition_weight=1.0,
+    action_scale=0.1, query_samples=16, seed=0,
+)
+# Already-cached/local DINO only. Alternatively provide obs['kv_index']['dino'].
+# To run without DINO, disable BOTH online observation and predicted DINO.
+twam_shared_cfg.kv_index_dino_online = True
+twam_shared_cfg.kv_index_dino_model_name_or_path = 'facebook/dinov2-base'
+twam_shared_cfg.kv_index_dino_device = 'cpu'
+twam_shared_cfg.kv_index_dino_image_size = (224, 224)
+# After the FINAL video forward only: decode for DINO labels, never feed the
+# predicted RGB/latents into another world-model forward. Adds VAE+DINO cost.
+twam_shared_cfg.kv_index_predicted_dino = True
+
 # Optional sparse RGB-motion sidecars.  Kept off by default so released
 # checkpoints and existing latent datasets retain their exact input contract.
 # When enabled, each latent segment must have a matching file under

@@ -851,6 +851,128 @@ class TWAM_Server:
             input_dict['timesteps'] = input_dict['timesteps'][None]
         return input_dict
 
+    def _global_index_enabled(self):
+        return getattr(self.job_config, 'kv_cache_policy', 'fifo') == 'global'
+
+    def _predicted_dino_enabled(self):
+        return self._global_index_enabled() and bool(getattr(
+            self.job_config, 'kv_index_predicted_dino', True))
+
+    @torch.no_grad()
+    def _decode_prediction_for_index(self, latents, frame_st_id):
+        """Decode camera streams independently, without advancing encoder state.
+
+        A warm chunk gets one real latent as decoder-only causal context. Its
+        RGB is excluded from the returned anchors; it is NOT model feedback.
+        This bounded context is an approximation to full-episode VAE decoding.
+        """
+        if latents.ndim != 5 or latents.shape[0] != 1 or latents.shape[2] < 1:
+            raise ValueError('predicted index decode requires [1,C,F,H,W] latents')
+        frames = latents.shape[2]
+        cameras = len(self.job_config.obs_cam_keys)
+        if not cameras or latents.shape[-1] % cameras:
+            raise ValueError('predicted latent width must split evenly across cameras')
+        prefix = int(frame_st_id != 0)
+        decode_latents = latents
+        if prefix:
+            previous = getattr(self, '_last_observed_video_latent', None)
+            if (previous is None or previous.shape !=
+                    (1, latents.shape[1], 1, latents.shape[3], latents.shape[4])):
+                raise ValueError('predicted continuation index needs the most recent real latent')
+            decode_latents = torch.cat((previous.to(latents), latents), dim=2)
+        decode_latents = torch.cat(decode_latents.chunk(cameras, dim=-1), dim=0)
+        parameter = next(self.vae.parameters())
+        decode_latents = decode_latents.to(device=parameter.device, dtype=parameter.dtype)
+        mean = torch.as_tensor(self.vae.config.latents_mean, device=parameter.device,
+                               dtype=parameter.dtype).view(1, -1, 1, 1, 1)
+        std = torch.as_tensor(self.vae.config.latents_std, device=parameter.device,
+                              dtype=parameter.dtype).view(1, -1, 1, 1, 1)
+        decode_latents = decode_latents * std + mean
+        # Diffusers' decode clears its internal encoder/decoder containers.
+        # Our streaming wrapper owns a separate feat_cache; preserve both its
+        # semantics and any existing VAE internal containers, including errors.
+        cache_fields = ('_conv_num', '_conv_idx', '_feat_map',
+                        '_enc_conv_num', '_enc_conv_idx', '_enc_feat_map')
+        old_state = {name: getattr(self.vae, name) for name in cache_fields
+                     if hasattr(self.vae, name)}
+        try:
+            video = self.vae.decode(decode_latents, return_dict=False)[0]
+        finally:
+            for name in cache_fields:
+                if name in old_state:
+                    setattr(self.vae, name, old_state[name])
+                elif hasattr(self.vae, name):
+                    delattr(self.vae, name)
+        stride = self._rgb_motion_vae_temporal_stride()
+        expected_frames = 1 + (frames + prefix - 1) * stride
+        expected_shape = (cameras, 3, expected_frames, self.height, self.width)
+        if tuple(video.shape) != expected_shape or not torch.isfinite(video).all():
+            raise ValueError(f'prediction decoder must return finite RGB {expected_shape}, got {tuple(video.shape)}')
+        anchors = torch.arange(prefix, frames + prefix, device=video.device) * stride
+        return video.float().clamp(-1, 1).add(1).mul(.5), anchors
+
+    @torch.no_grad()
+    def _backfill_predicted_video_index(self, latents, frame_st_id, handle):
+        """Output RGB -> DINO -> existing KV metadata; never another forward."""
+        from n0_twam.preprocessing.kv_index import encode_dense_dino
+        pt, ph, pw = self.job_config.patch_size
+        if pt != 1 or latents.shape[-2] % ph or latents.shape[-1] % pw:
+            raise ValueError('predicted index requires a complete dense WAN patch grid')
+        frames, height, width = latents.shape[2], latents.shape[3] // ph, latents.shape[4] // pw
+        # Verify full input-token ordering as well as count, even if physical
+        # slots were scattered by a global eviction plan.
+        ff, hh, ww = torch.meshgrid(
+            torch.arange(frame_st_id, frame_st_id + frames, device=self.device),
+            torch.arange(height, device=self.device),
+            torch.arange(width, device=self.device), indexing='ij')
+        position = torch.stack((hh.flatten(), ww.flatten(), torch.zeros_like(ww.flatten())), dim=1)
+        if (not torch.equal(handle['world_time_id'], ff.flatten())
+                or not torch.equal(handle['grid_position'], position)):
+            raise ValueError('predicted DINO handle does not match the generated video grid')
+        if handle['observation_flag'].all():
+            return 0
+        videos, anchors = self._decode_prediction_for_index(latents, frame_st_id)
+        cameras = len(self.job_config.obs_cam_keys)
+        if width % cameras:
+            raise ValueError('WAN patches must not cross camera boundaries')
+        features = encode_dense_dino(
+            videos, anchors, (height, width // cameras), self._get_kv_dino_encoder())
+        return self.transformer.annotate_video_dino(self.cache_name, handle, features)
+
+    def _get_kv_dino_encoder(self):
+        """Real RGB only; independent of the legacy motion detector."""
+        encoder = getattr(self, '_kv_dino_encoder', None)
+        if encoder is None:
+            from n0_twam.preprocessing.dinov2 import FrozenDinoV2PatchEncoder
+            device = getattr(self.job_config, 'kv_index_dino_device', 'cpu')
+            if str(device) == 'server':
+                device = self.device
+            encoder = FrozenDinoV2PatchEncoder.from_pretrained(
+                getattr(self.job_config, 'kv_index_dino_model_name_or_path',
+                        'facebook/dinov2-base'),
+                local_files_only=True, device=device, torch_dtype=torch.float32,
+                image_size=getattr(self.job_config, 'kv_index_dino_image_size', (224, 224)),
+                float_input_range='0_1', output_dtype=torch.float32)
+            self._kv_dino_encoder = encoder
+        return encoder
+
+    def _prepare_dense_observed_index(self, obs, videos):
+        from n0_twam.preprocessing.kv_index import observed_index, encode_dense_dino
+        anchors = self._rgb_motion_streaming_anchor_indices(videos.shape[2])
+        pt, ph, pw = self.job_config.patch_size
+        if pt != 1 or self.height % (16 * ph) or self.width % (16 * pw):
+            raise ValueError("dense index requires temporal patch_size=1 and spatially divisible camera sizes")
+        target = (self.height // (16 * ph), self.width // (16 * pw))
+        count = len(anchors) * target[0] * target[1] * len(videos)
+        payload = dict(obs.get('kv_index') or {})
+        # Validate supplied features before spending time on DINO.
+        index = observed_index(payload, count, self.device)
+        if 'dino' not in payload and bool(getattr(self.job_config, 'kv_index_dino_online', True)):
+            payload['dino'] = encode_dense_dino(
+                videos, anchors, target, self._get_kv_dino_encoder())
+            index = observed_index(payload, count, self.device)
+        return index
+
     def _get_rgb_motion_preprocessor(self):
         """Lazily construct the local-only online RGB-D producer.
 
@@ -1591,6 +1713,8 @@ class TWAM_Server:
             'tactile_prev_frames': getattr(self, 'tactile_prev_frames', None),
             'last_tactile_latents': getattr(self, 'last_tactile_latents', None),
             'init_latent': getattr(self, 'init_latent', None),
+            'current_observed_kv_index': getattr(self, '_current_observed_kv_index', None),
+            'init_kv_index': getattr(self, '_init_kv_index', None),
             'last_observed_video_latent': getattr(
                 self, '_last_observed_video_latent', None),
             'last_gen_tactile': getattr(self, '_last_gen_tactile', None),
@@ -1616,6 +1740,8 @@ class TWAM_Server:
         self.tactile_prev_frames = snapshot['tactile_prev_frames']
         self.last_tactile_latents = snapshot['last_tactile_latents']
         self.init_latent = snapshot['init_latent']
+        self._current_observed_kv_index = snapshot['current_observed_kv_index']
+        self._init_kv_index = snapshot['init_kv_index']
         self._last_observed_video_latent = snapshot[
             'last_observed_video_latent']
         self._last_gen_tactile = snapshot['last_gen_tactile']
@@ -2195,6 +2321,8 @@ class TWAM_Server:
         if not isinstance(images, list):
             images = [images]
         if len(images) < 1:
+            if self._global_index_enabled():
+                self._current_observed_kv_index = None
             return None
         videos = []
         for k in self.job_config.obs_cam_keys:
@@ -2207,7 +2335,10 @@ class TWAM_Server:
                                             align_corners=False).unsqueeze(0)
             videos.append(history_video_k)
 
-        videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
+        videos = torch.cat(videos, dim=0) / 255.0
+        dense_index = (self._prepare_dense_observed_index(obs, videos)
+                       if self._global_index_enabled() else None)
+        videos = videos * 2.0 - 1.0
         vae_device = next(self.streaming_vae.vae.parameters()).device
         videos_chunk = videos.to(vae_device).to(self.dtype)
         enc_out = self.streaming_vae.encode_chunk(videos_chunk)
@@ -2217,15 +2348,37 @@ class TWAM_Server:
         latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
         mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+        if dense_index is not None:
+            pt, ph, pw = self.job_config.patch_size
+            count = (video_latent.shape[2] // pt * (video_latent.shape[3] // ph)
+                     * (video_latent.shape[4] // pw))
+            if count != len(dense_index['observation_flag']):
+                raise ValueError("observed dense index does not match encoded WAN tokens")
+            self._current_observed_kv_index = dense_index
         return video_latent.to(self.device)
 
     def _reset(self, prompt=None):
         logger.info('Reset.')
         self._validate_rgb_motion_server_config(self.job_config)
+        cache_policy = getattr(self.job_config, 'kv_cache_policy', 'fifo')
+        if cache_policy not in ('fifo', 'global'):
+            raise ValueError("kv_cache_policy must be 'fifo' or 'global'")
+        if cache_policy == 'global':
+            from n0_twam.models.global_kv_retention import RetentionConfig
+            RetentionConfig(**dict(getattr(self.job_config, 'kv_retention', {})))
+            if bool(getattr(self.job_config, 'use_rgb_motion_tokens', False)):
+                raise ValueError("global index mode requires use_rgb_motion_tokens=False")
+            if self.job_config.patch_size[0] != 1:
+                raise ValueError("global RGB index currently requires temporal patch_size=1")
+            _, ph, pw = self.job_config.patch_size
+            if self.job_config.height % (16 * ph) or self.job_config.width % (16 * pw):
+                raise ValueError('global RGB index requires camera sizes divisible by WAN patch stride')
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self._current_observed_kv_index = None
+        self._init_kv_index = None
         self.last_tactile_latents = None   # mirror init_latent: tactile cond reuse slot
         self._last_rgb_motion = None
         self._last_observed_video_latent = None
@@ -2285,6 +2438,9 @@ class TWAM_Server:
                                             )
 
         self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
+        if self._global_index_enabled():
+            self.transformer.configure_global_retention(
+                self.cache_name, **dict(getattr(self.job_config, 'kv_retention', {})))
         self.action_mask[self.job_config.used_action_channel_ids] = True
 
         self.actions_q01 = torch.tensor(self.job_config.norm_stat['q01'],
@@ -2391,6 +2547,8 @@ class TWAM_Server:
             self.last_tactile_latents = tactile_latents
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
+            if self._global_index_enabled():
+                self._init_kv_index = self._current_observed_kv_index
             self._last_observed_video_latent = init_latent[:, :, -1:].detach().clone()
             if rgb_motion_enabled:
                 seed_frames = init_latent.shape[2] // self.job_config.patch_size[0]
@@ -2478,6 +2636,9 @@ class TWAM_Server:
             mode='constant',
             value=0)
 
+        video_index_cursor = (self.transformer.global_cache_cursor(self.cache_name)
+                              if self._predicted_dino_enabled() else None)
+
         with (
                 torch.no_grad(),
         ):
@@ -2496,6 +2657,13 @@ class TWAM_Server:
                     frame_st_id=frame_st_id,
                     tactile_latents=tactile_latents,
                     rgb_motion=rgb_motion)
+
+                if self._global_index_enabled():
+                    from n0_twam.preprocessing.kv_index import prediction_index
+                    count = input_dict['latent_res_lst']['grid_id'].shape[-1]
+                    input_dict['latent_res_lst']['kv_index'] = prediction_index(
+                        count, self.device,
+                        self._init_kv_index if frame_st_id == 0 else None)
 
                 # inject the current noisy GlobalTactile so the model denoises it
                 # alongside the video (same timestep t, frame-aligned co-generation).
@@ -2552,6 +2720,10 @@ class TWAM_Server:
 
                 if frame_st_id == 0:
                     latents[:, :, 0:1] = latent_cond
+
+            if video_index_cursor is not None:
+                handle = self.transformer.video_index_handle(self.cache_name, video_index_cursor)
+                self._backfill_predicted_video_index(latents, frame_st_id, handle)
 
             # video loop done: if we co-generated GlobalTactile, the action loop below
             # conditions on the GENERATED tactile (not the observed residual) — the
@@ -2652,17 +2824,23 @@ class TWAM_Server:
             seed_is_already_cached, prepared_current_rgb_motion):
         """Advance encoders and write both grounding experts inside one transaction."""
         rgb_motion = None
-        self.transformer.clear_pred_cache(self.cache_name)
+        # Real observations append new KV. Existing predicted KV and its index
+        # remain unchanged; only normal capacity eviction or episode reset can
+        # remove them, not the arrival of an observation.
         save_async(obs['obs'], os.path.join(
             self.exp_save_root, f'obs_data_{request_frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
+        dense_index = getattr(self, '_current_observed_kv_index', None)
 
         if request_frame_st_id == 0 and not seed_is_already_cached:
-            # Legacy dense path, and the defensive sparse direct-grounding path,
-            # re-prefill the initial condition after prediction KV is removed.
+            # Legacy dense path and defensive direct-grounding path also encode
+            # the initial real condition. No existing prediction is removed.
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
+            if self._global_index_enabled():
+                from n0_twam.preprocessing.kv_index import concat_indices
+                dense_index = concat_indices(self._init_kv_index, dense_index)
 
         if rgb_motion_enabled:
             p_t = self.job_config.patch_size[0]
@@ -2736,6 +2914,13 @@ class TWAM_Server:
             frame_st_id=grounding_frame_start,
             tactile_latents=tactile_latents,
             rgb_motion=rgb_motion)
+        if self._global_index_enabled():
+            input_dict['latent_res_lst']['kv_index'] = dense_index
+            # Optional pre-aligned NeoForce/DINO for the separate tactile tail.
+            # They never enter the tactile latent/content projection.
+            if 'tactile_kv_index' in obs:
+                input_dict['latent_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
+                input_dict['action_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
         last_observed_video_latent = (
             latent_model_input[:, :, -1:].detach().clone())
 
@@ -2766,11 +2951,13 @@ class TWAM_Server:
         if request_frame_st_id == 0:
             initial_latent = getattr(self, 'init_latent', None)
             seed_is_already_cached = (
-                rgb_motion_enabled and self._last_rgb_motion is not None)
+                (rgb_motion_enabled and self._last_rgb_motion is not None)
+                or (self._global_index_enabled()
+                    and getattr(self, '_init_kv_index', None) is not None))
             if seed_is_already_cached:
                 # The cold generation pass committed its clean-clamped first
-                # frame as an observed semantic token. clear_pred_cache keeps
-                # that row, so do not append the seed a second time.  Start the
+                # frame as an observed semantic token, so do not append the
+                # seed a second time. Start the
                 # newly grounded continuation immediately after it.
                 grounding_frame_start = (
                     self.init_latent.shape[2]
@@ -2784,8 +2971,8 @@ class TWAM_Server:
                 }
 
         # DINO loading/inference, camera geometry, raw RGB binding and canonical
-        # sidecar validation are deliberately completed before prediction KV is
-        # cleared or the streaming WAN VAE advances.  Keep the candidate episode
+        # sidecar validation are deliberately completed before the streaming
+        # WAN VAE advances or any new KV is appended. Keep the candidate episode
         # state private until the encoded temporal length is known to agree.
         prepared_current_rgb_motion = None
         if rgb_motion_enabled:
@@ -2814,7 +3001,7 @@ class TWAM_Server:
             if callable(transaction_factory) else nullcontext()
         )
         try:
-            # The transaction starts before clear_pred_cache.  Encoder/cache
+            # The transaction starts before encoding and appending. Encoder/cache
             # snapshots make every later failure retry-safe, including a WAN
             # temporal-length mismatch or an action pass that fails after video.
             with cache_transaction:

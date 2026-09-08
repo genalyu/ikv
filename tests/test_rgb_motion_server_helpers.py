@@ -469,7 +469,7 @@ def test_online_rgb_binding_allows_dtype_only_difference_but_not_length_or_keys(
         )
 
 
-def test_online_rgb_preflight_fails_before_prediction_cache_is_cleared():
+def test_online_rgb_preflight_fails_without_touching_prediction_cache():
     server = _server(online=True, first_frame_policy="empty")
 
     class _Transformer:
@@ -1696,11 +1696,11 @@ def test_sparse_cold_grounding_keeps_cached_seed_without_appending_it_twice():
     assert captured["action"].shape[2] == 2
     assert captured["action"][0, 0, :, 0, 0].tolist() == [1.0, 2.0]
     assert server.frame_st_id == 3
-    assert server.transformer.clear_calls == ["pos"]
+    assert server.transformer.clear_calls == []
     assert len(server.transformer.forward_calls) == 2
 
 
-def test_dense_legacy_cold_grounding_still_reappends_seed_after_pred_clear():
+def test_dense_legacy_cold_grounding_encodes_seed_without_clearing_predictions():
     server, captured = _kv_lifecycle_server(sparse=False)
 
     server._compute_kv_cache({"obs": [], "state": torch.zeros(2, 3, 1)})
@@ -1763,8 +1763,8 @@ def test_grounding_video_and_action_cache_updates_are_one_transaction():
 
     # The video call succeeded before action failed, but the request-level
     # transaction restores the common cache rather than exposing video-only KV.
-    # The request transaction began before prediction clearing, so the old
-    # prediction is restored together with the successful video append.
+    # The old prediction stays present; rollback removes the failed request's
+    # appends rather than removing or zeroing the previous prediction.
     assert transformer.committed == ["old-prediction"]
     assert transformer.transaction_events == [
         ("begin", "pos"),

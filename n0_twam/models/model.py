@@ -487,13 +487,6 @@ class WanAttention(torch.nn.Module):
         if isinstance(self.attn_op, FlexAttnFunc):
             self.attn_op.set_block_mask(block_mask)
 
-    def clear_pred_cache(self, cache_name):
-        if self.attn_caches is None:
-            return
-        cache = self.attn_caches[cache_name]
-        is_pred = cache['is_pred']
-        cache['mask'][is_pred] = False
-
     def clear_cache(self, cache_name):
         if self.attn_caches is None:
             return
@@ -1119,10 +1112,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     def clear_cache(self, cache_name):
         for block in self.blocks:
             block.attn1.clear_cache(cache_name)
-
-    def clear_pred_cache(self, cache_name):
-        for block in self.blocks:
-            block.attn1.clear_pred_cache(cache_name)
 
     def create_empty_cache(self, cache_name, attn_window,
                            latent_token_per_chunk, action_token_per_chunk,
@@ -2099,7 +2088,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     def _run_main_blocks(self, hidden_states, encoder_hidden_states, timestep_proj,
                          temb, rotary_emb, update_cache, cache_name, action_mode,
                          main_token_count, tactile_token_count,
-                         semantic_index=None, token_valid_mask=None):
+                         semantic_index=None, token_valid_mask=None,
+                         cache_context=None):
         """Streaming-inference block loop, extracted as an overridable hook so the
         MoT variant swaps the single shared stack for per-modality experts (mirrors
         _run_backbone for the training path). Default = legacy shared stack."""
@@ -2535,7 +2525,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             token_valid_mask=(
                 None if motion_layout is None
                 else motion_layout['valid_mask']
-            ))
+            ),
+            cache_context={
+                'grid_id': full_grid_id,
+                'index': input_dict.get('kv_index'),
+                'tail_index': input_dict.get('tactile_kv_index'),
+                'actions': input_dict['noisy_latents'] if action_mode else None,
+            })
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

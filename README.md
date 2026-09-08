@@ -36,7 +36,8 @@ robot and tasks. It does not ship the large-scale pretraining pipeline.
 - Load the pretrained $N_0$-TWAM checkpoint (`n0_twam.models.utils.load_mot_checkpoint`).
 - Post-train it on your own demonstrations (`n0_twam/train.py`) — see [POST_TRAINING.md](docs/POST_TRAINING.md).
 - Serve it over a websocket and get actions from observations (`n0_twam/n0_twam_server.py`) — see [DEPLOY.md](docs/DEPLOY.md).
-- Experiment with sparse motion-only WAN tokens and an independent semantic KV index — see [RGB_MOTION.md](docs/RGB_MOTION.md).
+- Use full RGB with independent KV indices, output-DINO back-labels, and shared global retention — see [INDEXED_KV.md](docs/INDEXED_KV.md).
+- Reproduce the older sparse motion-only experiment (`kv_cache_policy='fifo'`) — see [RGB_MOTION.md](docs/RGB_MOTION.md).
 - Evaluate it closed-loop in the [NeoSim](https://github.com/neoteai/NeoSim) vision–tactile benchmark — see [Evaluate in NeoSim](#evaluate-in-neosim-closed-loop).
 - Drive it closed-loop from your own robot or simulator (`example_client/closed_loop_client.py`, numpy-only) — see [DEPLOY.md](docs/DEPLOY.md#5-close-the-loop).
 

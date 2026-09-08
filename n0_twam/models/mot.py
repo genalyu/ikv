@@ -34,6 +34,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 from .model import WanTransformerBlock, FlexAttnFunc, custom_sdpa, WanTransformer3DModel
+from .global_kv_retention import GlobalKVRetention, RetentionConfig, token_rows
 
 
 class SharedSelfAttention(nn.Module):
@@ -69,6 +70,9 @@ class SharedSelfAttention(nn.Module):
         semantic_index=None,
         token_valid_mask=None,
         cache_transaction=None,
+        cache_plan=None,
+        usage_collector=None,
+        cache_observation_flags=None,
     ) -> torch.Tensor:
         # q/k/v: [B(=1), S, heads, head_dim]
         # Streaming KV-cache path: when a cache pool exists for cache_name,
@@ -92,6 +96,8 @@ class SharedSelfAttention(nn.Module):
                     # compact, slot-level snapshot alive through later layers
                     # (and, in serving, through the paired action pass).
                     transactional=True,
+                    cache_plan=cache_plan,
+                    cache_observation_flags=cache_observation_flags,
                 )
                 valid = cache["mask"].nonzero(as_tuple=False).squeeze(-1)
                 if valid.numel() == 0:
@@ -101,6 +107,9 @@ class SharedSelfAttention(nn.Module):
                     v_w = cache["v"][:, valid]
                     out = custom_sdpa(q, k_w, v_w)
                 result = self._zero_invalid_queries(out, current_valid)
+                if usage_collector is not None and not temporary and valid.numel():
+                    policy, measurements = usage_collector
+                    measurements.append(policy.measure_usage(q, k_w, valid, current_valid))
             except BaseException:
                 # Cache writes happen before the backend call.  Restore them on
                 # OOM/backend failures as well as ordinary validation errors so
@@ -178,22 +187,6 @@ class SharedSelfAttention(nn.Module):
 
     def clear_cache(self, cache_name):
         self.attn_caches[cache_name] = None
-
-    def clear_pred_cache(self, cache_name, cache_transaction=None):
-        c = self.attn_caches.get(cache_name)
-        if c is None:
-            return
-        pred = c["is_pred"] & c["mask"]
-        if cache_transaction is not None and pred.any():
-            slots = pred.nonzero(as_tuple=False).squeeze(-1)
-            cache_transaction.append(
-                (self, cache_name, self._snapshot_cache_slots(c, slots))
-            )
-        c["mask"][pred] = False
-        c["id"][pred] = -1
-        c["is_pred"][pred] = False
-        if c.get("semantic") is not None:
-            c["semantic"]["valid"][pred] = False
 
     def _next_cache_id(self, cache_name):
         ids = self.attn_caches[cache_name]["id"]
@@ -507,6 +500,8 @@ class SharedSelfAttention(nn.Module):
         semantic_index=None,
         token_valid_mask=None,
         transactional=False,
+        cache_plan=None,
+        cache_observation_flags=None,
     ):
         cache = self.attn_caches[cache_name]
         semantic_index, sequence_valid = self._normalise_semantic_sequence(
@@ -527,9 +522,11 @@ class SharedSelfAttention(nn.Module):
         # full.  Pack only real current K/V rows into physical cache slots while
         # retaining the full query sequence (invalid query outputs are zeroed by
         # `_zero_invalid_queries`).
-        slots, to_free = self._plan_slot_allocation(
+        slots, to_free = (self._plan_slot_allocation(
             cache_name, sequence_positions.numel()
-        )
+        ) if cache_plan is None else cache_plan)
+        if len(slots) != sequence_positions.numel():
+            raise ValueError("global eviction plan/current token count mismatch")
         rollback = self._snapshot_cache_slots(cache, slots)
         transaction = rollback if transactional else None
         try:
@@ -554,6 +551,10 @@ class SharedSelfAttention(nn.Module):
                 physical_is_pred[:semantic_count] = ~semantic_index[
                     "observation_flag"
                 ].bool()
+            if cache_observation_flags is not None:
+                if cache_observation_flags.shape != physical_is_pred.shape:
+                    raise ValueError("cache source flags must match all tokens")
+                physical_is_pred = ~cache_observation_flags.bool()
             cache["is_pred"][slots] = physical_is_pred.index_select(
                 0, sequence_positions
             )
@@ -756,6 +757,7 @@ class MoTBackbone(nn.Module):
         # only rows touched by the current request, avoiding a full clone of the
         # (potentially very large) rolling K/V pools.
         self._active_cache_transactions = {}
+        self.retention_policies = {}
 
     @staticmethod
     def _rollback_cache_entries(entries, start=0):
@@ -779,7 +781,9 @@ class MoTBackbone(nn.Module):
             raise RuntimeError(
                 f"cache transaction for {cache_name!r} is already active"
             )
-        transaction = {"cache_name": cache_name, "entries": []}
+        policy = self.retention_policies.get(cache_name)
+        transaction = {"cache_name": cache_name, "entries": [],
+                       "retention_snapshot": None if policy is None else policy.snapshot()}
         self._active_cache_transactions[cache_name] = transaction
         return transaction
 
@@ -799,6 +803,8 @@ class MoTBackbone(nn.Module):
         try:
             self._rollback_cache_entries(transaction["entries"])
         finally:
+            if transaction.get("retention_snapshot") is not None:
+                self.retention_policies[cache_name].restore(transaction["retention_snapshot"])
             del self._active_cache_transactions[cache_name]
 
     @contextmanager
@@ -841,6 +847,7 @@ class MoTBackbone(nn.Module):
         cache_name=None,
         semantic_index=None,
         token_valid_mask=None,
+        cache_metadata=None,
     ):
         """Run the MoT stack.
 
@@ -882,15 +889,38 @@ class MoTBackbone(nn.Module):
         order = [name for (name, _s, _e) in slices]
         cache_transaction = None
         owns_cache_transaction = False
+        policy = self.retention_policies.get(cache_name)
+        cache_plan = None
+        measurements = []
+        policy_before = None
+        old_mask = None
+        rows = None
+        if policy is not None:
+            if cache_metadata is None:
+                raise ValueError("global retention requires cache token metadata")
+            first = self.shared_attn[0].attn_caches[cache_name]
+            for attention in self.shared_attn[1:]:
+                other = attention.attn_caches[cache_name]
+                if not torch.equal(first["mask"], other["mask"]) or not torch.equal(first["id"], other["id"]):
+                    raise RuntimeError("layer cache slots diverged; cannot apply a global eviction plan")
+            _, validity = SharedSelfAttention._normalise_semantic_sequence(
+                semantic_index, hidden_states.shape[0], hidden_states.shape[1],
+                hidden_states.device, token_valid_mask=token_valid_mask)
+            positions = (torch.arange(hidden_states.shape[1], device=hidden_states.device)
+                         if validity is None else validity[0].nonzero().flatten())
+            rows = {name: value[positions] for name, value in cache_metadata.items()}
+            old_mask = first["mask"].clone()
+            policy_before = policy.snapshot() if update_cache else None
+            cache_plan = policy.plan(old_mask, len(positions), rows)
+
+        # Preflight above is read-only and must not leave an open transaction
+        # when metadata validation fails.
         if update_cache != 0 and cache_name is not None:
             cache_transaction = self._active_cache_transactions.get(cache_name)
             if cache_transaction is None:
                 cache_transaction = self.begin_cache_transaction(cache_name)
                 owns_cache_transaction = True
-        cache_entries = (
-            None if cache_transaction is None
-            else cache_transaction["entries"]
-        )
+        cache_entries = None if cache_transaction is None else cache_transaction["entries"]
         cache_entry_start = 0 if cache_entries is None else len(cache_entries)
 
         def _layer(layer, *streams_in):
@@ -922,6 +952,10 @@ class MoTBackbone(nn.Module):
                 semantic_index=semantic_index,
                 token_valid_mask=token_valid_mask,
                 cache_transaction=cache_entries,
+                cache_plan=cache_plan,
+                usage_collector=None if policy is None else (policy, measurements),
+                cache_observation_flags=(None if cache_metadata is None
+                                         else cache_metadata["observation_flag"]),
             )
             out = {}
             cursor = 0
@@ -968,7 +1002,12 @@ class MoTBackbone(nn.Module):
                 ],
                 dim=1,
             )
+            if policy is not None and update_cache:
+                policy.commit(cache_plan[0], rows, old_mask)
+                policy.add_usage(measurements)
         except BaseException:
+            if policy_before is not None:
+                policy.restore(policy_before)
             if cache_transaction is not None:
                 if owns_cache_transaction:
                     self.rollback_cache_transaction(cache_transaction)
@@ -1242,13 +1281,54 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
     def clear_cache(self, cache_name):
         for sa in self.mot.shared_attn:
             sa.clear_cache(cache_name)
+        getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
 
-    def clear_pred_cache(self, cache_name):
-        cache_transaction = self.mot.active_cache_transaction_entries(cache_name)
-        for sa in self.mot.shared_attn:
-            sa.clear_pred_cache(
-                cache_name, cache_transaction=cache_transaction
-            )
+    def configure_global_retention(self, cache_name, **config):
+        """Enable shared global top-k protection + random remainder eviction.
+
+        Must be configured on an empty cache. No model weights are introduced.
+        """
+        if self.use_rgb_motion_tokens:
+            raise ValueError("global index mode requires full RGB tokens; disable use_rgb_motion_tokens")
+        caches = [sa.attn_caches[cache_name] for sa in self.mot.shared_attn]
+        if not caches or any(c["mask"].any() for c in caches):
+            raise ValueError("configure retention on a new, empty multi-layer KV cache")
+        cfg = RetentionConfig(**config)
+        self.mot.retention_policies[cache_name] = GlobalKVRetention(
+            caches[0]["mask"].numel(), caches[0]["mask"].device, cfg)
+
+    def get_global_retention(self, cache_name):
+        """Detached, token-major diagnostics, shared by every expert/layer."""
+        policy = self.mot.retention_policies.get(cache_name)
+        if policy is None:
+            return None
+        mask = self.mot.shared_attn[0].attn_caches[cache_name]["mask"]
+        slots = mask.nonzero().flatten()
+        return {"t0": policy.t0, "slot_indices": slots.clone(),
+                **{k: v[slots].detach().clone() for k, v in policy.data.items()},
+                "score": policy.scores(slots).detach().clone(),
+                "components": {k: v.detach().clone()
+                               for k, v in policy.components(slots).items()}}
+
+    def global_cache_cursor(self, cache_name):
+        """Capture before a forward to identify its newly committed tokens."""
+        return self.mot.retention_policies[cache_name].next_uid
+
+    def video_index_handle(self, cache_name, since_uid):
+        policy = self.mot.retention_policies[cache_name]
+        mask = self.mot.shared_attn[0].attn_caches[cache_name]['mask']
+        return policy.video_handle(mask, since_uid)
+
+    def annotate_video_dino(self, cache_name, handle, features):
+        """One metadata write serves all layers. No forward or KV allocation."""
+        policy = self.mot.retention_policies[cache_name]
+        if handle['owner'] is not policy:
+            raise ValueError('video index handle belongs to a different cache generation')
+        for attention in self.mot.shared_attn:
+            mask = attention.attn_caches[cache_name]['mask']
+            if not mask[handle['slots']].all():
+                raise ValueError('video index handle addresses removed layer KV')
+        return policy.annotate_video_dino(mask, handle, features)
 
     def get_semantic_cache(self, cache_name, layer=0, *, valid_only=True):
         """Return a read-only snapshot of one layer's semantic KV sidecar.
@@ -1332,6 +1412,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
                 dtype,
                 batch_size,
             )
+        getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
 
     def _run_main_blocks(
         self,
@@ -1347,6 +1428,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         tactile_token_count,
         semantic_index=None,
         token_valid_mask=None,
+        cache_context=None,
     ):
         # MoT streaming inference: the [main, tactile] sequence -> per-modality slices.
         # One of video/action is empty per pass (video pass: action empty; action pass:
@@ -1357,6 +1439,24 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             slices = [("video", 0, 0), ("action", 0, m), ("tactile", m, m + t)]
         else:
             slices = [("video", 0, m), ("action", m, m), ("tactile", m, m + t)]
+        metadata = None
+        policy_enabled = cache_name in getattr(self.mot, "retention_policies", {})
+        if cache_context is not None and (policy_enabled or cache_context.get("index") is not None):
+            metadata = token_rows(
+                cache_context, batch_size=hidden_states.shape[0], length=m+t,
+                main_count=m, action_mode=action_mode, update_cache=update_cache,
+                device=hidden_states.device)
+            # Dense indexing has no sparse gather and no nonzero-presence
+            # requirement. Features are kept out of hidden states and Q/K/V.
+            if semantic_index is None and not policy_enabled:
+                batch = hidden_states.shape[0]
+                semantic_index = {
+                    name: metadata[name][None].expand(batch, *metadata[name].shape)
+                    for name in ("world_time_id", "dino", "neoforce", "observation_flag")}
+                semantic_index.update(
+                    visual_valid=(semantic_index["dino"] != 0).any(-1),
+                    tactile_valid=(semantic_index["neoforce"] != 0).any(-1),
+                    valid_mask=torch.ones(batch, m+t, dtype=torch.bool, device=hidden_states.device))
         return self.mot(
             hidden_states,
             encoder_hidden_states,
@@ -1368,6 +1468,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             cache_name=cache_name,
             semantic_index=semantic_index,
             token_valid_mask=token_valid_mask,
+            **({"cache_metadata": metadata} if metadata is not None else {}),
         )
 
 

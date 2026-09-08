@@ -31,6 +31,12 @@ At startup the server cross-checks the config against the checkpoint's
 **refuses to start** on a mismatch or on placeholder norm stats — fix the
 config rather than bypassing the check.
 
+This fork defaults to full-RGB indexed KV with global retention and output-DINO
+annotation. Set `kv_index_dino_model_name_or_path` to local/cached DINOv2 weights;
+no automatic download occurs. See [INDEXED_KV.md](INDEXED_KV.md) for configuration,
+extra decoding cost, and payloads. To run the original serving cache without
+DINO, explicitly set `kv_cache_policy='fifo'`.
+
 ### Serving a multi-task checkpoint
 
 A multi-task pool trains every task with its **own** normalization stats (the
