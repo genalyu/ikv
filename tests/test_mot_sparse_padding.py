@@ -8,7 +8,7 @@ import torch.nn as nn
 from unittest.mock import patch
 
 from n0_twam.models.model import custom_sdpa
-from n0_twam.models.mot import SharedSelfAttention, WanMoTTransformer3DModel
+from n0_twam.models.mot import MoTBackbone, SharedSelfAttention, WanMoTTransformer3DModel
 
 
 def _semantic_index(
@@ -41,7 +41,8 @@ def _cache_only_mot_model(num_layers: int = 2) -> WanMoTTransformer3DModel:
 
     model = WanMoTTransformer3DModel.__new__(WanMoTTransformer3DModel)
     nn.Module.__init__(model)
-    model.mot = nn.Module()
+    model.mot = MoTBackbone.__new__(MoTBackbone)
+    nn.Module.__init__(model.mot)
     model.mot.shared_attn = nn.ModuleList(
         SharedSelfAttention() for _ in range(num_layers)
     )
@@ -787,7 +788,7 @@ def test_current_sdpa_combines_existing_mask_with_semantic_padding_mask() -> Non
     assert actual[:, 2:].abs().max() < 100.0
 
 
-def test_model_semantic_cache_accessor_is_layered_and_read_only() -> None:
+def test_model_semantic_cache_accessor_is_shared_and_read_only() -> None:
     model = _cache_only_mot_model()
     for attention in model.mot.shared_attn:
         attention.init_kv_cache(
@@ -802,17 +803,20 @@ def test_model_semantic_cache_accessor_is_layered_and_read_only() -> None:
 
     qkv = torch.randn(1, 3, 1, 2)
     first = _semantic_index(torch.tensor([True, False]))
-    second = _semantic_index(torch.tensor([True, True]))
-    second["world_time_id"] += 10
-    second["dino"] += 100
     model.mot.shared_attn[0](
         qkv, qkv, qkv, update_cache=2, cache_name="stream", semantic_index=first
     )
+    model.mot._share_semantic_sidecar("stream")
     model.mot.shared_attn[1](
-        qkv, qkv, qkv, update_cache=2, cache_name="stream", semantic_index=second
+        qkv, qkv, qkv, update_cache=2, cache_name="stream",
+        semantic_index=first, manage_semantic_sidecar=False,
     )
 
     live_cache = model.mot.shared_attn[1].attn_caches["stream"]
+    first_cache = model.mot.shared_attn[0].attn_caches["stream"]
+    assert live_cache["semantic"] is first_cache["semantic"]
+    assert (live_cache["semantic"]["dino"].data_ptr()
+            == first_cache["semantic"]["dino"].data_ptr())
     key_before = live_cache["k"].clone()
     value_before = live_cache["v"].clone()
     snapshot = model.get_semantic_cache("stream", layer=1)
@@ -828,11 +832,11 @@ def test_model_semantic_cache_accessor_is_layered_and_read_only() -> None:
         "visual_valid",
         "tactile_valid",
     }
-    assert snapshot["slot_indices"].tolist() == [0, 1]
-    assert snapshot["valid"].tolist() == [True, True]
-    assert snapshot["world_time_id"].tolist() == [10, 11]
-    assert snapshot["dino"].shape == (2, 2)
-    assert snapshot["neoforce"].shape == (2, 0)
+    assert snapshot["slot_indices"].tolist() == [0]
+    assert snapshot["valid"].tolist() == [True]
+    assert snapshot["world_time_id"].tolist() == [0]
+    assert snapshot["dino"].shape == (1, 2)
+    assert snapshot["neoforce"].shape == (1, 0)
 
     # This is a clone-based snapshot, not an alias into semantic K/V storage.
     snapshot["world_time_id"][0] = 999
@@ -840,14 +844,14 @@ def test_model_semantic_cache_accessor_is_layered_and_read_only() -> None:
     snapshot["valid"].zero_()
     fresh = model.get_semantic_cache("stream", layer=1)
     assert fresh is not None
-    assert fresh["world_time_id"].tolist() == [10, 11]
+    assert fresh["world_time_id"].tolist() == [0]
     assert fresh["dino"].abs().sum() > 0
     assert fresh["valid"].all()
     torch.testing.assert_close(live_cache["k"], key_before)
     torch.testing.assert_close(live_cache["v"], value_before)
 
-    # Layer 0 has its own independent semantic rows and full-capacity inspection
-    # retains physical slot positions without exposing K/V tensors.
+    # The compatibility layer selector sees the same shared sidecar, and
+    # full-capacity inspection retains slots without exposing K/V tensors.
     layer_zero = model.get_semantic_cache("stream", layer=0, valid_only=False)
     assert layer_zero is not None
     assert layer_zero["slot_indices"].tolist() == [0, 1, 2, 3, 4]

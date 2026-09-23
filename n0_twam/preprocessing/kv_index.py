@@ -87,3 +87,60 @@ def concat_indices(first, second):
                 b = b.new_zeros(len(b), width)
         result[name] = torch.cat((a, b))
     return result
+
+
+@torch.no_grad()
+def route_contact_index(visual_index, contact_features, response, visual_rows,
+                        visual_camera_ids, paired_camera_ids):
+    """Attach confirmed contacts to existing third-person visual rows.
+
+    visual_rows[M] is a caller-confirmed 2D correspondence, -1 for unknown.
+    Camera choice is NOT a correspondence estimator. A confirmed pair is indexed
+    symmetrically: the visual row receives the tactile NeoForce feature, while
+    the tactile row keeps its NeoForce feature and inherits the paired visual
+    row's DINO feature. Wrist/unknown contacts remain tactile-only metadata with
+    DINO exactly zero. No Q/K/V is created or changed here; the caller aligns
+    the returned tactile rows to its stream.
+    """
+    device = visual_index['dino'].device
+    neo = torch.as_tensor(contact_features, device=device).float()
+    response = torch.as_tensor(response, device=device).float()
+    rows = torch.as_tensor(visual_rows, device=device)
+    cameras = torch.as_tensor(visual_camera_ids, device=device)
+    n = len(visual_index['dino'])
+    if neo.ndim != 2 or neo.shape[-1] == 0 or not torch.isfinite(neo).all():
+        raise ValueError('contact_features must be finite [M,D] with D>0')
+    m = len(neo)
+    if response.shape != (m,) or not torch.isfinite(response).all() or (response < 0).any():
+        raise ValueError('response must be finite nonnegative [M]')
+    if rows.shape != (m,) or rows.dtype != torch.long or (rows < -1).any() or (rows >= n).any():
+        raise ValueError('visual_rows must be int64 [M], -1 or an existing visual row')
+    if cameras.shape != (n,) or cameras.dtype != torch.long:
+        raise ValueError('visual_camera_ids must be int64 [N]')
+    if len(visual_index['neoforce']) != n:
+        raise ValueError('visual index fields have different row counts')
+    if visual_index['neoforce'].numel() and visual_index['neoforce'].any():
+        raise ValueError('refuse to overwrite an already populated NeoForce index')
+    visible = rows >= 0
+    eligible = torch.zeros(n, dtype=torch.bool, device=device)
+    for camera_id in paired_camera_ids:
+        eligible |= cameras == int(camera_id)
+    paired = torch.zeros(m, dtype=torch.bool, device=device)
+    paired[visible] = eligible[rows[visible]]
+    paired &= response > 0
+    visual = {k: v.clone() for k, v in visual_index.items()}
+    visual['neoforce'] = neo.new_zeros(n, neo.shape[-1])
+    weight = neo.new_zeros(n)
+    visual['neoforce'].index_add_(0, rows[paired], neo[paired] * response[paired, None])
+    weight.index_add_(0, rows[paired], response[paired])
+    visual['neoforce'] /= weight.clamp_min(torch.finfo(weight.dtype).tiny)[:, None]
+    tactile_dino = visual_index['dino'].new_zeros(
+        m, visual_index['dino'].shape[-1])
+    if paired.any():
+        tactile_dino[paired] = visual_index['dino'][rows[paired]]
+    tactile_neoforce = neo.clone()
+    tactile_neoforce[response == 0] = 0
+    return visual, {
+        'dino': tactile_dino,
+        'neoforce': tactile_neoforce,
+    }, paired

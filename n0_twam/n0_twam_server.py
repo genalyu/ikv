@@ -44,6 +44,16 @@ class TWAM_Server:
     @staticmethod
     def _validate_rgb_motion_server_config(job_config):
         """Validate invariants shared by RGB-motion serving entry points."""
+        mode = getattr(job_config, 'rgb_motion_input_mode', 'rgbd')
+        if mode not in ('rgb', 'rgbd'):
+            raise ValueError('rgb_motion_input_mode must be rgb or rgbd')
+        if mode == 'rgb':
+            # Dense capacity guarantees an untruncated first observation.
+            job_config.rgb_motion_max_tokens = (
+                job_config.height // (16 * job_config.patch_size[1])
+                * (job_config.width // (16 * job_config.patch_size[2]))
+                * len(job_config.obs_cam_keys))
+            job_config.rgb_motion_first_frame_policy = 'all'
         enabled = bool(getattr(job_config, 'use_rgb_motion_tokens', False))
         online = bool(getattr(
             job_config, 'rgb_motion_online_preprocess', False))
@@ -936,8 +946,16 @@ class TWAM_Server:
         if width % cameras:
             raise ValueError('WAN patches must not cross camera boundaries')
         features = encode_dense_dino(
-            videos, anchors, (height, width // cameras), self._get_kv_dino_encoder())
+            self._kv_index_rgb(videos), anchors, (height, width // cameras), self._get_kv_dino_encoder())
         return self.transformer.annotate_video_dino(self.cache_name, handle, features)
+
+    def _kv_index_rgb(self, videos):
+        """DINO consumes natural RGB even when the released VLA uses swapped R/B."""
+        if bool(getattr(self.job_config, 'kv_index_input_rb_swapped', False)):
+            if videos.ndim != 5 or videos.shape[1] != 3:
+                raise ValueError('DINO color correction expects [cameras,3,T,H,W]')
+            return videos[:, [2, 1, 0]].contiguous()
+        return videos
 
     def _get_kv_dino_encoder(self):
         """Real RGB only; independent of the legacy motion detector."""
@@ -969,11 +987,117 @@ class TWAM_Server:
         index = observed_index(payload, count, self.device)
         if 'dino' not in payload and bool(getattr(self.job_config, 'kv_index_dino_online', True)):
             payload['dino'] = encode_dense_dino(
-                videos, anchors, target, self._get_kv_dino_encoder())
+                self._kv_index_rgb(videos), anchors, target, self._get_kv_dino_encoder())
             index = observed_index(payload, count, self.device)
         return index
 
+    def _prepare_online_contacts(self, obs, *, cold=False):
+        if not (self._global_index_enabled() and bool(getattr(
+                self.job_config, 'kv_neoforce_online', False))):
+            return obs
+        if 'contact_pairs' in obs or 'tactile_kv_index' in obs:
+            raise ValueError('online contact encoding conflicts with supplied contact metadata')
+        from n0_twam.preprocessing.online_contact import build_online_contact_pairs
+        from n0_twam.preprocessing.neoforce import FrozenNeoForceEncoder
+        encoder = getattr(self, '_kv_neoforce_encoder', None)
+        if encoder is None:
+            encoder = FrozenNeoForceEncoder.from_checkpoint(
+                self.job_config.kv_neoforce_checkpoint, device=self.device)
+            self._kv_neoforce_encoder = encoder
+        frames = len(obs['obs']) if isinstance(obs['obs'], list) else 1
+        anchors = self._rgb_motion_streaming_anchor_indices(
+            frames, streaming_vae_warm=False if cold else None)
+        _, ph, pw = self.job_config.patch_size
+        # Read the configured sensor image dimensions, not the force-field grid.
+        th, tw = self._tactile_image_size()
+        # Policy images follow the release BGR convention; NeoForce expects native RGB.
+        contact_obs = obs
+        if bool(getattr(self.job_config, 'kv_index_input_rb_swapped', False)):
+            import numpy as np
+            raw = obs['obs']
+            frames_rgb = raw if isinstance(raw, list) else [raw]
+            restored = [{k: np.ascontiguousarray(v[..., ::-1])
+                         for k, v in frame.items()} for frame in frames_rgb]
+            contact_obs = dict(obs, obs=restored if isinstance(raw, list) else restored[0])
+        pairs = build_online_contact_pairs(
+            contact_obs, encoder=encoder, anchors=anchors,
+            camera_keys=self.job_config.obs_cam_keys,
+            tactile_keys=self.job_config.tactile_keys,
+            visual_grid=(self.height // (16 * ph), self.width // (16 * pw)),
+            tactile_grid=(th // (16 * ph), tw // (16 * pw)),
+            paired_camera=self.job_config.kv_contact_pair_camera_keys[0],
+            device=self.device,
+            min_similarity=getattr(self.job_config, 'kv_contact_min_similarity', .7),
+            min_margin=getattr(self.job_config, 'kv_contact_min_margin', .15))
+        active = pairs['response'] > 0
+        paired = active & (pairs['visual_rows'] >= 0)
+        logger.info('[online-contact] cold=%s active=%s paired=%s tactile_only=%s',
+                    cold, active.sum().item(), paired.sum().item(), (active & ~paired).sum().item())
+        # Cold-start GlobalTactile KV is predicted, not an observed tactile tail.
+        # Keep real LocalTactile conditioning and valid visual pairs. Unmatched
+        # contact gets a tactile index on the first real grounding, where an
+        # observed tail exists; never label the cold prediction as observation.
+        if cold and (active & ~paired).any():
+            logger.info('[cold-contact] unmatched=%s deferred_until_observed_grounding=True',
+                        (active & ~paired).sum().item())
+        return dict(obs, contact_pairs=pairs)
+
+    def _attach_observed_contact_pairs(self, obs, input_dict, dense_index,
+                                       video_latents, tactile_latents):
+        """Route caller-confirmed RGB matches into this grounding transaction.
+
+        No depth, new tokens, encoder calls, or mutation of stored historical KV.
+        This is an input boundary, not an automatic RGB contact localizer.
+        Rows of contact_pairs follow the existing tactile (sensor,F,H,W) order.
+        """
+        from n0_twam.preprocessing.kv_index import route_contact_index
+        pairs = obs['contact_pairs']
+        if set(pairs) != {'neoforce', 'response', 'visual_rows'}:
+            raise ValueError('contact_pairs requires neoforce, response and visual_rows')
+        if 'tactile_kv_index' in obs:
+            raise ValueError('contact_pairs conflicts with pre-aligned tactile_kv_index')
+        if tactile_latents is None or 'tactile_global_latent' not in tactile_latents:
+            raise ValueError('contact_pairs requires real tactile latents')
+        tactile = tactile_latents['tactile_global_latent']
+        pt, ph, pw = self.job_config.patch_size
+        cameras = tuple(self.job_config.obs_cam_keys)
+        if pt != 1 or tactile.ndim != 6 or video_latents.ndim != 5:
+            raise ValueError('contact_pairs requires dense RGB/tactile latents and temporal patch size 1')
+        _, sensors, _, frames, th, tw = tactile.shape
+        vf, vh, vw = video_latents.shape[2:]
+        if (frames != vf or sensors != len(self.job_config.tactile_keys)
+                or vh % ph or vw % (pw * len(cameras)) or th % ph or tw % pw):
+            raise ValueError('contact_pairs video/tactile frame or patch layout mismatch')
+        h, w = vh // ph, vw // (pw * len(cameras))
+        count = sensors * frames * (th // ph) * (tw // pw)
+        features = torch.as_tensor(pairs['neoforce'], device=self.device)
+        if features.ndim != 2 or len(features) != count:
+            raise ValueError('contact_pairs must cover exactly the existing tactile token rows')
+        camera_ids = torch.arange(len(cameras), device=self.device).repeat_interleave(w).repeat(vf * h)
+        paired_keys = tuple(getattr(self.job_config, 'kv_contact_pair_camera_keys',
+                                   ('observation.images.top', 'observation.images.third_view')))
+        allowed = [i for i, key in enumerate(cameras) if key in paired_keys]
+        visual, tail, paired = route_contact_index(
+            dense_index, features, pairs['response'], pairs['visual_rows'], camera_ids, allowed)
+        rows = torch.as_tensor(pairs['visual_rows'], device=self.device)
+        contact_frames = torch.arange(frames, device=self.device).repeat_interleave(
+            (th // ph) * (tw // pw)).repeat(sensors)
+        if (rows[paired] // (h * w * len(cameras)) != contact_frames[paired]).any():
+            raise ValueError('contact_pairs cannot attach a contact to another observation time')
+        # All validation precedes changes to the local forward inputs.
+        input_dict['latent_res_lst']['kv_index'] = visual
+        input_dict['latent_res_lst']['tactile_kv_index'] = tail
+        input_dict['action_res_lst']['tactile_kv_index'] = tail
+        logger.info('[contact-index-prepare] sensors=%s frames=%s paired=%s tactile_rows=%s', sensors, frames, paired.sum().item(), count)
+
     def _get_rgb_motion_preprocessor(self):
+        if getattr(self.job_config, 'rgb_motion_input_mode', 'rgbd') == 'rgb':
+            from n0_twam.preprocessing.rgb_frame_difference import RGBFrameDifferencePreprocessor
+            return RGBFrameDifferencePreprocessor(
+                camera_keys=self.job_config.obs_cam_keys,
+                height=self.height, width=self.width, patch_size=self.job_config.patch_size,
+                threshold=getattr(self.job_config, 'rgb_motion_rgb_threshold', 0.02),
+                dino_encoder=self._get_kv_dino_encoder())
         """Lazily construct the local-only online RGB-D producer.
 
         This method is reached only for a real observation that has raw
@@ -1122,7 +1246,20 @@ class TWAM_Server:
             raise ValueError(f"{name} must contain only 0 or 1")
         return tensor.to(dtype=torch.bool)
 
+    def _rgb_only_inputs(self, obs):
+        if obs.get('rgb_motion_inputs') is not None:
+            return obs['rgb_motion_inputs']
+        frames = obs.get('obs')
+        frames = frames if isinstance(frames, list) else [frames]
+        keys = self.job_config.obs_cam_keys
+        return {'camera_keys': list(keys), 'cameras': {
+            key: {'rgb': torch.stack([torch.as_tensor(frame[key]) for frame in frames])}
+            for key in keys}}
+
     def _rgb_motion_camera_sequences(self, payload, *, label):
+        if getattr(self.job_config, 'rgb_motion_input_mode', 'rgbd') == 'rgb':
+            from n0_twam.preprocessing.rgb_frame_difference import parse_rgb_cameras
+            return parse_rgb_cameras(payload, self.job_config.obs_cam_keys)
         """Parse one explicitly camera-ordered raw RGB-D observation."""
         if not isinstance(payload, dict):
             raise TypeError(f"{label} must be a dict")
@@ -1245,6 +1382,9 @@ class TWAM_Server:
 
         captured = {}
         for camera_key, sequence in sequences.items():
+            if not hasattr(sequence, 'depth'):
+                captured[camera_key] = {'rgb': sequence.rgb[anchor_index].detach().cpu().clone()}
+                continue
             pose = _matrix_at(sequence.camera_pose)
             intrinsics = _matrix_at(sequence.camera_intrinsics)
             captured[camera_key] = {
@@ -1578,7 +1718,7 @@ class TWAM_Server:
                 "precomputed sidecar, or enable rgb_motion_online_preprocess "
                 "and send obs['rgb_motion_inputs'] with ordered RGB-D camera "
                 "geometry.")
-        raw = obs.get('rgb_motion_inputs')
+        raw = self._rgb_only_inputs(obs) if getattr(self.job_config, 'rgb_motion_input_mode', 'rgbd') == 'rgb' else obs.get('rgb_motion_inputs')
         if raw is None:
             raise KeyError(
                 "online RGB-motion preprocessing needs "
@@ -1754,7 +1894,7 @@ class TWAM_Server:
     def _rgb_motion_from_raw_inputs(
             self, obs, num_frames, frame_st_id, *, streaming_vae_warm=None):
         """Generate one observed canonical sidecar from raw RGB-D inputs."""
-        raw = obs.get('rgb_motion_inputs')
+        raw = self._rgb_only_inputs(obs) if getattr(self.job_config, 'rgb_motion_input_mode', 'rgbd') == 'rgb' else obs.get('rgb_motion_inputs')
         if raw is None:
             raise KeyError(
                 "RGB-motion serving received no precomputed obs['rgb_motion'] "
@@ -1823,7 +1963,8 @@ class TWAM_Server:
             'rgb_motion_first_frame_policy',
             'require_previous',
         ))
-        if first_policy == 'require_previous' and previous is None:
+        if (first_policy == 'require_previous' and previous is None
+                and getattr(self.job_config, 'rgb_motion_input_mode', 'rgbd') != 'rgb'):
             raise ValueError(
                 "cold-start online RGB-motion preprocessing with "
                 "first_frame_policy='require_previous' needs "
@@ -2523,6 +2664,7 @@ class TWAM_Server:
         seed_rgb_motion = None
         prepared_seed_rgb_motion = None
         if frame_st_id == 0:
+            obs = self._prepare_online_contacts(obs, cold=True)
             # Complete DINO/geometry work and canonical address validation before
             # advancing any streaming encoder.  The preparation transaction keeps
             # `_last_rgb_motion` and raw previous-frame support unchanged until the
@@ -2549,6 +2691,11 @@ class TWAM_Server:
             self.init_latent = init_latent
             if self._global_index_enabled():
                 self._init_kv_index = self._current_observed_kv_index
+                if 'contact_pairs' in obs:
+                    seed_inputs = {'latent_res_lst': {}, 'action_res_lst': {}}
+                    self._attach_observed_contact_pairs(
+                        obs, seed_inputs, self._init_kv_index, init_latent, tactile_latents)
+                    self._init_kv_index = seed_inputs['latent_res_lst']['kv_index']
             self._last_observed_video_latent = init_latent[:, :, -1:].detach().clone()
             if rgb_motion_enabled:
                 seed_frames = init_latent.shape[2] // self.job_config.patch_size[0]
@@ -2823,10 +2970,9 @@ class TWAM_Server:
             initial_latent, request_frame_st_id, grounding_frame_start,
             seed_is_already_cached, prepared_current_rgb_motion):
         """Advance encoders and write both grounding experts inside one transaction."""
+        obs = self._prepare_online_contacts(obs)
         rgb_motion = None
-        # Real observations append new KV. Existing predicted KV and its index
-        # remain unchanged; only normal capacity eviction or episode reset can
-        # remove them, not the arrival of an observation.
+        self.transformer.clear_pred_cache(self.cache_name)
         save_async(obs['obs'], os.path.join(
             self.exp_save_root, f'obs_data_{request_frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
@@ -2921,6 +3067,9 @@ class TWAM_Server:
             if 'tactile_kv_index' in obs:
                 input_dict['latent_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
                 input_dict['action_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
+            if 'contact_pairs' in obs:
+                self._attach_observed_contact_pairs(
+                    obs, input_dict, dense_index, latent_model_input, tactile_latents)
         last_observed_video_latent = (
             latent_model_input[:, :, -1:].detach().clone())
 
@@ -3030,6 +3179,8 @@ class TWAM_Server:
         self._commit_prepared_rgb_motion(prepared_current_rgb_motion)
         torch.cuda.empty_cache()
         self.frame_st_id = grounding_frame_start + latent_model_input.shape[2]
+        if self._global_index_enabled() and bool(getattr(self.job_config, 'kv_neoforce_online', False)):
+            logger.info('[contact-index-write] committed=True observed=True frame_start=%s frames=%s sensors=%s', grounding_frame_start, latent_model_input.shape[2], len(self.job_config.tactile_keys))
 
     @torch.no_grad()
     def infer(self, obs):

@@ -73,6 +73,7 @@ class SharedSelfAttention(nn.Module):
         cache_plan=None,
         usage_collector=None,
         cache_observation_flags=None,
+        manage_semantic_sidecar=True,
     ) -> torch.Tensor:
         # q/k/v: [B(=1), S, heads, head_dim]
         # Streaming KV-cache path: when a cache pool exists for cache_name,
@@ -97,6 +98,7 @@ class SharedSelfAttention(nn.Module):
                     # (and, in serving, through the paired action pass).
                     transactional=True,
                     cache_plan=cache_plan,
+                    manage_semantic_sidecar=manage_semantic_sidecar,
                     cache_observation_flags=cache_observation_flags,
                 )
                 valid = cache["mask"].nonzero(as_tuple=False).squeeze(-1)
@@ -187,6 +189,18 @@ class SharedSelfAttention(nn.Module):
 
     def clear_cache(self, cache_name):
         self.attn_caches[cache_name] = None
+
+    def clear_pred_cache(self, cache_name):
+        c = self.attn_caches.get(cache_name)
+        if c is None:
+            return
+        pred = c['is_pred'] & c['mask']
+        semantic = c.get('semantic')
+        if semantic is not None:
+            semantic['valid'][pred] = False
+        c['mask'][pred] = False
+        c['id'][pred] = -1
+        c['is_pred'][pred] = False
 
     def _next_cache_id(self, cache_name):
         ids = self.attn_caches[cache_name]["id"]
@@ -502,6 +516,7 @@ class SharedSelfAttention(nn.Module):
         transactional=False,
         cache_plan=None,
         cache_observation_flags=None,
+        manage_semantic_sidecar=True,
     ):
         cache = self.attn_caches[cache_name]
         semantic_index, sequence_valid = self._normalise_semantic_sequence(
@@ -531,7 +546,7 @@ class SharedSelfAttention(nn.Module):
         transaction = rollback if transactional else None
         try:
             self._apply_slot_allocation(cache, to_free)
-            if cache.get("semantic") is not None:
+            if manage_semantic_sidecar and cache.get("semantic") is not None:
                 cache["semantic"]["valid"][slots] = False
             new_id = self._next_cache_id(cache_name)
             cache["k"][:, slots] = key.index_select(1, sequence_positions)
@@ -558,9 +573,10 @@ class SharedSelfAttention(nn.Module):
             cache["is_pred"][slots] = physical_is_pred.index_select(
                 0, sequence_positions
             )
-            self._write_semantic_sidecar(
-                cache, slots, semantic_index, sequence_positions
-            )
+            if manage_semantic_sidecar:
+                self._write_semantic_sidecar(
+                    cache, slots, semantic_index, sequence_positions
+                )
         except Exception:
             self.restore_cache(cache_name, rollback)
             raise
@@ -607,7 +623,7 @@ class SharedSelfAttention(nn.Module):
                 original_semantic[name][slots] = value
 
     def semantic_cache(self, cache_name):
-        """Return the independent semantic slot metadata for inspection."""
+        """Return this layer's reference to shared semantic slot metadata."""
         cache = self.attn_caches.get(cache_name)
         return None if cache is None else cache.get("semantic")
 
@@ -759,13 +775,29 @@ class MoTBackbone(nn.Module):
         self._active_cache_transactions = {}
         self.retention_policies = {}
 
-    @staticmethod
-    def _rollback_cache_entries(entries, start=0):
+    def _share_semantic_sidecar(self, cache_name):
+        """Make every layer reference layer 0's single semantic sidecar."""
+
+        if not self.shared_attn:
+            return
+        first_cache = self.shared_attn[0].attn_caches.get(cache_name)
+        if first_cache is None:
+            return
+        semantic = first_cache.get("semantic")
+        for attention in self.shared_attn[1:]:
+            cache = attention.attn_caches.get(cache_name)
+            if cache is not None:
+                cache["semantic"] = semantic
+
+    def _rollback_cache_entries(self, entries, start=0):
         """Restore and remove transaction entries from ``start`` onward."""
 
+        cache_names = {cache_name for _, cache_name, _ in entries[start:]}
         for attention, cache_name, snapshot in reversed(entries[start:]):
             attention.restore_cache(cache_name, snapshot)
         del entries[start:]
+        for cache_name in cache_names:
+            self._share_semantic_sidecar(cache_name)
 
     def has_active_cache_transaction(self, cache_name):
         return cache_name in self._active_cache_transactions
@@ -956,7 +988,10 @@ class MoTBackbone(nn.Module):
                 usage_collector=None if policy is None else (policy, measurements),
                 cache_observation_flags=(None if cache_metadata is None
                                          else cache_metadata["observation_flag"]),
+                manage_semantic_sidecar=(layer == 0),
             )
+            if layer == 0 and update_cache != 0 and cache_name is not None:
+                self._share_semantic_sidecar(cache_name)
             out = {}
             cursor = 0
             for name, block, residual, gate, cs, csc, cg in post:
@@ -1283,6 +1318,10 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             sa.clear_cache(cache_name)
         getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
 
+    def clear_pred_cache(self, cache_name):
+        for sa in self.mot.shared_attn:
+            sa.clear_pred_cache(cache_name)
+
     def configure_global_retention(self, cache_name, **config):
         """Enable shared global top-k protection + random remainder eviction.
 
@@ -1331,7 +1370,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         return policy.annotate_video_dino(mask, handle, features)
 
     def get_semantic_cache(self, cache_name, layer=0, *, valid_only=True):
-        """Return a read-only snapshot of one layer's semantic KV sidecar.
+        """Return a read-only snapshot of the shared semantic KV sidecar.
 
         The snapshot contains only index metadata -- ``world_time_id``,
         ``dino``, ``neoforce``, ``observation_flag``, modality-presence masks,
@@ -1349,7 +1388,8 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         Args:
             cache_name: Streaming cache pool name passed to
                 :meth:`create_empty_cache`.
-            layer: Zero-based shared-attention layer to inspect.
+            layer: Validated for API compatibility. Semantic metadata is shared
+                by every shared-attention layer and stored by layer 0.
             valid_only: Select only active semantic rows when true; when false,
                 return the full sidecar capacity together with its ``valid``
                 mask.
@@ -1365,7 +1405,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         if not isinstance(valid_only, bool):
             raise TypeError("valid_only must be bool")
 
-        sidecar = self.mot.shared_attn[layer].semantic_cache(cache_name)
+        sidecar = self.mot.shared_attn[0].semantic_cache(cache_name)
         if sidecar is None:
             return None
         valid = sidecar["valid"]
