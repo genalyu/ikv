@@ -311,6 +311,16 @@ class TWAM_Server:
                 continue
             if meta[key] != live:
                 problems.append(f'{key}: train={meta[key]!r} serve={live!r}')
+        if bool(meta.get("use_ikv_training", False)):
+            from n0_twam.models.global_kv_retention import RetentionConfig
+            if not bool(getattr(self.job_config, "use_ikv_training", False)):
+                problems.append("use_ikv_training must match the checkpoint")
+            if getattr(self.job_config, "kv_cache_policy", "fifo") != "global":
+                problems.append("IKV-trained checkpoint requires global retention")
+            if int(getattr(self.job_config, "ikv_train_capacity", 0)) != meta["ikv_train_capacity"]:
+                problems.append("ikv_train_capacity differs from training")
+            if RetentionConfig(**dict(getattr(self.job_config, "kv_retention", {}))) != RetentionConfig(**meta["kv_retention"]):
+                problems.append("kv_retention differs from training")
         if problems:
             raise RuntimeError(
                 '[consistency] serve config does not match the training '
@@ -862,7 +872,10 @@ class TWAM_Server:
         return input_dict
 
     def _global_index_enabled(self):
-        return getattr(self.job_config, 'kv_cache_policy', 'fifo') == 'global'
+        # This helper gates dense annotation, not the retention allocator.
+        # Sparse mode supplies metadata through the selected motion sidecar.
+        return (getattr(self.job_config, 'kv_cache_policy', 'fifo') == 'global'
+                and not bool(getattr(self.job_config, 'use_rgb_motion_tokens', False)))
 
     def _predicted_dino_enabled(self):
         return self._global_index_enabled() and bool(getattr(
@@ -2490,8 +2503,6 @@ class TWAM_Server:
         if cache_policy == 'global':
             from n0_twam.models.global_kv_retention import RetentionConfig
             RetentionConfig(**dict(getattr(self.job_config, 'kv_retention', {})))
-            if bool(getattr(self.job_config, 'use_rgb_motion_tokens', False)):
-                raise ValueError("global index mode requires use_rgb_motion_tokens=False")
             if self.job_config.patch_size[0] != 1:
                 raise ValueError("global RGB index currently requires temporal patch_size=1")
             _, ph, pw = self.job_config.patch_size
@@ -2552,8 +2563,14 @@ class TWAM_Server:
             latent_token_per_chunk += tactile_token_per_chunk
             action_token_per_chunk += tactile_token_per_chunk
             logger.info("tactile cache tokens per chunk: %d", tactile_token_per_chunk)
+        trained_ikv = bool(getattr(self.job_config, 'use_ikv_training', False))
+        if trained_ikv:
+            capacity = int(getattr(self.job_config, 'ikv_train_capacity', 0))
+            if capacity <= 0 or cache_policy != 'global':
+                raise ValueError("IKV-trained serving requires global policy and positive ikv_train_capacity")
+            latent_token_per_chunk, action_token_per_chunk = capacity, 0
         self.transformer.create_empty_cache(self.cache_name,
-                                            self.job_config.attn_window,
+                                            2 if trained_ikv else self.job_config.attn_window,
                                             latent_token_per_chunk,
                                             action_token_per_chunk,
                                             dtype=self.dtype,
@@ -2562,7 +2579,7 @@ class TWAM_Server:
                                             )
 
         self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
-        if self._global_index_enabled():
+        if cache_policy == 'global':
             self.transformer.configure_global_retention(
                 self.cache_name, **dict(getattr(self.job_config, 'kv_retention', {})))
         self.action_mask[self.job_config.used_action_channel_ids] = True

@@ -93,6 +93,10 @@ Everything else in the file is the validated recipe (MoT experts, LocalTactile
 "current", horizon 12, drop probabilities 0) and is asserted at the bottom —
 prefer not to touch it.
 
+Motion patches and bounded IKV history can be enabled independently while
+keeping this training objective. See [IKV_POST_TRAINING.md](IKV_POST_TRAINING.md)
+for the four switch combinations, causal support, index sidecars and memory limits.
+
 ## 5. Launch post-training
 
 ```bash

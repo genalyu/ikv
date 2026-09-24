@@ -134,6 +134,9 @@ class FlexAttnFunc(nn.Module):
         tactile_grid_shape=None,       # (B, S, Fp, Hp, Wp) → frame-aligned tactile
         latent_token_frame_ids=None,   # optional sparse video layout: (B, N)
         latent_token_valid_mask=None,  # optional sparse video padding mask: (B, N)
+        return_layout=False,
+        latent_condition_valid_mask=None,
+        latent_condition_frame_ids=None,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
@@ -163,8 +166,19 @@ class FlexAttnFunc(nn.Module):
                 latent_seq_id = latent_seq_id.masked_fill(~valid, -1)
             latent_seq_id = latent_seq_id.flatten()
             latent_frame_id = latent_token_frame_ids.flatten()
-        seq_ids = torch.cat([latent_seq_id] * 2)
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2)
+        condition_seq_id = latent_seq_id
+        if latent_condition_valid_mask is not None:
+            condition_valid = latent_condition_valid_mask.reshape(B, -1).to("cpu")
+            condition_seq_id = torch.arange(B)[:,None].expand_as(condition_valid).masked_fill(~condition_valid, -1).flatten()
+            if condition_seq_id.shape != latent_seq_id.shape:
+                raise ValueError("noisy/condition motion layouts must use the same padded K")
+        seq_ids = torch.cat([latent_seq_id, condition_seq_id])
+        condition_frame_id = latent_frame_id if latent_condition_frame_ids is None else (
+            latent_condition_frame_ids.reshape(-1).to("cpu"))
+        if condition_frame_id.shape != latent_frame_id.shape:
+            raise ValueError("noisy/condition motion frame layouts must have equal size")
+        frame_ids = torch.cat([latent_frame_id // chunk_size * 2,
+                               condition_frame_id // chunk_size * 2])
         noise_ids = torch.cat(
             [
                 torch.zeros_like(latent_frame_id),
@@ -253,6 +267,12 @@ class FlexAttnFunc(nn.Module):
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
         noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
         modality_ids = F.pad(modality_ids, (0, padded_length), value=-1)
+
+        if return_layout:
+            return {
+                "seq": seq_ids.to(device), "phase": frame_ids.to(device),
+                "clean": noise_ids.to(device).bool(), "kind": modality_ids.to(device),
+            }
 
         mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device),
                                                noise_ids.long().to(device), modality_ids.long().to(device), window_size)
@@ -1826,9 +1846,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         text_hidden_states = self._encode_text_condition(latent_dict["text_emb"])
         encoder_hidden_states = text_hidden_states.flatten(0, 1)[None]
 
+        condition_motion_layout = motion_layout
+        if "condition_motion" in latent_dict:
+            condition_motion_layout = self._rgb_motion_layout(
+                {**latent_dict, **latent_dict["condition_motion"]}, latent_dict["latent"].shape)
         condition_latent_hidden_states = self._input_embed(
             latent_dict['latent'], input_type='latent',
-            motion_layout=motion_layout).flatten(0, 1)[None]
+            motion_layout=condition_motion_layout).flatten(0, 1)[None]
         condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
 
         drop_tactile = self._should_drop_tactile_condition(action_dict)
@@ -1927,6 +1951,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             text_hidden_states=text_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             motion_layout=motion_layout,
+            condition_motion_layout=condition_motion_layout,
         )
 
     def _build_stage_position_inputs(self,
@@ -1938,11 +1963,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                      tactile_noisy_token_length=0,
                                      tactile_clean_token_length=0,
                                      tactile_grid_shape=None,
-                                     motion_layout=None):
+                                     motion_layout=None, return_grid=False,
+                                     condition_motion_layout=None):
         latent_grid = self._gather_rgb_motion_grid(
             latent_dict['grid_id'], motion_layout)
         latent_grid_id = latent_grid.permute(1, 0, 2).flatten(1)[None]
-        full_grid_id = torch.cat([latent_grid_id] * 2, dim=2)
+        if condition_motion_layout is None:
+            condition_motion_layout = motion_layout
+        clean_grid = self._gather_rgb_motion_grid(latent_dict['grid_id'], condition_motion_layout)
+        clean_grid = clean_grid.permute(1, 0, 2).flatten(1)[None]
+        full_grid_id = torch.cat([latent_grid_id, clean_grid], dim=2)
 
         if motion_layout is None:
             latent_time_steps = torch.cat(
@@ -1974,11 +2004,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             noisy_temb = self._gather_rgb_motion_tokens(
                 noisy_temb, motion_layout).flatten(0, 1)[None]
             clean_temb = self._gather_rgb_motion_tokens(
-                clean_temb, motion_layout).flatten(0, 1)[None]
+                clean_temb, condition_motion_layout).flatten(0, 1)[None]
             noisy_proj = self._gather_rgb_motion_tokens(
                 noisy_proj, motion_layout).flatten(0, 1)[None]
             clean_proj = self._gather_rgb_motion_tokens(
-                clean_proj, motion_layout).flatten(0, 1)[None]
+                clean_proj, condition_motion_layout).flatten(0, 1)[None]
             temb = torch.cat([noisy_temb, clean_temb], dim=1)
             timestep_proj = torch.cat([noisy_proj, clean_proj], dim=1)
 
@@ -2051,6 +2081,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 timestep_proj = torch.cat([timestep_proj, clean_ts_proj], dim=1)
 
         rotary_emb = self.rope(full_grid_id)[:, :, None]
+        if return_grid:
+            return rotary_emb, temb, timestep_proj, full_grid_id
         return rotary_emb, temb, timestep_proj
 
     def _pad_stage_tensors(self, hidden_states, rotary_emb, temb, timestep_proj):
@@ -2119,7 +2151,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
     def _run_backbone(self, hidden_states, encoder_hidden_states, timestep_proj,
                       rotary_emb, self_attention_mask, cross_attention_mask,
-                      split_list, batch_size, temb=None):
+                      split_list, batch_size, temb=None, training_memory=None):
         """Run the transformer backbone over the assembled sequence. Extracted as
         an overridable hook so the Mixture-of-Transformers variant
         (WanMoTTransformer3DModel) can swap the single shared stack for per-modality
@@ -2175,7 +2207,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             + prepared.get('tactile_clean_token_length', 0)
         )
 
-        rotary_emb, temb, timestep_proj = self._build_stage_position_inputs(
+        ikv_config = input_dict.get("ikv_training")
+        if ikv_config is not None and not hasattr(self, "mot"):
+            raise ValueError("IKV training requires the MoT backbone")
+        position_inputs = self._build_stage_position_inputs(
             latent_dict,
             action_dict,
             hidden_states.dtype,
@@ -2185,7 +2220,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             tactile_clean_token_length=prepared.get('tactile_clean_token_length', 0),
             tactile_grid_shape=prepared.get('tactile_grid_shape'),
             motion_layout=prepared.get('motion_layout'),
+            return_grid=ikv_config is not None,
+            condition_motion_layout=prepared.get("condition_motion_layout"),
         )
+        rotary_emb, temb, timestep_proj = position_inputs[:3]
         hidden_states, rotary_emb, temb, timestep_proj, padded_length = self._pad_stage_tensors(
             hidden_states, rotary_emb, temb, timestep_proj)
 
@@ -2199,7 +2237,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             padded_length,
         ]
 
-        self_attention_mask, cross_attention_mask = FlexAttnFunc.init_mask(
+        masks = FlexAttnFunc.init_mask(
             latent_dict['noisy_latents'].shape,
             action_dict['noisy_latents'].shape,
             padded_length,
@@ -2218,7 +2256,23 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_token_valid_mask=(
                 prepared['motion_layout']['valid_mask']
                 if prepared.get('motion_layout') is not None else None),
+            latent_condition_frame_ids=(
+                prepared["condition_motion_layout"]["frame_ids"]
+                if prepared.get("condition_motion_layout") is not None else None),
+            return_layout=ikv_config is not None,
+            latent_condition_valid_mask=(
+                prepared["condition_motion_layout"]["valid_mask"]
+                if prepared.get("condition_motion_layout") is not None else None),
         )
+        training_memory = None
+        if ikv_config is None:
+            self_attention_mask, cross_attention_mask = masks
+        else:
+            from .ikv_training import training_metadata
+            training_memory = dict(config=ikv_config, layout=masks,
+                rows=training_metadata(position_inputs[3], masks, split_list,
+                                       latent_dict, action_dict, prepared.get("condition_motion_layout")))
+            self_attention_mask = cross_attention_mask = None
         hidden_states = self._run_backbone(
             hidden_states,
             prepared['encoder_hidden_states'],
@@ -2229,6 +2283,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             split_list,
             batch_size,
             temb,
+            **({"training_memory": training_memory} if training_memory is not None else {}),
         )
         hidden_states = self._apply_output_norm(hidden_states, temb)
         # split: v_noisy, v_clean, a_noisy, a_clean, gt_noisy, gt_clean, pad

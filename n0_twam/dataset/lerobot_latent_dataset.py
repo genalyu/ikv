@@ -277,6 +277,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         episode_index: int,
         start_frame: int,
         end_frame: int,
+        root_name=None,
     ) -> Path:
         """Resolve the segment-level RGB-motion sidecar.
 
@@ -286,7 +287,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         Keeping one file per segment prevents ambiguous per-camera index
         conversion in the dataset loader.
         """
-        root_name = getattr(self.config, 'rgb_motion_root_name', 'rgb_motion')
+        root_name = root_name or getattr(self.config, 'rgb_motion_root_name', 'rgb_motion')
         motion_root = self.root / root_name
         filename = f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
 
@@ -1105,6 +1106,20 @@ class LatentLeRobotDataset(LeRobotDataset):
         those entry points one identical opt-in contract.
         """
         if not self.use_rgb_motion_tokens:
+            config = getattr(self, "config", None)
+            root_name = getattr(config, "ikv_index_root_name", None)
+            if bool(getattr(config, "use_ikv_training", False)) and root_name:
+                from n0_twam.dataset.ikv_index import load_dense_index
+                patch = tuple(getattr(self.config, "patch_size", (1,2,2)))
+                _, h, w, _ = out_dict["latents"].shape
+                if patch[0] != 1 or h % patch[1] or w % patch[2]:
+                    raise ValueError("dense IKV index requires aligned spatial patches and temporal patch 1")
+                path = self._resolve_rgb_motion_file(episode_index, local_start_frame,
+                                                     local_end_frame, root_name=root_name)
+                out_dict.update(load_dense_index(path, camera_keys=self.used_video_keys,
+                    patch_size=patch, grid_shape=(h//patch[1], w//patch[2]),
+                    latent_frame_ids=latent_frame_ids, full_frames=int(expected_full_frames),
+                    start=truncate_start, end=truncate_end))
             return
         if latent_world_time_ids is None:
             raise ValueError(

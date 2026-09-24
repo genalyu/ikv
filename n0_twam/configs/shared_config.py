@@ -85,3 +85,13 @@ twam_shared_cfg.tactile_sensor_id_map = {                       # tactile_key â†
 twam_shared_cfg.tactile_latent_height = 8      # 128 / 16 (Wan VAE 16x spatial compress)
 twam_shared_cfg.tactile_latent_width = 8
 twam_shared_cfg.tactile_cfg_prob = 0.1          # prob to drop tactile (CFG dropout)
+
+
+# Opt-in post-training of the existing IKV policy. The original trainer,
+# teacher forcing, noise schedule and losses remain unchanged.
+twam_shared_cfg.use_ikv_training = False
+twam_shared_cfg.ikv_train_capacity = 4096
+
+# Optional full-grid DINO/NeoForce sidecars for IKV-only (dense RGB) training.
+# None means absent semantic features score zero; query/time/repetition still work.
+twam_shared_cfg.ikv_index_root_name = None

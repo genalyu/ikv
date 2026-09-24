@@ -58,6 +58,14 @@ class Trainer:
         with sparse RGB tokens would produce a checkpoint that the server must
         reject later, after an expensive training run.
         """
+        if bool(getattr(config, "use_ikv_training", False)):
+            from n0_twam.models.global_kv_retention import RetentionConfig
+            if not bool(getattr(config, "use_mot", False)):
+                raise ValueError("use_ikv_training requires use_mot=True")
+            capacity = getattr(config, "ikv_train_capacity", 0)
+            if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+                raise ValueError("ikv_train_capacity must be a positive integer")
+            RetentionConfig(**dict(getattr(config, "kv_retention", {})))
         if (bool(getattr(config, 'use_rgb_motion_tokens', False))
                 and not bool(getattr(config, 'use_mot', False))):
             raise ValueError(
@@ -488,6 +496,13 @@ class Trainer:
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
         }
+        if bool(getattr(self.config, "use_rgb_motion_tokens", False)):
+            from n0_twam.models.motion_training import prepare_causal_motion
+            prepare_causal_motion(latent_dict, input_dict["chunk_size"])
+        if bool(getattr(self.config, "use_ikv_training", False)):
+            input_dict["ikv_training"] = dict(
+                capacity=self.config.ikv_train_capacity,
+                retention=dict(getattr(self.config, "kv_retention", {})))
         return input_dict
 
     def convert_input_format(self, input_dict):
@@ -875,6 +890,9 @@ class Trainer:
                     'use_local_tactile': bool(getattr(_c, 'use_local_tactile', False)),
                     'local_tactile_mode': getattr(_c, 'local_tactile_mode', None),
                     'tactile_global_zero': bool(getattr(_c, 'tactile_global_zero', False)),
+                    'use_ikv_training': bool(getattr(_c, 'use_ikv_training', False)),
+                    'ikv_train_capacity': int(getattr(_c, 'ikv_train_capacity', 0)),
+                    'kv_retention': dict(getattr(_c, 'kv_retention', {})),
                     'use_rgb_motion_tokens': bool(getattr(
                         _c, 'use_rgb_motion_tokens', False)),
                     'rgb_motion_require_index': bool(getattr(
@@ -1077,6 +1095,17 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.motion is not None:
+        config.use_rgb_motion_tokens = args.motion
+    if args.ikv is not None:
+        config.use_ikv_training = args.ikv
+        config.kv_cache_policy = "global" if args.ikv else "fifo"
+    if args.ikv_capacity is not None:
+        config.ikv_train_capacity = args.ikv_capacity
+    if args.base_checkpoint is not None:
+        config.resume_from = args.base_checkpoint
+    if bool(getattr(config, "use_ikv_training", False)):
+        config.kv_cache_policy = "global"
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -1102,6 +1131,14 @@ def main():
         help="Root directory for saving checkpoints",
     )
 
+    parser.add_argument("--motion", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable/disable motion patches; retain original N0-TWAM loss")
+    parser.add_argument("--ikv", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable/disable IKV historical attention in teacher-forced training")
+    parser.add_argument("--ikv-capacity", type=int, default=None,
+                        help="Maximum retained condition tokens, shared across all experts")
+    parser.add_argument("--base-checkpoint", default=None,
+                        help="Released MoT base directory with transformer/; initializes original trainer")
     args = parser.parse_args()
     run(args)
 

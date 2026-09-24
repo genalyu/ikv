@@ -15,7 +15,7 @@ cfg.use_rgb_motion_tokens = True
 cfg.rgb_motion_online_preprocess = True
 cfg.rgb_motion_input_mode = 'rgb'
 cfg.rgb_motion_rgb_threshold = 0.02
-cfg.kv_cache_policy = 'fifo'  # existing sparse RGB path requires FIFO
+cfg.kv_cache_policy = 'fifo'  # or 'global' for IKV over selected motion patches
 ```
 
 The server derives capacity from the complete camera grid, overriding the old
@@ -31,6 +31,9 @@ Camera motion and lighting changes can select patches because there is no ego-mo
 compensation. Existing checkpoint compatibility and GPU rollout success have not
 been established. Existing source-lock manifests must be intentionally refreshed
 before using a hash-locked benchmark launcher; do not bypass a mismatch.
+
+Post-training can independently enable motion and IKV using the original
+N0-TWAM objective; see [IKV_POST_TRAINING.md](docs/IKV_POST_TRAINING.md).
 
 Tests: test_rgb_frame_difference.py and test_rgb_frame_difference_server.py.
 The service helper test extracts actual methods and substitutes a deterministic

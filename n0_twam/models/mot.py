@@ -880,6 +880,7 @@ class MoTBackbone(nn.Module):
         semantic_index=None,
         token_valid_mask=None,
         cache_metadata=None,
+        training_context=None,
     ):
         """Run the MoT stack.
 
@@ -918,6 +919,9 @@ class MoTBackbone(nn.Module):
         # The ENTIRE layer body is one activation-checkpoint unit (legacy granularity):
         # in backward, q/k/v/attn/ffn are recomputed rather than held resident.
         kv_cache = [] if collect_cache else None
+        training_kv = []
+        # Snapshot masks: checkpoint recomputation may occur after later chunks.
+        cross_masks = dict(self._cross_masks)
         order = [name for (name, _s, _e) in slices]
         cache_transaction = None
         owns_cache_transaction = False
@@ -960,6 +964,11 @@ class MoTBackbone(nn.Module):
             q_chunks, k_chunks, v_chunks, post = [], [], [], []
             for name in order:
                 block = self.experts[name].blocks[layer]
+                if training_context is not None and hasattr(block, "unshard"):
+                    # Recurrent checkpoint graphs can revisit an earlier phase
+                    # after FSDP has resharded this shared block. Public unshard
+                    # is idempotent and restores parameters before recomputation.
+                    block.unshard()
                 q, k, v, residual, gate, cs, csc, cg = block(
                     sl_in[name], temb=mod[name], rotary_emb=rope_e[name], mot_mode="pre"
                 )
@@ -972,29 +981,39 @@ class MoTBackbone(nn.Module):
             v = torch.cat(v_chunks, dim=1)
             if collect_cache:
                 kv_cache.append((k, v))  # full-sequence K/V at this layer
-            # update_cache/cache_name default to 0/None in training (no streaming cache;
-            # SharedSelfAttention falls back to normal attn) and carry the streaming
-            # KV-cache args at inference. Captured from the enclosing forward scope.
-            attn = self.shared_attn[layer](
-                q,
-                k,
-                v,
-                update_cache=update_cache,
-                cache_name=cache_name,
-                semantic_index=semantic_index,
-                token_valid_mask=token_valid_mask,
-                cache_transaction=cache_entries,
-                cache_plan=cache_plan,
-                usage_collector=None if policy is None else (policy, measurements),
-                cache_observation_flags=(None if cache_metadata is None
-                                         else cache_metadata["observation_flag"]),
-                manage_semantic_sidecar=(layer == 0),
-            )
+            # IKV training has a differentiable per-phase context. Otherwise
+            # the original attention path handles dense training or inference.
+            if training_context is not None:
+                # Historical KV must be explicit checkpoint inputs. Capturing
+                # them in a closure can trigger older checkpoint recomputation
+                # inside this layer, invalidating FSDP's current parameter state.
+                previous = streams_in[len(order):]
+                keys = k if not previous else torch.cat((previous[0], k), dim=1)
+                values = v if not previous else torch.cat((previous[1], v), dim=1)
+                attn = custom_sdpa(q, keys, values, attn_mask=training_context["mask"])
+            else:
+                attn = self.shared_attn[layer](
+                    q,
+                    k,
+                    v,
+                    update_cache=update_cache,
+                    cache_name=cache_name,
+                    semantic_index=semantic_index,
+                    token_valid_mask=token_valid_mask,
+                    cache_transaction=cache_entries,
+                    cache_plan=cache_plan,
+                    usage_collector=None if policy is None else (policy, measurements),
+                    cache_observation_flags=(None if cache_metadata is None
+                                             else cache_metadata["observation_flag"]),
+                    manage_semantic_sidecar=(layer == 0),
+                )
             if layer == 0 and update_cache != 0 and cache_name is not None:
                 self._share_semantic_sidecar(cache_name)
             out = {}
             cursor = 0
             for name, block, residual, gate, cs, csc, cg in post:
+                if training_context is not None and hasattr(block, "unshard"):
+                    block.unshard()
                 sl = attn[:, cursor : cursor + seg_len[name]]
                 do_cross = self.experts[name].do_cross_attn and (text[name] is not None)
                 out[name] = block(
@@ -1008,11 +1027,15 @@ class MoTBackbone(nn.Module):
                         c_gate_msa=cg,
                         encoder_hidden_states=text[name],
                         do_cross_attn=do_cross,
-                        cross_attn_mask=self._cross_masks.get(name),
+                        cross_attn_mask=cross_masks.get(name),
                     ),
                 )
                 cursor += seg_len[name]
-            return tuple(out[name] for name in order)
+            result = tuple(out[name] for name in order)
+            if training_context is not None:
+                clean = training_context["clean_positions"]
+                result += (k[:, clean], v[:, clean], q[:, clean].detach())
+            return result
 
         use_ckpt = (
             self.gradient_checkpointing
@@ -1022,12 +1045,18 @@ class MoTBackbone(nn.Module):
         try:
             for layer in range(self.num_layers):
                 cur = tuple(streams[name] for name in order)
+                if training_context is not None:
+                    previous = training_context["past"][layer]
+                    if previous is not None:
+                        cur += tuple(previous)
                 new = (
                     _ckpt(_layer, layer, *cur, use_reentrant=False)
                     if use_ckpt
                     else _layer(layer, *cur)
                 )
                 streams = {order[i]: new[i] for i in range(len(order))}
+                if training_context is not None:
+                    training_kv.append(new[len(order):])
 
             # 3. widen each expert back to shared_dim and concatenate in slice order
             out = torch.cat(
@@ -1054,6 +1083,8 @@ class MoTBackbone(nn.Module):
         else:
             if owns_cache_transaction:
                 self.commit_cache_transaction(cache_transaction)
+        if training_context is not None:
+            return out, training_kv
         if collect_cache:
             return out, kv_cache
         return out
@@ -1233,7 +1264,12 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         split_list,
         batch_size,
         temb=None,
+        training_memory=None,
     ):
+        if training_memory is not None:
+            from .ikv_training import run_ikv_training
+            return run_ikv_training(self.mot, hidden_states, encoder_hidden_states,
+                                    timestep_proj, temb, rotary_emb, training_memory)
         # split_list = [v_noisy, v_clean, a_noisy, a_clean, t_noisy, t_clean, pad]
         v = split_list[0] + split_list[1]
         a = split_list[2] + split_list[3]
@@ -1338,8 +1374,6 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
 
         Must be configured on an empty cache. No model weights are introduced.
         """
-        if self.use_rgb_motion_tokens:
-            raise ValueError("global index mode requires full RGB tokens; disable use_rgb_motion_tokens")
         caches = [sa.attn_caches[cache_name] for sa in self.mot.shared_attn]
         if not caches or any(c["mask"].any() for c in caches):
             raise ValueError("configure retention on a new, empty multi-layer KV cache")
@@ -1493,6 +1527,12 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         metadata = None
         policy_enabled = cache_name in getattr(self.mot, "retention_policies", {})
         if cache_context is not None and (policy_enabled or cache_context.get("index") is not None):
+            if policy_enabled and semantic_index is not None:
+                if cache_context.get("index") is not None:
+                    raise ValueError("sparse global mode expects selected motion metadata, not dense kv_index")
+                cache_context = dict(cache_context)
+                cache_context["index"] = {name: semantic_index[name]
+                    for name in ("dino", "neoforce", "observation_flag")}
             metadata = token_rows(
                 cache_context, batch_size=hidden_states.shape[0], length=m+t,
                 main_count=m, action_mode=action_mode, update_cache=update_cache,
@@ -1517,7 +1557,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             slices,
             update_cache=update_cache,
             cache_name=cache_name,
-            semantic_index=semantic_index,
+            semantic_index=None if policy_enabled else semantic_index,
             token_valid_mask=token_valid_mask,
             **({"cache_metadata": metadata} if metadata is not None else {}),
         )

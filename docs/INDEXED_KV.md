@@ -4,8 +4,10 @@ This is the current RGB experiment. It preserves the N0-TWAM weights, content
 embeddings, expert layers, output heads, and generation schedule. It adds one
 independent index/statistics table and a global cache-retention policy. It does
 not perform motion detection, object reconciliation, or prediction re-encoding
-into the world model. Historical sparse experiments remain available with the
-legacy `fifo` policy; they are not used by this mode.
+into the world model. This page describes dense RGB indexing. The same global
+policy also supports selected motion patches; see
+[IKV_POST_TRAINING.md](IKV_POST_TRAINING.md) for independent motion/IKV training
+switches and their serving configuration.
 
 ## Enable and run
 

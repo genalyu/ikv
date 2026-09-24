@@ -46,12 +46,22 @@ _ACTION_MODE = "absee"
 # _TACTILE_GLOBAL_ZERO=True -> "global-zero" (local only). Serve inherits both.
 _USE_LOCAL_TACTILE = True
 _TACTILE_GLOBAL_ZERO = False
+# Independent optional post-training features. Both off = original recipe.
+_USE_MOTION = False
+_USE_IKV = False
+_IKV_CAPACITY = 4096
+_IKV_INDEX_ROOT = None  # optional full-grid sidecars for dense IKV-only training
 # ───────── end EDIT ME ─────────
 
 assert _ACTION_MODE in ("absee", "delta"), _ACTION_MODE
 
 cfg = EasyDict(twam_base_cfg.copy())
 cfg.__name__ = f"Config: N0-TWAM post-train ({_ACTION_MODE}, MoT)"
+cfg.use_rgb_motion_tokens = _USE_MOTION
+cfg.use_ikv_training = _USE_IKV
+cfg.ikv_train_capacity = _IKV_CAPACITY
+cfg.ikv_index_root_name = _IKV_INDEX_ROOT
+cfg.kv_cache_policy = "global" if _USE_IKV else "fifo"
 
 # data
 cfg.dataset_path = str(_POOL / "train")
@@ -59,6 +69,11 @@ cfg.val_dataset_path = str(_POOL / "val")
 cfg.val_interval = 9999   # val pool == train pool here (not held-out) -> keep off
 
 cfg.obs_cam_keys = list(_CAM_KEYS)
+# Fixed padding covers the entire first observed RGB frame, just as the RGB
+# server does. Validity masks keep unselected slots out of attention/loss/KV.
+cfg.rgb_motion_max_tokens = (
+    cfg.height // (16 * cfg.patch_size[1])
+    * (cfg.width // (16 * cfg.patch_size[2])) * len(cfg.obs_cam_keys))
 cfg.tactile_keys = list(_TACTILE_KEYS)
 cfg.per_repo_obs_cam_keys = {}    # single-task pool: the global keys above apply
 cfg.per_repo_tactile_keys = {}
