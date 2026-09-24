@@ -946,16 +946,8 @@ class TWAM_Server:
         if width % cameras:
             raise ValueError('WAN patches must not cross camera boundaries')
         features = encode_dense_dino(
-            self._kv_index_rgb(videos), anchors, (height, width // cameras), self._get_kv_dino_encoder())
+            videos, anchors, (height, width // cameras), self._get_kv_dino_encoder())
         return self.transformer.annotate_video_dino(self.cache_name, handle, features)
-
-    def _kv_index_rgb(self, videos):
-        """DINO consumes natural RGB even when the released VLA uses swapped R/B."""
-        if bool(getattr(self.job_config, 'kv_index_input_rb_swapped', False)):
-            if videos.ndim != 5 or videos.shape[1] != 3:
-                raise ValueError('DINO color correction expects [cameras,3,T,H,W]')
-            return videos[:, [2, 1, 0]].contiguous()
-        return videos
 
     def _get_kv_dino_encoder(self):
         """Real RGB only; independent of the legacy motion detector."""
@@ -987,7 +979,7 @@ class TWAM_Server:
         index = observed_index(payload, count, self.device)
         if 'dino' not in payload and bool(getattr(self.job_config, 'kv_index_dino_online', True)):
             payload['dino'] = encode_dense_dino(
-                self._kv_index_rgb(videos), anchors, target, self._get_kv_dino_encoder())
+                videos, anchors, target, self._get_kv_dino_encoder())
             index = observed_index(payload, count, self.device)
         return index
 
@@ -1010,17 +1002,8 @@ class TWAM_Server:
         _, ph, pw = self.job_config.patch_size
         # Read the configured sensor image dimensions, not the force-field grid.
         th, tw = self._tactile_image_size()
-        # Policy images follow the release BGR convention; NeoForce expects native RGB.
-        contact_obs = obs
-        if bool(getattr(self.job_config, 'kv_index_input_rb_swapped', False)):
-            import numpy as np
-            raw = obs['obs']
-            frames_rgb = raw if isinstance(raw, list) else [raw]
-            restored = [{k: np.ascontiguousarray(v[..., ::-1])
-                         for k, v in frame.items()} for frame in frames_rgb]
-            contact_obs = dict(obs, obs=restored if isinstance(raw, list) else restored[0])
         pairs = build_online_contact_pairs(
-            contact_obs, encoder=encoder, anchors=anchors,
+            obs, encoder=encoder, anchors=anchors,
             camera_keys=self.job_config.obs_cam_keys,
             tactile_keys=self.job_config.tactile_keys,
             visual_grid=(self.height // (16 * ph), self.width // (16 * pw)),
@@ -2980,7 +2963,7 @@ class TWAM_Server:
 
         if request_frame_st_id == 0 and not seed_is_already_cached:
             # Legacy dense path and defensive direct-grounding path also encode
-            # the initial real condition. No existing prediction is removed.
+            # the initial real condition after clearing predicted entries.
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent

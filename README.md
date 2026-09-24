@@ -1,3 +1,13 @@
+# IKV — RGB-only indexed memory
+
+This fork maintains the portable IKV core built on N0-TWAM. The supported
+input is native RGB (plus the checkpoint's tactile/action inputs), with no depth
+requirement. Motion detection is OFF by default. Two-machine pipeline-parallel
+launchers are deployment adapters, not part of this core release.
+
+See [reproducibility and deployment versioning](docs/REPRODUCIBILITY.md).
+The upstream model description and attribution follow below.
+
 <h1 align="center">N<sub>0</sub>-TWAM: A Tactile-Native World Action Model</h1>
 
 <p align="center">
@@ -37,7 +47,7 @@ robot and tasks. It does not ship the large-scale pretraining pipeline.
 - Post-train it on your own demonstrations (`n0_twam/train.py`) — see [POST_TRAINING.md](docs/POST_TRAINING.md).
 - Serve it over a websocket and get actions from observations (`n0_twam/n0_twam_server.py`) — see [DEPLOY.md](docs/DEPLOY.md).
 - Use full RGB with independent KV indices, output-DINO back-labels, and shared global retention — see [INDEXED_KV.md](docs/INDEXED_KV.md).
-- Reproduce the older sparse motion-only experiment (`kv_cache_policy='fifo'`) — see [RGB_MOTION.md](docs/RGB_MOTION.md).
+- Optional RGB-only frame-difference experiment (off by default): [RGB_ONLY.md](RGB_ONLY.md).
 - Evaluate it closed-loop in the [NeoSim](https://github.com/neoteai/NeoSim) vision–tactile benchmark — see [Evaluate in NeoSim](#evaluate-in-neosim-closed-loop).
 - Drive it closed-loop from your own robot or simulator (`example_client/closed_loop_client.py`, numpy-only) — see [DEPLOY.md](docs/DEPLOY.md#5-close-the-loop).
 

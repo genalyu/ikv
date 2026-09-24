@@ -149,7 +149,7 @@ def test_disabled_prediction_index_does_not_need_decoder_or_dino():
 
 
 @torch.no_grad()
-def test_real_grounding_keeps_predicted_video_and_action_kv_and_dino(monkeypatch):
+def test_real_grounding_replaces_predicted_video_action_and_index(monkeypatch):
     from test_global_kv_retention import tiny_model, model_input
     from n0_twam.preprocessing.kv_index import observed_index
 
@@ -174,8 +174,6 @@ def test_real_grounding_keeps_predicted_video_and_action_kv_and_dino(monkeypatch
     model(model_input(5, True), update_cache=1, cache_name='test', action_mode=True)
     before = model.get_global_retention('test')
     old_slots = before['slot_indices']
-    old_layers = [{name: attention.attn_caches['test'][name][:, old_slots].clone()
-                   for name in ('k', 'v')} for attention in model.mot.shared_attn]
     observed = model_input(5)
 
     def encode_obs(_):
@@ -191,16 +189,13 @@ def test_real_grounding_keeps_predicted_video_and_action_kv_and_dino(monkeypatch
     monkeypatch.setitem(TWAMServer._infer_impl.__globals__, 'get_mesh_id', get_mesh_id)
     server._compute_kv_cache({'obs': [], 'state': torch.zeros(3, 1, 2)})
     policy = model.mot.retention_policies['test']
-    for attention, old in zip(model.mot.shared_attn, old_layers):
+    for attention in model.mot.shared_attn:
         cache = attention.attn_caches['test']
-        assert cache['mask'].sum() == 28  # 14 predicted + 14 newly observed
-        assert cache['mask'][old_slots].all() and cache['is_pred'][old_slots].all()
-        for name in ('k', 'v'):
-            torch.testing.assert_close(cache[name][:, old_slots], old[name], rtol=0, atol=0)
-        assert not hasattr(attention, 'clear_pred_cache')
-    for name in ('token_uid', 'world_time_id', 'observation_flag', 'dino', 'neoforce'):
-        torch.testing.assert_close(policy.data[name][old_slots], before[name], rtol=0, atol=0)
-    assert not hasattr(model, 'clear_pred_cache')
+        assert cache['mask'].sum() == 14  # real video + action/tactile only
+        assert not cache['is_pred'][cache['mask']].any()
+    live = model.get_global_retention('test')
+    assert live['observation_flag'].all()
+    assert not torch.isin(live['token_uid'], before['token_uid']).any()
     assert policy.t0 == 5
 
 

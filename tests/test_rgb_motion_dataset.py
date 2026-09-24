@@ -24,9 +24,10 @@ def _load_dataset_module():
     )
 
     inserted = []
+    previous = {}
     try:
-        import lerobot  # noqa: F401
-    except ModuleNotFoundError:
+        from lerobot.datasets.utils import get_episode_data_index  # noqa: F401
+    except ImportError:
         stubs = {
             "lerobot": types.ModuleType("lerobot"),
             "lerobot.datasets": types.ModuleType("lerobot.datasets"),
@@ -49,6 +50,7 @@ def _load_dataset_module():
         stubs["lerobot.constants"].HF_LEROBOT_HOME = Path("/tmp")
         stubs["lerobot.datasets.video_utils"].decode_video_frames = lambda *a, **k: None
         for name, stub in stubs.items():
+            previous[name] = sys.modules.get(name)
             sys.modules[name] = stub
             inserted.append(name)
 
@@ -62,7 +64,10 @@ def _load_dataset_module():
         return module
     finally:
         for name in reversed(inserted):
-            sys.modules.pop(name, None)
+            if previous[name] is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous[name]
 
 
 DATASET_MODULE = _load_dataset_module()

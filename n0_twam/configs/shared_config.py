@@ -46,6 +46,8 @@ twam_shared_cfg.rgb_motion_require_index = True
 # ``use_rgb_motion_tokens=True``; keeping it false lets clients use precomputed
 # ``obs['rgb_motion']`` payloads without loading a second vision backbone.
 twam_shared_cfg.rgb_motion_online_preprocess = False
+# Supported online input contract: native RGB only; no depth/geometry required.
+twam_shared_cfg.rgb_motion_input_mode = 'rgb'
 # DINOv2-B/14 may be either a local directory or an already-cached HF model id.
 # The server always calls from_pretrained(..., local_files_only=True): it never
 # downloads weights implicitly while serving.

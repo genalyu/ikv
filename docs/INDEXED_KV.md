@@ -161,13 +161,15 @@ larger than capacity is rejected. All layers apply the same selection. Seed plus
 committed revision makes the draw reproducible; temporary/failed forwards do not
 advance that state.
 
-**Real observations do not clear predicted KV.** Grounding appends new observed
-KV alongside existing predictions, even at the same time/patch address. It does
-not zero their K/V or index, invalidate their slots, or remove their DINO labels.
-The old automatic prediction-clear call and transformer interfaces are removed.
-Both sources compete in normal global capacity eviction. Explicit episode reset
-and temporary/failed-forward rollback remain separate mechanisms. There is no
-per-object replacement or “predicted versus observed” reconciliation rule.
+**Real observations clear predicted KV before grounding.** Inference retains
+predictions only until actual observations return. Grounding invalidates predicted
+video, action and tactile slots (and their semantic validity), preserves observed
+history including the cold RGB seed, then appends actual observations/actions.
+Live retention queries use the cache mask, so invalidated metadata is excluded.
+Clearing and both expert writes share a transaction: a failed grounding restores
+prior K/V, validity, semantic metadata and retention state. Capacity eviction
+still applies to the remaining observed history. This is not object tracking.
+
 
 ## Safety and inspection
 

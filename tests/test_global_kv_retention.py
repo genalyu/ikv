@@ -342,3 +342,34 @@ def test_backfill_validates_entire_packet_before_mutation(features):
     with pytest.raises(ValueError):
         policy.annotate_video_dino(mask, policy.video_handle(mask, 0), features)
     assert_snapshot_equal(before, policy.snapshot())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize('global_policy', [False, True])
+@pytest.mark.parametrize('append_before_failure', [False, True])
+def test_prediction_clear_rolls_back_with_grounding(global_policy, append_before_failure):
+    model = tiny_model(global_policy)
+    model(model_input(0), update_cache=2, cache_name='test')
+    model(model_input(1), update_cache=1, cache_name='test')
+    before = cache_snapshot(model)
+    policy = model.mot.retention_policies.get('test')
+    state = None if policy is None else policy.snapshot()
+    with pytest.raises(RuntimeError, match='grounding failed'):
+        with model.cache_transaction('test'):
+            model.clear_pred_cache('test')
+            for attention in model.mot.shared_attn:
+                cache = attention.attn_caches['test']
+                assert cache['mask'].sum() == 8  # observed history survives
+                assert not cache['is_pred'][cache['mask']].any()
+            if append_before_failure:
+                model(model_input(1), update_cache=2, cache_name='test')
+            raise RuntimeError('grounding failed')
+    assert_cache_equal(before, cache_snapshot(model))
+    if policy is not None:
+        assert_snapshot_equal(state, policy.snapshot())
+    with model.cache_transaction('test'):
+        model.clear_pred_cache('test')
+    for attention in model.mot.shared_attn:
+        cache = attention.attn_caches['test']
+        assert cache['mask'].sum() == 8
+        assert not cache['is_pred'][cache['mask']].any()

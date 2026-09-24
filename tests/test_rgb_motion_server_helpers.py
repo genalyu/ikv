@@ -1696,7 +1696,7 @@ def test_sparse_cold_grounding_keeps_cached_seed_without_appending_it_twice():
     assert captured["action"].shape[2] == 2
     assert captured["action"][0, 0, :, 0, 0].tolist() == [1.0, 2.0]
     assert server.frame_st_id == 3
-    assert server.transformer.clear_calls == []
+    assert server.transformer.clear_calls == ['pos']
     assert len(server.transformer.forward_calls) == 2
 
 

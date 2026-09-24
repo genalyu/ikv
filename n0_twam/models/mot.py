@@ -1319,6 +1319,17 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
 
     def clear_pred_cache(self, cache_name):
+        # Capture every layer BEFORE invalidating the shared semantic sidecar.
+        # Grounding may fail after clearing or after only one expert has written.
+        entries = getattr(self.mot, '_active_cache_transactions', {}).get(
+            cache_name, {}).get('entries')
+        if entries is not None:
+            for sa in self.mot.shared_attn:
+                cache = sa.attn_caches.get(cache_name)
+                if cache is not None:
+                    slots = (cache['mask'] & cache['is_pred']).nonzero().flatten()
+                    if slots.numel():
+                        entries.append((sa, cache_name, sa._snapshot_cache_slots(cache, slots)))
         for sa in self.mot.shared_attn:
             sa.clear_pred_cache(cache_name)
 
