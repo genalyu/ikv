@@ -2,6 +2,11 @@
 
 - Maintain the portable RGB-only core here. Use native RGB for visual and tactile
   images; do not add implicit red/blue swaps or require depth inputs.
+- Dense RGB IKV may differ from the released baseline only in KV indexing and
+  retention/eviction policy. Keep observation encoding, denoising, action math,
+  temporal indexing and real-observation grounding otherwise equivalent.
+- First grounding must rewrite KV0 with real observations, not preserve its
+  imagination-time representation. Do not add task-specific action heuristics.
 - Motion detection remains disabled by default. RGB frame-difference is opt-in.
 - A100 is the development checkout; GitHub main is the published source of truth.
   The two 4090 installations are deployments of a recorded core commit plus
