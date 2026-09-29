@@ -1039,7 +1039,8 @@ class TWAM_Server:
         return dict(obs, contact_pairs=pairs)
 
     def _attach_observed_contact_pairs(self, obs, input_dict, dense_index,
-                                       video_latents, tactile_latents):
+                                       video_latents, tactile_latents, *,
+                                       cold_seed_frames=0):
         """Route caller-confirmed RGB matches into this grounding transaction.
 
         No depth, new tokens, encoder calls, or mutation of stored historical KV.
@@ -1061,7 +1062,10 @@ class TWAM_Server:
             raise ValueError('contact_pairs requires dense RGB/tactile latents and temporal patch size 1')
         _, sensors, _, frames, th, tw = tactile.shape
         vf, vh, vw = video_latents.shape[2:]
-        if (frames != vf or sensors != len(self.job_config.tactile_keys)
+        cold_mixed_layout = (
+            cold_seed_frames > 0 and vf == frames + cold_seed_frames)
+        if ((frames != vf and not cold_mixed_layout)
+                or sensors != len(self.job_config.tactile_keys)
                 or vh % ph or vw % (pw * len(cameras)) or th % ph or tw % pw):
             raise ValueError('contact_pairs video/tactile frame or patch layout mismatch')
         h, w = vh // ph, vw // (pw * len(cameras))
@@ -1069,6 +1073,14 @@ class TWAM_Server:
         features = torch.as_tensor(pairs['neoforce'], device=self.device)
         if features.ndim != 2 or len(features) != count:
             raise ValueError('contact_pairs must cover exactly the existing tactile token rows')
+        if cold_mixed_layout:
+            # The released dense path prepends the RGB/action seed, but not a
+            # tactile frame. Keep the existing latent/token/RoPE contract;
+            # do not invent a same-time RGB match for this shorter tactile tail.
+            # Real tactile descriptors remain available as unpaired metadata.
+            pairs = dict(pairs, visual_rows=torch.full_like(
+                torch.as_tensor(pairs['visual_rows'], device=self.device), -1))
+            logger.info('[cold-contact] RGB association deferred for mixed seed layout')
         camera_ids = torch.arange(len(cameras), device=self.device).repeat_interleave(w).repeat(vf * h)
         paired_keys = tuple(getattr(self.job_config, 'kv_contact_pair_camera_keys',
                                    ('observation.images.top', 'observation.images.third_view')))
@@ -2985,7 +2997,14 @@ class TWAM_Server:
         """Advance encoders and write both grounding experts inside one transaction."""
         obs = self._prepare_online_contacts(obs)
         rgb_motion = None
-        self.transformer.clear_pred_cache(self.cache_name)
+        # A cold seed's input is real, but its cached representation was built
+        # beside imagined future tokens. Recompute it with actual observations.
+        # Later grounding must retain all previously grounded real history.
+        if (request_frame_st_id == 0 and self._global_index_enabled()
+                and not rgb_motion_enabled):
+            self.transformer.clear_pred_cache(self.cache_name, include_observed=True)
+        else:
+            self.transformer.clear_pred_cache(self.cache_name)
         save_async(obs['obs'], os.path.join(
             self.exp_save_root, f'obs_data_{request_frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
@@ -3082,7 +3101,10 @@ class TWAM_Server:
                 input_dict['action_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
             if 'contact_pairs' in obs:
                 self._attach_observed_contact_pairs(
-                    obs, input_dict, dense_index, latent_model_input, tactile_latents)
+                    obs, input_dict, dense_index, latent_model_input, tactile_latents,
+                    cold_seed_frames=(self.init_latent.shape[2]
+                        if request_frame_st_id == 0 and not seed_is_already_cached
+                        else 0))
         last_observed_video_latent = (
             latent_model_input[:, :, -1:].detach().clone())
 
@@ -3113,9 +3135,7 @@ class TWAM_Server:
         if request_frame_st_id == 0:
             initial_latent = getattr(self, 'init_latent', None)
             seed_is_already_cached = (
-                (rgb_motion_enabled and self._last_rgb_motion is not None)
-                or (self._global_index_enabled()
-                    and getattr(self, '_init_kv_index', None) is not None))
+                rgb_motion_enabled and self._last_rgb_motion is not None)
             if seed_is_already_cached:
                 # The cold generation pass committed its clean-clamped first
                 # frame as an observed semantic token, so do not append the

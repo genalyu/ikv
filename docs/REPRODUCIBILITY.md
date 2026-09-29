@@ -45,15 +45,26 @@ keep the PP adapter hash separately. Stop only the relevant evaluation services
 before updating them. Run adapter regression/smoke tests after a core API change.
 Do not mix results from different source versions into one campaign.
 
-### Cold action seed retention
+### Cold seed reconstruction
 
-In global-cache mode, the clean-clamped first action frame is observed context,
-just like the initial RGB frame. It must survive prediction clearing because
-the first grounding appends only the continuation. Future/unclamped action
-frames remain predictions and are removed before real grounding. This changes
-only cache observation metadata, not action values, denoising, RGB ordering,
-success criteria or the legacy FIFO path.
+A clean-clamped seed has real input values, but its deeper cached representation
+was computed alongside imagined future tokens. Dense RGB global-cache serving now
+invalidates ALL cold cached entries on the first grounding and rebuilds the RGB
+and action seed together with the real continuation, matching the released FIFO
+grounding context. Later grounding still clears predictions only and preserves
+real history. RGB-motion/sparse serving keeps its existing separate lifecycle.
 
-Regression coverage includes CFG and non-CFG metadata and prediction clearing
-through a real tiny MoT. These tests do not establish a task success-rate gain;
-closed-loop results must be recorded separately.
+The clear operation is transactional across every layer: if encoding or either
+grounding expert fails, cached observations and predictions are restored.
+The public clear_pred_cache API has a keyword-only include_observed=False option.
+Deployment adapters must forward this option to every PP rank and preserve the
+transaction snapshots. Do not deploy this server against an old PP clear hook.
+
+The released cold dense layout prepends RGB/action but not tactile frames.
+For that one mixed-length grounding, keep tactile descriptors but defer visual
+contact association rather than invent same-time matches. No input latent,
+image order, action values, temporal RoPE layout or success criterion is changed.
+
+Fixed-request two-chunk diagnostics aligned rebuilt global-cache actions exactly
+with FIFO and checked selected layer Q/K/V, cache, and attention output. This is
+not a proof of task-score reproduction. Closed-loop results remain a separate gate.

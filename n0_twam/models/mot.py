@@ -190,11 +190,11 @@ class SharedSelfAttention(nn.Module):
     def clear_cache(self, cache_name):
         self.attn_caches[cache_name] = None
 
-    def clear_pred_cache(self, cache_name):
+    def clear_pred_cache(self, cache_name, *, include_observed=False):
         c = self.attn_caches.get(cache_name)
         if c is None:
             return
-        pred = c['is_pred'] & c['mask']
+        pred = c['mask'] if include_observed else c['is_pred'] & c['mask']
         semantic = c.get('semantic')
         if semantic is not None:
             semantic['valid'][pred] = False
@@ -1354,7 +1354,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             sa.clear_cache(cache_name)
         getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
 
-    def clear_pred_cache(self, cache_name):
+    def clear_pred_cache(self, cache_name, *, include_observed=False):
         # Capture every layer BEFORE invalidating the shared semantic sidecar.
         # Grounding may fail after clearing or after only one expert has written.
         entries = getattr(self.mot, '_active_cache_transactions', {}).get(
@@ -1363,11 +1363,12 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             for sa in self.mot.shared_attn:
                 cache = sa.attn_caches.get(cache_name)
                 if cache is not None:
-                    slots = (cache['mask'] & cache['is_pred']).nonzero().flatten()
+                    selected = cache['mask'] if include_observed else cache['mask'] & cache['is_pred']
+                    slots = selected.nonzero().flatten()
                     if slots.numel():
                         entries.append((sa, cache_name, sa._snapshot_cache_slots(cache, slots)))
         for sa in self.mot.shared_attn:
-            sa.clear_pred_cache(cache_name)
+            sa.clear_pred_cache(cache_name, include_observed=include_observed)
 
     def configure_global_retention(self, cache_name, **config):
         """Enable shared global top-k protection + random remainder eviction.
