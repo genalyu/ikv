@@ -8,6 +8,7 @@ at a bundle from script/make_serve_bundle.py, then:
 
     python -m n0_twam.n0_twam_server --config-name posttrain_server --port 29601
 """
+import os
 from easydict import EasyDict
 
 from .twam_posttrain_cfg import twam_posttrain_cfg
@@ -15,6 +16,14 @@ from .twam_posttrain_cfg import twam_posttrain_cfg
 s = EasyDict()
 s.update(twam_posttrain_cfg)
 s.__name__ = "Config: N0-TWAM post-train SERVER"
+
+# Training recipe and inference memory policy are independent. In this IKV
+# repository, serving defaults to global indexing even with official weights
+# trained without IKV. FIFO is an explicit diagnostic/compatibility choice.
+s.kv_cache_policy = os.environ.get("IKV_CACHE_POLICY", "global")
+if s.kv_cache_policy not in ("global", "fifo"):
+    raise ValueError("IKV_CACHE_POLICY must be global or fifo")
+
 
 s.infer_mode = "server"
 s.host = "0.0.0.0"

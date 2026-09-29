@@ -2533,6 +2533,9 @@ class TWAM_Server:
             _, ph, pw = self.job_config.patch_size
             if self.job_config.height % (16 * ph) or self.job_config.width % (16 * pw):
                 raise ValueError('global RGB index requires camera sizes divisible by WAN patch stride')
+        logger.info('[serve-contract] cache_policy=%s motion=%s attn_window=%s',
+                    cache_policy, getattr(self.job_config, 'use_rgb_motion_tokens', False),
+                    self.job_config.attn_window)
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
@@ -3002,6 +3005,7 @@ class TWAM_Server:
         # Later grounding must retain all previously grounded real history.
         if (request_frame_st_id == 0 and self._global_index_enabled()
                 and not rgb_motion_enabled):
+            logger.info('[cold-seed-rebuild] invalidate imagination-time KV0 and rebuild from observations')
             self.transformer.clear_pred_cache(self.cache_name, include_observed=True)
         else:
             self.transformer.clear_pred_cache(self.cache_name)

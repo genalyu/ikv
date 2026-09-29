@@ -1,5 +1,17 @@
 # Portable RGB-only IKV
 
+### Serving policy is independent of the training recipe
+
+Official weights trained with use_ikv_training=False can use IKV inference.
+Post-training serve configs default to global KV policy in this repository;
+set IKV_CACHE_POLICY=fifo explicitly for FIFO diagnostics. This does not change
+the training recipe. Invalid policy values fail during configuration loading.
+
+Check the actual [serve-contract] log, not just a launcher label or code version.
+Dense global cold grounding must also log [cold-seed-rebuild]. A FIFO run is not
+an IKV-global result, even if its files or task keys were named "ikv".
+
+
 ## Source and deployment boundaries
 
 A100 develops this repository; GitHub main publishes the same portable core.
