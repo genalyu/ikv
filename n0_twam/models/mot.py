@@ -194,7 +194,7 @@ class SharedSelfAttention(nn.Module):
         c = self.attn_caches.get(cache_name)
         if c is None:
             return
-        pred = c['mask'] if include_observed else c['is_pred'] & c['mask']
+        pred = c['mask'].clone() if include_observed else c['is_pred'] & c['mask']
         semantic = c.get('semantic')
         if semantic is not None:
             semantic['valid'][pred] = False

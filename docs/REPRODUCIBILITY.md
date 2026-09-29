@@ -80,3 +80,9 @@ image order, action values, temporal RoPE layout or success criterion is changed
 Fixed-request two-chunk diagnostics aligned rebuilt global-cache actions exactly
 with FIFO and checked selected layer Q/K/V, cache, and attention output. This is
 not a proof of task-score reproduction. Closed-loop results remain a separate gate.
+
+The long-stream CPU regression compares 24 rounds of prediction, temporary
+denoising and real grounding, at batch sizes 1 and 2, against FIFO without
+eviction. It checks exact outputs and cache tensors/slot IDs. Full clearing uses
+a copied selection mask so invalidating valid bits cannot skip ID/flag cleanup.
+This regression does not establish full-checkpoint or task-score equivalence.
