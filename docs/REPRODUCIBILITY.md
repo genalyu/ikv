@@ -44,3 +44,16 @@ Before deployment, record hashes of tracked runtime files and the core commit;
 keep the PP adapter hash separately. Stop only the relevant evaluation services
 before updating them. Run adapter regression/smoke tests after a core API change.
 Do not mix results from different source versions into one campaign.
+
+### Cold action seed retention
+
+In global-cache mode, the clean-clamped first action frame is observed context,
+just like the initial RGB frame. It must survive prediction clearing because
+the first grounding appends only the continuation. Future/unclamped action
+frames remain predictions and are removed before real grounding. This changes
+only cache observation metadata, not action values, denoising, RGB ordering,
+success criteria or the legacy FIFO path.
+
+Regression coverage includes CFG and non-CFG metadata and prediction clearing
+through a real tiny MoT. These tests do not establish a task success-rate gain;
+closed-loop results must be recorded separately.

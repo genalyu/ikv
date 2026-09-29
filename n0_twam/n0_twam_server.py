@@ -2449,6 +2449,19 @@ class TWAM_Server:
                 input_dict['action_res_lst'][
                     'noisy_latents'][:, :, 0:1] = action_cond[:, :, 0:1]
                 input_dict['action_res_lst']['timesteps'][0:1] *= 0
+                if self._global_index_enabled():
+                    # This is a clean condition, not a predicted action. The
+                    # first grounding keeps the observed RGB seed and skips
+                    # action frame 0, so its clamped action KV must survive
+                    # clear_pred_cache as well. Future actions remain predicted.
+                    tokens_per_frame = int(
+                        action_model_input.shape[-2] * action_model_input.shape[-1])
+                    flags = torch.zeros(
+                        action_model_input.shape[2] * tokens_per_frame,
+                        dtype=torch.bool, device=self.device)
+                    flags[:tokens_per_frame] = True
+                    input_dict['action_res_lst']['kv_index'] = {
+                        'observation_flag': flags}
             input_dict['action_res_lst']['noisy_latents'][:, ~self.
                                                           action_mask] *= 0
         return input_dict
