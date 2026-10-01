@@ -25,16 +25,13 @@ sum must equal `ikv_train_capacity`. The CLI override is
 - Motion selects visual patches only; all modalities still participate in the
   original shared attention. KV keeps RoPE, but the version-2 importance index
   stores no spatial coordinates, camera IDs, sensor IDs, or action vectors.
-- Visual score is weighted persistence + contact duration + current DINO
-  relevance + query usage + recency. Tactile score is recency + query usage.
+- The current post-training recipe sets all three query-usage weights to zero
+  for both training and serving. Visual score combines persistence, contact
+  duration, current DINO relevance and recency. Tactile score uses recency.
   Action retention first prefers rows with surviving same-frame visual or active
-  tactile evidence, then recency + query usage. Action subframe timestamps map
-  back to their parent frame for this association.
-- Query usage uses one softmax over the actual visible cross-modal keys. It is
-  averaged over sampled valid queries, heads, and participating layers, without
-  re-normalizing each modality or each pool maximum. Temporary diffusion calls,
-  failed transactions, and checkpoint recomputation do not accumulate usage.
-  `action_query_weight` and `tactile_query_weight` default to 1.
+  tactile evidence, then recency. Action subframe timestamps map back to their
+  parent frame for this association. These scores select context; model
+  attention remains trainable. Legacy checkpoints may still use query usage.
 - Separate modality budgets prevent a high score in one modality from taking
   another's budget. Old candidates are evicted in stable ascending score order;
   incoming keys must fit their modality budget. Same-score ties evict oldest
@@ -103,24 +100,34 @@ window. It does **not** have an unlimited online cache: its accessible context i
 bounded by the sampled sequence and attention window, and there is no streaming
 slot eviction during that forward pass.
 
-With IKV on, the same teacher-forced sequence is evaluated in its original causal
-phases: video/tactile phase, then action phase, for each sampled chunk. Each phase
-has separate noisy and condition branches. A noisy token cannot read its own
-phase's condition tokens; both branches can read allowed earlier condition KV.
-The existing global retention policy chooses the earlier tokens visible to each
-branch. Its capacity replaces the old distance window for history, so retained
-old evidence can remain visible after many intervening chunks.
+With IKV on, the same teacher-forced sequence uses the original causal
+video/tactile and action phases with separate noisy and condition branches.
+A noisy token cannot read its own phase's condition tokens. The detached
+retention policy first selects the historical condition tokens visible to each
+branch. The normal full-sequence MoT forward then runs once with that mask,
+so autograd trains the same attention parameters without a recurrent KV graph.
+There is no additional distance window in this IKV mask: a retained old token
+remains visible regardless of age. For masked IKV training, each sample draws a
+token capacity K uniformly between a configured fixed minimum (half the
+maximum by default) and the configured maximum. This draw is independent of
+the sample's future tokens. Version 2 preserves separate video/action/tactile
+budgets: it draws total K and distributes slots proportionally across each
+modality's configured capacity. Inference uses the
+configured full capacity. Baseline instead randomly draws a time window of
+4-64 phase IDs; these are different units and are not numerically equivalent.
 
 - Capacity is measured in valid tokens per sample, per layer. Version 2 enforces
-  separate modality budgets; legacy version 1 shares one budget. Each modality's
-  incoming phase must fit its budget, or training fails explicitly.
-- Clean/condition KV is kept with its autograd graph. Later action loss can train
-  attention to earlier evidence. Only hard selection, index features and usage
-  statistics are detached. No detached replay cache is substituted.
-- The selected version's serving retention policy is reused.
-  Query usage is measured from condition queries and averaged across layers.
-  Current clean DINO must not affect which history a simultaneous noisy target
-  sees; noisy selection uses the previously committed observation anchor.
+  separate modality budgets; legacy version 1 shares one budget. If a
+  sampled budget cannot fit the current phase, training fails explicitly;
+  raise the task's `ikv_min_capacity` for that robot/task. No token is silently
+  dropped to fit K. Low scores are evicted first, with
+  older tokens breaking equal-score ties in version 2.
+- Later action loss can still backpropagate through earlier condition tokens
+  because they participate in the single differentiable MoT forward. Only hard
+  retention selection and index features are detached.
+- The selected version's serving retention policy is reused with query-usage
+  weights zero. Current clean DINO must not affect which history a simultaneous
+  noisy target sees; noisy selection uses the previously committed anchor.
 - Each sample/forward starts an empty history, including across packed batch
   members. Nothing carries over to a different episode or optimizer step.
 - This remains teacher forcing. It does not train through multi-step diffusion
@@ -144,10 +151,11 @@ transformer to read it. A sample cropped entirely after that observation cannot
 teach this dependency. Include cue and decision in the same training sequence;
 choose a capacity and sequence length that actually exercise retention/eviction.
 
-**Memory limit:** bounded visible historical KV does not bound the entire training
-VRAM footprint. Autograd retains dependencies on earlier phases, including paths
-through evicted tokens. Long sequences require measured memory tuning. This code
-does not claim full-model training fits a single A100 at any fixed sequence size.
+**Memory limit:** the single forward eliminates the recurrent per-phase KV
+autograd graph, but model activations still scale with the full training sample.
+A small visible history does not imply a small full-sequence training footprint.
+Measure the longest sample before starting full training. W&B records the
+mean sampled K under `ikv/mean_capacity` for each optimizer update.
 
 ## Index data
 
@@ -159,7 +167,7 @@ matching the RGB server. Do not silently truncate moving patches. Dense WAN enco
 unchanged; sparse selection starts at transformer patches.
 
 For dense IKV-only training, `cfg.ikv_index_root_name = None` means semantic
-features are unavailable (their scores are zero); time/query still operate (action repetition is legacy version 1 only). To train with semantic retention, set an explicit relative root,
+features are unavailable (their scores are zero); time still operates (action repetition is legacy version 1 only). To train with semantic retention, set an explicit relative root,
 e.g. `ikv_index`, and supply one file per encoded segment:
 
 ```

@@ -2269,7 +2269,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             self_attention_mask, cross_attention_mask = masks
         else:
             from .ikv_training import training_metadata
-            training_memory = dict(config=ikv_config, layout=masks,
+            training_memory = dict(config=ikv_config, layout=masks, splits=split_list,
                 rows=training_metadata(position_inputs[3], masks, split_list,
                                        latent_dict, action_dict, prepared.get("condition_motion_layout"),
                                        version=ikv_config.get("retention", {}).get("version", 1)),

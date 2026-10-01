@@ -507,7 +507,9 @@ class Trainer:
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
         }
-        if bool(getattr(self.config, "use_ikv_training", False)) and dist.is_initialized():
+        if (bool(getattr(self.config, "use_ikv_training", False))
+                and getattr(self.config, "ikv_train_execution", "recurrent") == "recurrent"
+                and dist.is_initialized()):
             # Recurrent IKV invokes FSDP once per phase. Share the phase width
             # across ranks; variable trajectory lengths are padded below.
             shared_chunk = torch.tensor(input_dict["chunk_size"], device=self.device)
@@ -517,9 +519,14 @@ class Trainer:
             from n0_twam.models.motion_training import prepare_causal_motion
             prepare_causal_motion(latent_dict, input_dict["chunk_size"])
         if bool(getattr(self.config, "use_ikv_training", False)):
+            retention = dict(getattr(self.config, "kv_retention", {}))
+            execution = getattr(self.config, "ikv_train_execution", "recurrent")
             input_dict["ikv_training"] = dict(
                 capacity=self.config.ikv_train_capacity,
-                retention=dict(getattr(self.config, "kv_retention", {})))
+                retention=retention, execution=execution,
+                sample_capacity=bool(getattr(self.config, "ikv_train_sample_capacity", False)),
+                min_capacity=int(getattr(self.config, "ikv_train_min_capacity",
+                                         (self.config.ikv_train_capacity + 1) // 2)))
         return input_dict
 
     def convert_input_format(self, input_dict):
@@ -812,6 +819,10 @@ class Trainer:
             key: value.detach() if torch.is_tensor(value) else value
             for key, value in loss_dict.items()
         }
+        sampled_k = getattr(getattr(self.transformer, "mot", None),
+                            "last_sampled_ikv_capacity", None)
+        if sampled_k is not None:
+            losses["ikv_capacity"] = torch.tensor(float(sampled_k), device=self.device)
         
         # Only update weights after accumulating gradients
         if should_sync:
@@ -912,6 +923,9 @@ class Trainer:
                     'rgb_motion_rgb_threshold': float(getattr(_c, 'rgb_motion_rgb_threshold', .02)),
                     'use_ikv_training': bool(getattr(_c, 'use_ikv_training', False)),
                     'ikv_train_capacity': int(getattr(_c, 'ikv_train_capacity', 0)),
+                    'ikv_train_execution': getattr(_c, 'ikv_train_execution', 'recurrent'),
+                    'ikv_train_sample_capacity': bool(getattr(_c, 'ikv_train_sample_capacity', False)),
+                    'ikv_train_min_capacity': int(getattr(_c, 'ikv_train_min_capacity', 0)),
                     'kv_retention': dict(getattr(_c, 'kv_retention', {})),
                     'use_rgb_motion_tokens': bool(getattr(
                         _c, 'use_rgb_motion_tokens', False)),
@@ -1002,6 +1016,8 @@ class Trainer:
             'total_loss',
             'tactile_loss',     # symdiff; always tracked (0 if unused)
         ]
+        if bool(getattr(self.config, "use_ikv_training", False)):
+            metric_names.append("ikv_capacity")
         accumulated_metrics = {name: [] for name in metric_names}
         step_in_accumulation = 0
 
@@ -1036,7 +1052,8 @@ class Trainer:
                 for name, values in accumulated_metrics.items():
                     if not values:
                         continue
-                    metric_tensor = torch.stack(values).sum()
+                    metric_tensor = (torch.stack(values).mean() if name == "ikv_capacity"
+                                     else torch.stack(values).sum())
                     metric_shows[name] = dist_mean(metric_tensor).detach().cpu().item()
                     max_metric_shows[name] = dist_max(metric_tensor).detach().cpu().item()
 
@@ -1076,6 +1093,8 @@ class Trainer:
                             'epoch': (self.step / self.steps_per_epoch
                                       if self.steps_per_epoch else 0),
                         }
+                        if "ikv_capacity" in metric_shows:
+                            wandb_log["ikv/mean_capacity"] = metric_shows["ikv_capacity"]
                         self.wandb.log(wandb_log, step=self.step)
                 
                 self.step += 1

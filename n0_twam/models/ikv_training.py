@@ -4,6 +4,8 @@ Only backbone attention execution changes. Inputs, condition corruption,
 denoising targets and losses remain owned by the original Trainer/model.
 No persistent inference pool or detached historical K/V is used here.
 """
+from dataclasses import replace
+
 import torch
 import torch.distributed as dist
 from .multimodal_kv_retention import make_retention_policy
@@ -195,3 +197,156 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
             zero_anchor = zero_anchor + dummy.sum() * 0.0
         result = result + zero_anchor
     return result
+
+
+def sample_ikv_capacity(memory, device, retention):
+    """Draw K without consulting future token counts or feature values."""
+    config = memory["config"]
+    maximum = config["capacity"]
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ValueError("IKV capacity must be a positive integer")
+    if not config.get("sample_capacity", False):
+        config["sampled_capacity"] = maximum
+        return maximum, retention
+    minimum = config.get("min_capacity", (maximum + 1) // 2)
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1 or minimum > maximum:
+        raise ValueError("IKV min_capacity must be in [1, capacity]")
+    if retention.version == 2:
+        limits = [retention.video_capacity, retention.action_capacity, retention.tactile_capacity]
+        if sum(limits) != maximum:
+            raise ValueError("v2 modality capacities must sum to IKV capacity")
+        if minimum < 3:
+            raise ValueError("v2 min_capacity must reserve one slot per modality")
+    sampled = int(torch.randint(minimum, maximum + 1, (1,), device=device))
+    config["sampled_capacity"] = sampled
+    if retention.version == 1:
+        return sampled, retention
+    # Reserve one slot in each modality, then allocate the remaining sampled
+    # slots in proportion to configured modality slack. No trajectory metadata
+    # enters the budget decision; an oversized current phase fails explicitly.
+    slack = [limit - 1 for limit in limits]
+    total_slack = sum(slack)
+    extra = sampled - 3
+    shares = [divmod(extra * room, total_slack) if total_slack else (0, 0)
+              for room in slack]
+    budgets = [1 + share[0] for share in shares]
+    leftover = sampled - sum(budgets)
+    order = sorted(range(3), key=lambda i: (-shares[i][1], i))
+    for i in order:
+        if not leftover:
+            break
+        if budgets[i] < limits[i]:
+            budgets[i] += 1
+            leftover -= 1
+    assert leftover == 0 and sum(budgets) == sampled
+    config["sampled_modality_capacities"] = budgets
+    return sampled, replace(retention, video_capacity=budgets[0],
+                            action_capacity=budgets[1], tactile_capacity=budgets[2])
+
+
+def build_ikv_support_plan(memory, device):
+    """Replay the detached retention policy from recorded metadata only.
+
+    Attention-query usage must be disabled for this path; otherwise the mask
+    would depend on a model pass and could not be prepared before training.
+    """
+    config, layout, rows = memory["config"], memory["layout"], memory["rows"]
+    retention = RetentionConfig(**config.get("retention", {}))
+    if any(getattr(retention, name) for name in
+           ("query_weight", "action_query_weight", "tactile_query_weight")):
+        raise ValueError("Masked IKV requires zero query-usage score weights")
+    seq, phase, clean = (layout[name] for name in ("seq", "phase", "clean"))
+    valid_seqs = torch.unique(seq[seq >= 0]).tolist()
+    if valid_seqs != [0]:
+        raise ValueError("Masked IKV currently requires per-rank batch_size=1")
+    capacity, retention = sample_ikv_capacity(memory, device, retention)
+    support_clean = torch.zeros(int(phase.max()) + 1, len(seq), dtype=torch.bool, device=device)
+    support_noisy = torch.zeros_like(support_clean)
+    policy = make_retention_policy(capacity, device, retention)
+    occupied = torch.zeros(capacity, dtype=torch.bool, device=device)
+    slots = torch.empty(0, dtype=torch.long, device=device)
+    slot_to_token = torch.full((capacity,), -1, dtype=torch.long, device=device)
+    for stage in torch.unique(phase[seq == 0], sorted=True).tolist():
+        positions = ((seq == 0) & (phase == stage)).nonzero().flatten()
+        is_clean = clean[positions]
+        source = positions[is_clean]
+        incoming = {name: value[source] for name, value in rows.items()}
+        if retention.version == 2:
+            noisy_source = positions[~is_clean]
+            provisional = {name: value[noisy_source].clone() for name, value in rows.items()}
+            provisional["observation_flag"].zero_()
+            provisional["dino"].zero_()
+            provisional["neoforce"].zero_()
+            if "contact_present" in provisional:
+                provisional["contact_present"].zero_()
+        else:
+            provisional = dict(incoming,
+                               observation_flag=torch.zeros_like(incoming["observation_flag"]))
+        new_slots, victims = policy.plan(occupied, len(source), incoming)
+        _, noisy_victims = policy.plan(occupied, int((~is_clean).sum()), provisional)
+        clean_keep = ~torch.isin(slots, victims)
+        noisy_keep = ~torch.isin(slots, noisy_victims)
+        old_tokens = slot_to_token[slots]
+        support_clean[int(stage), old_tokens[clean_keep]] = True
+        support_noisy[int(stage), old_tokens[noisy_keep]] = True
+        kept_slots = slots[clean_keep]
+        old_mask = occupied.clone()
+        occupied[victims] = False
+        occupied[new_slots] = True
+        policy.commit(new_slots, incoming, old_mask)
+        slot_to_token[new_slots] = source
+        if retention.version == 2:
+            dense = memory.get("dense_dino_features")
+            if (dense is None or not dense.shape[-1]) and retention.persistence_weight:
+                raise ValueError("v2 persistence requires full-grid dense DINO")
+            if dense is not None:
+                real_times = incoming["world_time_id"][incoming["kind"] != 1]
+                if len(real_times):
+                    last = int(real_times.max())
+                    frame_ids = torch.arange(min(last + 1, dense.shape[1]), device=device)
+                    features = dense[0, frame_ids]
+                    times = frame_ids[:, None].expand(features.shape[:2]).flatten().float()
+                    policy.observe_dense(features.flatten(0, 1), times, torch.ones_like(times))
+        slots = torch.cat((kept_slots, new_slots))
+    return dict(clean=support_clean, noisy=support_noisy)
+
+
+def run_ikv_masked_training(mot, hidden, text, timestep, temb, rope, memory):
+    """Use the normal one-pass MoT backward with IKV-derived visibility."""
+    from .model import FlexAttnFunc
+    layout = memory["layout"]
+    seq, phase, clean = (layout[key] for key in ("seq", "phase", "clean"))
+    with torch.no_grad():
+        plan = build_ikv_support_plan(memory, hidden.device)
+    mot.last_sampled_ikv_capacity = memory["config"]["sampled_capacity"]
+    valid = seq >= 0
+    support_clean, support_noisy = plan["clean"], plan["noisy"]
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        same_sample = valid[q_idx] & valid[kv_idx] & (seq[q_idx] == seq[kv_idx])
+        same_phase = (phase[q_idx] == phase[kv_idx]) & (clean[q_idx] == clean[kv_idx])
+        past_clean = (phase[kv_idx] < phase[q_idx]) & clean[kv_idx]
+        phase_row = phase[q_idx].clamp_min(0)
+        retained = torch.where(clean[q_idx],
+                               support_clean[phase_row, kv_idx],
+                               support_noisy[phase_row, kv_idx])
+        return same_sample & (same_phase | (past_clean & retained))
+
+    length = len(seq)
+    dense_mask = None
+    block_mask = None
+    if hidden.device.type == "cpu" or hidden.shape[-1] < 16:
+        q = torch.arange(length, device=hidden.device)[:, None]
+        k = torch.arange(length, device=hidden.device)[None, :]
+        dense_mask = mask_mod(None, None, q, k)[None, None]
+    else:
+        block_mask = FlexAttnFunc.compiled_create_block_mask(
+            mask_mod, 1, 1, length, length, device=hidden.device, _compile=True)
+    splits = memory["splits"]
+    video = splits[0] + splits[1]
+    action = splits[2] + splits[3]
+    slices = [("video", 0, video), ("action", video, video + action),
+              ("tactile", video + action, length)]
+    mot.set_masks(self_block_mask=block_mask, dense_self_mask=dense_mask, cross_masks={})
+    result = mot(hidden, text, timestep, temb, rope, slices)
+    return result.masked_fill(~valid[None, :, None], 0)

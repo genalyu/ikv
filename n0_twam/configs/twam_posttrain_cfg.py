@@ -63,12 +63,15 @@ cfg = EasyDict(twam_base_cfg.copy())
 cfg.__name__ = f"Config: N0-TWAM post-train ({_ACTION_MODE}, MoT)"
 cfg.use_rgb_motion_tokens = _USE_MOTION
 cfg.use_ikv_training = _USE_IKV
+cfg.ikv_train_execution = "masked" if _USE_IKV else "recurrent"
+cfg.ikv_train_sample_capacity = bool(_USE_IKV)
 cfg.ikv_train_capacity = _IKV_CAPACITY
+cfg.ikv_train_min_capacity = (_IKV_CAPACITY + 1) // 2 if _USE_IKV else 0
 cfg.ikv_index_root_name = _IKV_INDEX_ROOT
 cfg.kv_retention = dict(cfg.kv_retention)
 cfg.kv_retention.update(version=2, video_capacity=_IKV_VIDEO_CAPACITY,
     action_capacity=_IKV_ACTION_CAPACITY, tactile_capacity=_IKV_TACTILE_CAPACITY,
-    action_query_weight=1.0, tactile_query_weight=1.0,
+    query_weight=0.0, action_query_weight=0.0, tactile_query_weight=0.0,
     persistence_weight=1.0, persistence_scale=8.0, contact_scale=8.0,
     content_threshold=0.9, content_capacity=2048)
 cfg.kv_cache_policy = "global" if _USE_IKV else "fifo"

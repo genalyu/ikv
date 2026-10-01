@@ -172,3 +172,15 @@ def test_v2_server_broadcasts_frame_contacts_without_visual_rows():
     torch.testing.assert_close(neo, torch.tensor([[3.,4.],[3.,4.],[5.,6.],[5.,6.]]))
     assert torch.equal(forward["latent_res_lst"]["tactile_kv_index"]["neoforce"], packet["neoforce"])
 
+
+
+def test_v2_evicts_low_score_then_oldest_on_tie(monkeypatch):
+    p = policy(video_capacity=3, query_weight=0,
+               action_query_weight=0, tactile_query_weight=0)
+    mask = torch.zeros(7, dtype=torch.bool)
+    slots, _ = append(p, mask, rows([0, 1, 2], kind=0))
+    score_by_slot = {int(slot): score for slot, score in zip(slots, (0.9, 0.1, 0.1))}
+    monkeypatch.setattr(p, "scores", lambda used, **kwargs: torch.tensor(
+        [score_by_slot[int(slot)] for slot in used]))
+    _, victims = p.plan(mask, 1, rows([3], kind=0))
+    assert victims.tolist() == [int(slots[1])]

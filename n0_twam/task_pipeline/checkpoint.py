@@ -68,6 +68,9 @@ def save_training_state(trainer, directory):
             world_size=world,
             task_fingerprint=trainer.config.task_fingerprint,
             mode=trainer.config.task_mode,
+            ikv_train_execution=getattr(trainer.config, "ikv_train_execution", "recurrent"),
+            ikv_train_sample_capacity=bool(getattr(trainer.config, "ikv_train_sample_capacity", False)),
+            ikv_train_min_capacity=int(getattr(trainer.config, "ikv_train_min_capacity", 0)),
             step=trainer.step,
         )
         temp = directory / "complete.tmp"
@@ -84,11 +87,17 @@ def load_training_state(trainer, directory):
         world_size=int(trainer.config.world_size),
         task_fingerprint=trainer.config.task_fingerprint,
         mode=trainer.config.task_mode,
+        ikv_train_execution=getattr(trainer.config, "ikv_train_execution", "recurrent"),
+        ikv_train_sample_capacity=bool(getattr(trainer.config, "ikv_train_sample_capacity", False)),
+        ikv_train_min_capacity=int(getattr(trainer.config, "ikv_train_min_capacity", 0)),
     )
+    legacy_defaults = {"ikv_train_execution": "recurrent",
+                       "ikv_train_sample_capacity": False,
+                       "ikv_train_min_capacity": 0}
     for k, v in expected.items():
-        if manifest[k] != v:
+        if manifest.get(k, legacy_defaults.get(k)) != v:
             raise ValueError(
-                f"Resume {k} mismatch; exact resume requires same task, mode and GPU count"
+                f"Resume {k} mismatch; exact resume requires same task, mode, GPU count and IKV training settings"
             )
     dcp.load(
         {"training": TrainingState(trainer)}, checkpoint_id=directory / "distributed"

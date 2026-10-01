@@ -147,6 +147,16 @@ def training_config(task, mode, world_size, *, require_ready=True):
     cfg.use_rgb_motion_tokens, cfg.use_ikv_training = motion, ikv
     cfg.kv_cache_policy = "global" if ikv else "fifo"
     cfg.ikv_train_capacity = int(task.get("features", {}).get("ikv_capacity", 4096))
+    cfg.ikv_train_execution = (task.get("features", {}).get("ikv_training_execution", "masked")
+                               if ikv else "recurrent")
+    cfg.ikv_train_sample_capacity = bool(ikv and cfg.ikv_train_execution == "masked"
+        and task.get("features", {}).get("ikv_sample_capacity", True))
+    cfg.ikv_train_min_capacity = (int(task.get("features", {}).get("ikv_min_capacity",
+                                           (cfg.ikv_train_capacity + 1) // 2)) if ikv else 0)
+    if ikv:
+        cfg.kv_retention = dict(cfg.kv_retention)
+        cfg.kv_retention.update(query_weight=0.0, action_query_weight=0.0,
+                                tactile_query_weight=0.0)
     cfg.ikv_index_root_name = "ikv_index" if ikv else None
     cfg.rgb_motion_root_name = "rgb_motion"
     cfg.rgb_motion_input_mode = "rgb"

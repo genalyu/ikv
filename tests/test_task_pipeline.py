@@ -47,6 +47,12 @@ def test_official_effective_batch_and_four_modes(tmp_path, world, acc):
         assert c.num_steps == 2000 and c.learning_rate == 1e-4 and c.warmup_steps == 20
         assert (c.beta1, c.beta2, c.weight_decay) == (0.9, 0.95, 0.1)
         assert c.kv_cache_policy == ("global" if bits[1] else "fifo")
+        if bits[1]:
+            assert c.ikv_train_execution == "masked"
+            assert c.ikv_train_sample_capacity is True
+            assert c.ikv_train_min_capacity == 2048
+            assert all(c.kv_retention[name] == 0 for name in (
+                "query_weight", "action_query_weight", "tactile_query_weight"))
         assert c.max_latent_frames == c.max_tactile_frames == 0
         assert c.used_action_channel_ids == list(range(10))
 
@@ -239,6 +245,10 @@ def test_full_checkpoint_restores_optimizer_scheduler_rng(tmp_path):
     assert b.lr_scheduler.state_dict() == a.lr_scheduler.state_dict()
     b.config.world_size = 2
     with pytest.raises(ValueError, match="world_size"):
+        load_training_state(b, tmp_path / "state")
+    b.config.world_size = 1
+    b.config.ikv_train_sample_capacity = True
+    with pytest.raises(ValueError, match="ikv_train_sample_capacity"):
         load_training_state(b, tmp_path / "state")
 
 

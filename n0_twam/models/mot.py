@@ -1004,7 +1004,9 @@ class MoTBackbone(nn.Module):
                     token_valid_mask=token_valid_mask,
                     cache_transaction=cache_entries,
                     cache_plan=cache_plan,
-                    usage_collector=None if policy is None else (policy, measurements),
+                    usage_collector=(None if policy is None or not any((
+                        policy.config.query_weight, policy.config.action_query_weight,
+                        policy.config.tactile_query_weight)) else (policy, measurements)),
                     cache_observation_flags=(None if cache_metadata is None
                                              else cache_metadata["observation_flag"]),
                     manage_semantic_sidecar=(layer == 0),
@@ -1271,9 +1273,13 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         training_memory=None,
     ):
         if training_memory is not None:
-            from .ikv_training import run_ikv_training
-            return run_ikv_training(self.mot, hidden_states, encoder_hidden_states,
-                                    timestep_proj, temb, rotary_emb, training_memory)
+            from .ikv_training import run_ikv_training, run_ikv_masked_training
+            execution = training_memory["config"].get("execution", "recurrent")
+            if execution not in ("recurrent", "masked"):
+                raise ValueError(f"Unknown IKV training execution: {execution}")
+            runner = run_ikv_masked_training if execution == "masked" else run_ikv_training
+            return runner(self.mot, hidden_states, encoder_hidden_states,
+                          timestep_proj, temb, rotary_emb, training_memory)
         # split_list = [v_noisy, v_clean, a_noisy, a_clean, t_noisy, t_clean, pad]
         v = split_list[0] + split_list[1]
         a = split_list[2] + split_list[3]
