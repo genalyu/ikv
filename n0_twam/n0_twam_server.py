@@ -875,11 +875,13 @@ class TWAM_Server:
         # This helper gates dense annotation, not the retention allocator.
         # Sparse mode supplies metadata through the selected motion sidecar.
         return (getattr(self.job_config, 'kv_cache_policy', 'fifo') == 'global'
-                and not bool(getattr(self.job_config, 'use_rgb_motion_tokens', False)))
+                and (not bool(getattr(self.job_config, 'use_rgb_motion_tokens', False))
+                     or dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2))
 
     def _predicted_dino_enabled(self):
-        return self._global_index_enabled() and bool(getattr(
-            self.job_config, 'kv_index_predicted_dino', True))
+        return (self._global_index_enabled()
+                and not bool(getattr(self.job_config, 'use_rgb_motion_tokens', False))
+                and bool(getattr(self.job_config, 'kv_index_predicted_dino', True)))
 
     @torch.no_grad()
     def _decode_prediction_for_index(self, latents, frame_st_id):
@@ -950,7 +952,7 @@ class TWAM_Server:
             torch.arange(width, device=self.device), indexing='ij')
         position = torch.stack((hh.flatten(), ww.flatten(), torch.zeros_like(ww.flatten())), dim=1)
         if (not torch.equal(handle['world_time_id'], ff.flatten())
-                or not torch.equal(handle['grid_position'], position)):
+                or ('grid_position' in handle and not torch.equal(handle['grid_position'], position))):
             raise ValueError('predicted DINO handle does not match the generated video grid')
         if handle['observation_flag'].all():
             return 0
@@ -1000,7 +1002,7 @@ class TWAM_Server:
         if not (self._global_index_enabled() and bool(getattr(
                 self.job_config, 'kv_neoforce_online', False))):
             return obs
-        if 'contact_pairs' in obs or 'tactile_kv_index' in obs:
+        if 'contact_pairs' in obs or 'contact_index' in obs or 'tactile_kv_index' in obs:
             raise ValueError('online contact encoding conflicts with supplied contact metadata')
         from n0_twam.preprocessing.online_contact import build_online_contact_pairs
         from n0_twam.preprocessing.neoforce import FrozenNeoForceEncoder
@@ -1021,10 +1023,15 @@ class TWAM_Server:
             tactile_keys=self.job_config.tactile_keys,
             visual_grid=(self.height // (16 * ph), self.width // (16 * pw)),
             tactile_grid=(th // (16 * ph), tw // (16 * pw)),
-            paired_camera=self.job_config.kv_contact_pair_camera_keys[0],
+            paired_camera=(self.job_config.obs_cam_keys[0] if
+                dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2
+                else self.job_config.kv_contact_pair_camera_keys[0]),
+            frame_level=dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2,
             device=self.device,
             min_similarity=getattr(self.job_config, 'kv_contact_min_similarity', .7),
             min_margin=getattr(self.job_config, 'kv_contact_min_margin', .15))
+        if dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2:
+            return dict(obs, contact_index=pairs)
         active = pairs['response'] > 0
         paired = active & (pairs['visual_rows'] >= 0)
         logger.info('[online-contact] cold=%s active=%s paired=%s tactile_only=%s',
@@ -1047,6 +1054,9 @@ class TWAM_Server:
         This is an input boundary, not an automatic RGB contact localizer.
         Rows of contact_pairs follow the existing tactile (sensor,F,H,W) order.
         """
+        if dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2:
+            return self._attach_frame_contacts(obs, input_dict, dense_index,
+                video_latents, tactile_latents, cold_seed_frames=cold_seed_frames)
         from n0_twam.preprocessing.kv_index import route_contact_index
         pairs = obs['contact_pairs']
         if set(pairs) != {'neoforce', 'response', 'visual_rows'}:
@@ -1097,6 +1107,47 @@ class TWAM_Server:
         input_dict['latent_res_lst']['tactile_kv_index'] = tail
         input_dict['action_res_lst']['tactile_kv_index'] = tail
         logger.info('[contact-index-prepare] sensors=%s frames=%s paired=%s tactile_rows=%s', sensors, frames, paired.sum().item(), count)
+
+    def _attach_frame_contacts(self, obs, inputs, dense_index, video, tactile, *, cold_seed_frames=0):
+        """Frame-level descriptors; no RGB/tactile patch correspondence."""
+        if "contact_pairs" in obs:
+            raise ValueError("v2 uses contact_index {neoforce,response}; remove legacy visual_rows")
+        if "tactile_kv_index" in obs:
+            raise ValueError("contact_index conflicts with tactile_kv_index")
+        packet = obs.get("contact_index")
+        if packet is None or set(packet) != {"neoforce", "response"}:
+            raise ValueError("contact_index requires neoforce and response")
+        if tactile is None:
+            raise ValueError("contact_index requires aligned observed tactile latents")
+        _, sensors, _, frames, h, w = tactile["tactile_global_latent"].shape
+        _, ph, pw = self.job_config.patch_size
+        patches = (h // ph) * (w // pw)
+        features = torch.as_tensor(packet["neoforce"], device=self.device).float()
+        response = torch.as_tensor(packet["response"], device=self.device).float()
+        if (features.ndim != 2 or len(features) != sensors * frames * patches
+                or response.shape != features.shape[:1] or not torch.isfinite(features).all()
+                or not torch.isfinite(response).all() or (response < 0).any()):
+            raise ValueError("contact_index must align with finite sensor/frame/patch rows")
+        features = features.masked_fill((response <= 0)[:, None], 0)
+        shaped = features.reshape(sensors, frames, patches, -1)
+        active = response.reshape(sensors, frames, patches) > 0
+        frame_features = shaped.sum((0, 2)) / active.sum((0, 2)).clamp_min(1)[:, None]
+        vf, vh, vw = video.shape[2:]
+        offset = vf - frames
+        if offset not in (0, cold_seed_frames):
+            raise ValueError("NeoForce/visual frame alignment mismatch")
+        visual = dict(dense_index)
+        neo = features.new_zeros(vf, (vh // ph) * (vw // pw), features.shape[-1])
+        neo[offset:] = frame_features[:, None]
+        visual["neoforce"] = neo.flatten(0, 1)
+        present = torch.zeros(vf, neo.shape[1], dtype=torch.bool, device=self.device)
+        present[offset:] = active.any(0).any(-1)[:, None]
+        visual["contact_present"] = present.flatten()
+        tail = {"neoforce": features, "contact_present": response > 0,
+                "observation_flag": torch.ones(len(features), device=self.device)}
+        inputs["latent_res_lst"]["kv_index"] = visual
+        inputs["latent_res_lst"]["tactile_kv_index"] = tail
+        inputs["action_res_lst"]["tactile_kv_index"] = tail
 
     def _get_rgb_motion_preprocessor(self):
         if getattr(self.job_config, 'rgb_motion_input_mode', 'rgbd') == 'rgb':
@@ -2592,13 +2643,21 @@ class TWAM_Server:
             action_token_per_chunk += tactile_token_per_chunk
             logger.info("tactile cache tokens per chunk: %d", tactile_token_per_chunk)
         trained_ikv = bool(getattr(self.job_config, 'use_ikv_training', False))
-        if trained_ikv:
+        multimodal_cfg = dict(getattr(self.job_config, 'kv_retention', {}))
+        multimodal = cache_policy == 'global' and multimodal_cfg.get('version', 1) == 2
+        if multimodal:
+            capacity = sum(multimodal_cfg[name] for name in
+                           ('video_capacity', 'action_capacity', 'tactile_capacity'))
+            if trained_ikv and capacity != int(self.job_config.ikv_train_capacity):
+                raise ValueError("v2 serving capacity must match trained modality budgets")
+            latent_token_per_chunk, action_token_per_chunk = capacity, 0
+        elif trained_ikv:
             capacity = int(getattr(self.job_config, 'ikv_train_capacity', 0))
             if capacity <= 0 or cache_policy != 'global':
                 raise ValueError("IKV-trained serving requires global policy and positive ikv_train_capacity")
             latent_token_per_chunk, action_token_per_chunk = capacity, 0
         self.transformer.create_empty_cache(self.cache_name,
-                                            2 if trained_ikv else self.job_config.attn_window,
+                                            2 if (trained_ikv or multimodal) else self.job_config.attn_window,
                                             latent_token_per_chunk,
                                             action_token_per_chunk,
                                             dtype=self.dtype,
@@ -2719,7 +2778,7 @@ class TWAM_Server:
             self.init_latent = init_latent
             if self._global_index_enabled():
                 self._init_kv_index = self._current_observed_kv_index
-                if 'contact_pairs' in obs:
+                if 'contact_pairs' in obs or 'contact_index' in obs:
                     seed_inputs = {'latent_res_lst': {}, 'action_res_lst': {}}
                     self._attach_observed_contact_pairs(
                         obs, seed_inputs, self._init_kv_index, init_latent, tactile_latents)
@@ -3103,7 +3162,7 @@ class TWAM_Server:
             if 'tactile_kv_index' in obs:
                 input_dict['latent_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
                 input_dict['action_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
-            if 'contact_pairs' in obs:
+            if 'contact_pairs' in obs or 'contact_index' in obs:
                 self._attach_observed_contact_pairs(
                     obs, input_dict, dense_index, latent_model_input, tactile_latents,
                     cold_seed_frames=(self.init_latent.shape[2]

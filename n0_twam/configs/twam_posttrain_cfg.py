@@ -49,8 +49,12 @@ _TACTILE_GLOBAL_ZERO = False
 # Independent optional post-training features. Both off = original recipe.
 _USE_MOTION = False
 _USE_IKV = False
-_IKV_CAPACITY = 4096
-_IKV_INDEX_ROOT = None  # optional full-grid sidecars for dense IKV-only training
+# Separate budgets; total is explicit and stored in checkpoint metadata.
+_IKV_VIDEO_CAPACITY = 2816
+_IKV_ACTION_CAPACITY = 512
+_IKV_TACTILE_CAPACITY = 768
+_IKV_CAPACITY = _IKV_VIDEO_CAPACITY + _IKV_ACTION_CAPACITY + _IKV_TACTILE_CAPACITY
+_IKV_INDEX_ROOT = "ikv_index"  # full-grid DINO, including patches motion omits
 # ───────── end EDIT ME ─────────
 
 assert _ACTION_MODE in ("absee", "delta"), _ACTION_MODE
@@ -61,6 +65,12 @@ cfg.use_rgb_motion_tokens = _USE_MOTION
 cfg.use_ikv_training = _USE_IKV
 cfg.ikv_train_capacity = _IKV_CAPACITY
 cfg.ikv_index_root_name = _IKV_INDEX_ROOT
+cfg.kv_retention = dict(cfg.kv_retention)
+cfg.kv_retention.update(version=2, video_capacity=_IKV_VIDEO_CAPACITY,
+    action_capacity=_IKV_ACTION_CAPACITY, tactile_capacity=_IKV_TACTILE_CAPACITY,
+    action_query_weight=1.0, tactile_query_weight=1.0,
+    persistence_weight=1.0, persistence_scale=8.0, contact_scale=8.0,
+    content_threshold=0.9, content_capacity=2048)
 cfg.kv_cache_policy = "global" if _USE_IKV else "fifo"
 
 # data

@@ -16,6 +16,17 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class RetentionConfig:
+    version: int = 1
+    video_capacity: int = 0
+    action_capacity: int = 0
+    tactile_capacity: int = 0
+    action_query_weight: float = 1.0
+    tactile_query_weight: float = 1.0
+    persistence_weight: float = 1.0
+    persistence_scale: float = 8.0
+    contact_scale: float = 8.0
+    content_threshold: float = 0.9
+    content_capacity: int = 2048
     top_k: int = 128
     time_scale: float = 8.0
     contact_weight: float = 1.0
@@ -28,15 +39,24 @@ class RetentionConfig:
     seed: int = 0
 
     def __post_init__(self):
+        if isinstance(self.version, bool) or self.version not in (1, 2):
+            raise ValueError("retention version must be 1 (legacy) or 2 (multimodal)")
+        for name in ("video_capacity", "action_capacity", "tactile_capacity", "content_capacity"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < (1 if self.version == 2 else 0):
+                raise ValueError(f"{name} must be a positive integer for v2")
+        if not 0 < self.content_threshold <= 1:
+            raise ValueError("content_threshold must be in (0, 1]")
         for name in ("top_k", "query_samples", "seed"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        for name in ("time_scale", "action_scale"):
+        for name in ("time_scale", "action_scale", "persistence_scale", "contact_scale"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         for name in ("contact_weight", "visual_weight", "time_weight",
-                     "query_weight", "repetition_weight"):
+                     "query_weight", "repetition_weight", "action_query_weight",
+                     "tactile_query_weight", "persistence_weight"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
 
@@ -327,6 +347,17 @@ def token_rows(context, *, batch_size, length, main_count, action_mode,
             if name == "observation_flag" and not ((value == 0) | (value == 1)).all():
                 raise ValueError("observation_flag must be binary")
             rows[name][start:end] = value
+    rows["contact_present"] = rows["neoforce"].ne(0).any(-1)
+    for index, start, end in indices:
+        if "contact_present" in index:
+            value = torch.as_tensor(index["contact_present"], device=device)
+            if value.ndim == 2:
+                if value.shape[0] not in (1, batch_size) or not torch.equal(value, value[:1].expand_as(value)):
+                    raise ValueError("contact_present differs across CFG batch")
+                value = value[0]
+            if not ((value == 0) | (value == 1)).all():
+                raise ValueError("contact_present must be binary")
+            rows["contact_present"][start:end] = torch.broadcast_to(value.bool(), (end-start,))
     actions = context.get("actions")
     rows["action"] = torch.empty(length, 0, device=device)
     if action_mode and actions is not None:

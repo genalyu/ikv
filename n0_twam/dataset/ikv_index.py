@@ -21,4 +21,10 @@ def load_dense_index(path, *, camera_keys, patch_size, grid_shape,
         if value.ndim != 3 or tuple(value.shape[:2]) != (full_frames, spatial) or not torch.isfinite(value).all():
             raise ValueError(f"dense IKV {name} requires finite [F,spatial,D]")
         result[name] = value[slice(start,end)].float()
+    frame_neo = payload.get("frame_neoforce_features")
+    if frame_neo is not None:
+        frame_neo = torch.as_tensor(frame_neo)
+        if frame_neo.ndim != 2 or len(frame_neo) != full_frames or not torch.isfinite(frame_neo).all():
+            raise ValueError("frame_neoforce_features requires finite [F,D], zero without contact")
+        result["frame_neoforce_features"] = frame_neo[slice(start, end)].float()
     return result

@@ -5,10 +5,11 @@ denoising targets and losses remain owned by the original Trainer/model.
 No persistent inference pool or detached historical K/V is used here.
 """
 import torch
+from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig
 
 
-def training_metadata(grid, layout, splits, latent, action, motion_layout):
+def training_metadata(grid, layout, splits, latent, action, motion_layout, version=1):
     """Describe condition tokens; index features never enter content embeddings."""
     n = len(layout["seq"])
     device = grid.device
@@ -26,6 +27,11 @@ def training_metadata(grid, layout, splits, latent, action, motion_layout):
             features = motion_layout["semantic_index"][name]
         elif motion_layout is None and source in latent:
             features = latent[source]
+        if version == 2 and name == "dino" and "dense_dino_features" in latent:
+            features = latent["dense_dino_features"].flatten(1, 2)
+            if motion_layout is not None:
+                indices = motion_layout["indices"]
+                features = features.gather(1, indices[..., None].expand(-1, -1, features.shape[-1]))
         if features is None:
             rows[name] = torch.empty(n, 0, device=device)
         else:
@@ -40,6 +46,17 @@ def training_metadata(grid, layout, splits, latent, action, motion_layout):
     if len(values) != splits[3]:
         raise ValueError("condition action metadata/token count mismatch")
     rows["action"][start:start+splits[3]] = values
+    if version == 2:
+        frame_neo = latent.get("frame_neoforce_features")
+        if frame_neo is not None:
+            if frame_neo.ndim != 3 or not torch.isfinite(frame_neo).all():
+                raise ValueError("frame_neoforce_features must be finite [B,F,D], zero without contact")
+            rows["neoforce"] = torch.zeros(n, frame_neo.shape[-1], device=device)
+            selected = layout["clean"] & (layout["seq"] >= 0) & (layout["kind"] != 1)
+            frame = rows["world_time_id"][selected].long()
+            if len(frame) and (frame.min() < 0 or frame.max() >= frame_neo.shape[1]):
+                raise ValueError("NeoForce frames do not cover the training sequence")
+            rows["neoforce"][selected] = frame_neo[layout["seq"][selected], frame]
     return rows
 
 
@@ -66,7 +83,7 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
         raise ValueError("text tokens must divide evenly across packed samples")
     outputs, addresses = [], []
     for batch in valid_seqs:
-        policy = GlobalKVRetention(capacity, hidden.device, retention)
+        policy = make_retention_policy(capacity, hidden.device, retention)
         mask = torch.zeros(capacity, dtype=torch.bool, device=hidden.device)
         slots = torch.empty(0, dtype=torch.long, device=hidden.device)
         past = [None] * mot.num_layers
@@ -80,7 +97,18 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
             with torch.no_grad():
                 # Do not let same-phase clean DINO/labels determine which past
                 # the noisy prediction can see. The anchor is committed history.
-                provisional = dict(incoming, observation_flag=torch.zeros_like(incoming["observation_flag"]))
+                if retention.version == 2:
+                    noisy_source = positions[~is_clean]
+                    # Allocation needs only kinds/times. No clean semantic metadata
+                    # may influence simultaneous noisy-branch history selection.
+                    provisional = {k: v[noisy_source].clone() for k, v in rows.items()}
+                    provisional["observation_flag"].zero_()
+                    provisional["dino"].zero_()
+                    provisional["neoforce"].zero_()
+                    if "contact_present" in provisional:
+                        provisional["contact_present"].zero_()
+                else:
+                    provisional = dict(incoming, observation_flag=torch.zeros_like(incoming["observation_flag"]))
                 new_slots, victims = policy.plan(mask, len(source), incoming)
                 _, noisy_victims = policy.plan(mask, int((~is_clean).sum()), provisional)
                 clean_keep = ~torch.isin(slots, victims)
@@ -121,6 +149,20 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
                 measurements = [policy.measure_usage(q, kv[0].detach(), combined_slots)
                                 for (_k, _v, q), kv in zip(current, past) if q.shape[1]]
                 policy.add_usage(measurements)
+                if retention.version == 2:
+                    dense = memory.get("dense_dino_features")
+                    if (dense is None or not dense.shape[-1]) and retention.persistence_weight:
+                        raise ValueError("v2 persistence requires full-grid dense_dino_features; disable persistence_weight to omit")
+                    if dense is not None:
+                        # Update only after this phase has evaluated. No future
+                        # observation can affect its simultaneous noisy branch.
+                        real_times = incoming["world_time_id"][incoming["kind"] != 1]
+                        if len(real_times):
+                            last = int(real_times.max())
+                            frame_ids = torch.arange(min(last + 1, dense.shape[1]), device=hidden.device)
+                            features = dense[batch, frame_ids]
+                            times = frame_ids[:, None].expand(features.shape[:2]).flatten().float()
+                            policy.observe_dense(features.flatten(0, 1), times, torch.ones_like(times))
             slots = combined_slots
     result = torch.zeros_like(hidden)
     return result.index_copy(1, torch.cat(addresses), torch.cat(outputs, dim=1))

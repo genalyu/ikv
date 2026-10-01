@@ -13,7 +13,7 @@ from .rgb_contact_matching import mutual_contact_matches, pool_visual_tokens
 def build_online_contact_pairs(obs, *, encoder, anchors, camera_keys,
                                tactile_keys, visual_grid, tactile_grid,
                                paired_camera, device, min_similarity=.7,
-                               min_margin=.15):
+                               min_margin=.15, frame_level=False):
     rgb_frames = obs['obs'] if isinstance(obs['obs'], list) else [obs['obs']]
     tactile_frames = obs['tactile'] if isinstance(obs['tactile'], list) else [obs['tactile']]
     if len(rgb_frames) != len(tactile_frames) or not rgb_frames:
@@ -54,15 +54,18 @@ def build_online_contact_pairs(obs, *, encoder, anchors, camera_keys,
             # local responses: opposite fingers must not cancel one another.
             mask = local_force.ne(0).float()
             encoded = encoder(rgb[:, start:anchor+1], local_force, mask)
-            if 'visual_tokens' not in encoded:
+            if not frame_level and 'visual_tokens' not in encoded:
                 raise ValueError('NeoForce encoder must expose visual patch tokens for RGB matching')
             pooled = pool_contact_tokens({'tokens': encoded['tokens'][:, -1:],
                                           'response': encoded['response'][:, -1:]}, tactile_grid)
-            v = pool_visual_tokens(encoded['visual_tokens'][:, -1:], visual_grid).reshape(vh*vw, -1)
+            v = (None if frame_level else pool_visual_tokens(encoded['visual_tokens'][:, -1:], visual_grid).reshape(vh*vw, -1))
             f = pooled['neoforce'][0, :, 0]
             r = pooled['response'][0, :, 0]
             sensor_rows = []
             for sensor in range(2):
+                if frame_level:
+                    sensor_rows.append(torch.full(tactile_grid, -1, dtype=torch.long, device=device))
+                    continue
                 matched = mutual_contact_matches(v, f[sensor].flatten(0, 1), r[sensor].flatten(),
                                                  min_similarity=min_similarity, min_margin=min_margin)
                 rows = matched['visual_rows']
@@ -80,4 +83,6 @@ def build_online_contact_pairs(obs, *, encoder, anchors, camera_keys,
     features = torch.cat(all_features).flatten(0, 3)
     response = torch.cat(all_response).flatten()
     rows = torch.cat(all_rows).flatten()
+    if frame_level:
+        return {'neoforce': features, 'response': response}
     return {'neoforce': features, 'response': response, 'visual_rows': rows}

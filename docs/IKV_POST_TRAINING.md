@@ -9,6 +9,66 @@ The original trainer updates its normal trainable transformer parameters; these
 switches change what context they learn to use, not which parameter names train.
 Frozen preprocessing features never become model input embeddings.
 
+## Multimodal retention version 2
+
+The posttrain configuration now explicitly selects version 2 when IKV is enabled.
+Baseline with IKV disabled is unchanged. Legacy configurations without a version
+remain version 1; loading a checkpoint compares the complete retention config and
+does not silently upgrade it.
+
+Version 2 divides the total capacity into video/action/tactile budgets. Configure
+`kv_retention.video_capacity`, `action_capacity`, and `tactile_capacity`; their
+sum must equal `ikv_train_capacity`. The CLI override is
+`--ikv-modality-capacities VIDEO ACTION TACTILE`. The posttrain defaults are
+2816/512/768. These are configurable starting budgets, not measured optimums.
+
+- Motion selects visual patches only; all modalities still participate in the
+  original shared attention. KV keeps RoPE, but the version-2 importance index
+  stores no spatial coordinates, camera IDs, sensor IDs, or action vectors.
+- Visual score is weighted persistence + contact duration + current DINO
+  relevance + query usage + recency. Tactile score is recency + query usage.
+  Action retention first prefers rows with surviving same-frame visual or active
+  tactile evidence, then recency + query usage. Action subframe timestamps map
+  back to their parent frame for this association.
+- Query usage uses one softmax over the actual visible cross-modal keys. It is
+  averaged over sampled valid queries, heads, and participating layers, without
+  re-normalizing each modality or each pool maximum. Temporary diffusion calls,
+  failed transactions, and checkpoint recomputation do not accumulate usage.
+  `action_query_weight` and `tactile_query_weight` default to 1.
+- Separate modality budgets prevent a high score in one modality from taking
+  another's budget. Old candidates are evicted in stable ascending score order;
+  incoming keys must fit their modality budget. Same-score ties evict oldest
+  time, then oldest insertion. There is no random remainder eviction in v2.
+- DINO persistence measures observed support, not cache residence. Full-grid
+  features before motion are required when `persistence_weight > 0`, even if
+  some/all patches were filtered. One group/time counts once, observation gaps
+  do not count, and content history is bounded by `content_capacity`. Similarity
+  is a heuristic content association, not guaranteed physical object identity.
+- `MultimodalKVRetention.tactile_scorer` is an optional detached scoring hook
+  accepting times and NeoForce vectors. It is unset in this release; no Qwen
+  calls or judge training are introduced. Any future implementation must also
+  version and validate its train/serve configuration.
+
+For v2, `ikv_index_root_name` full-grid sidecars are used in both motion and dense
+training. Supply `dino_features[F, spatial, D]` and optionally
+`frame_neoforce_features[F,D]` (zero without contact). Data loading preserves the
+full-grid DINO tensor as `dense_dino_features`, independently of sparse support.
+These features are detached; causal phases update content history only after the
+phase has been evaluated. Set `persistence_weight=0` to explicitly disable P
+when full-grid DINO is unavailable.
+
+Serving v2 accepts `contact_index={neoforce,response}` covering existing tactile
+tokens in sensor/frame/patch order. Positive response gates descriptors; their
+frame mean is broadcast to every visual token of that frame. An independent
+contact flag prevents vector cancellation from being mistaken for no contact.
+No visual-row matching is performed. Legacy `contact_pairs/visual_rows` is
+rejected in v2. Optional online NeoForce uses the same frame-level route; its
+existing force-input schema and encoder weights remain unchanged.
+
+The version-2 CUDA smoke is:
+`OMP_NUM_THREADS=2 python tests/smoke_ikv_training_cuda.py --retention-version 2`.
+It checks tiny random models, not task performance or full-model memory fit.
+
 ## Independent switches
 
 First complete [POST_TRAINING.md](POST_TRAINING.md): convert demonstrations,
@@ -51,12 +111,13 @@ The existing global retention policy chooses the earlier tokens visible to each
 branch. Its capacity replaces the old distance window for history, so retained
 old evidence can remain visible after many intervening chunks.
 
-- Capacity is shared across modalities, measured in valid tokens **per sample,
-  per layer**. The largest incoming phase must fit, or training fails explicitly.
+- Capacity is measured in valid tokens per sample, per layer. Version 2 enforces
+  separate modality budgets; legacy version 1 shares one budget. Each modality's
+  incoming phase must fit its budget, or training fails explicitly.
 - Clean/condition KV is kept with its autograd graph. Later action loss can train
   attention to earlier evidence. Only hard selection, index features and usage
   statistics are detached. No detached replay cache is substituted.
-- The same global top-k protection and seeded random eviction policy is reused.
+- The selected version's serving retention policy is reused.
   Query usage is measured from condition queries and averaged across layers.
   Current clean DINO must not affect which history a simultaneous noisy target
   sees; noisy selection uses the previously committed observation anchor.
@@ -98,8 +159,7 @@ matching the RGB server. Do not silently truncate moving patches. Dense WAN enco
 unchanged; sparse selection starts at transformer patches.
 
 For dense IKV-only training, `cfg.ikv_index_root_name = None` means semantic
-features are unavailable (their scores are zero); time/query/action repetition
-still operate. To train with semantic retention, set an explicit relative root,
+features are unavailable (their scores are zero); time/query still operate (action repetition is legacy version 1 only). To train with semantic retention, set an explicit relative root,
 e.g. `ikv_index`, and supply one file per encoded segment:
 
 ```

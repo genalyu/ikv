@@ -2271,7 +2271,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             from .ikv_training import training_metadata
             training_memory = dict(config=ikv_config, layout=masks,
                 rows=training_metadata(position_inputs[3], masks, split_list,
-                                       latent_dict, action_dict, prepared.get("condition_motion_layout")))
+                                       latent_dict, action_dict, prepared.get("condition_motion_layout"),
+                                       version=ikv_config.get("retention", {}).get("version", 1)),
+                dense_dino_features=latent_dict.get("dense_dino_features",
+                    latent_dict.get("dino_features") if prepared.get("condition_motion_layout") is None else None))
             self_attention_mask = cross_attention_mask = None
         hidden_states = self._run_backbone(
             hidden_states,
@@ -2583,6 +2586,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             ),
             cache_context={
                 'grid_id': full_grid_id,
+                'dense_grid': input_dict['grid_id'],
+                'selected_indices': None if motion_layout is None else motion_layout['indices'],
                 'index': input_dict.get('kv_index'),
                 'tail_index': input_dict.get('tactile_kv_index'),
                 'actions': input_dict['noisy_latents'] if action_mode else None,

@@ -65,7 +65,10 @@ class Trainer:
             capacity = getattr(config, "ikv_train_capacity", 0)
             if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
                 raise ValueError("ikv_train_capacity must be a positive integer")
-            RetentionConfig(**dict(getattr(config, "kv_retention", {})))
+            retention = RetentionConfig(**dict(getattr(config, "kv_retention", {})))
+            if retention.version == 2 and capacity != (
+                    retention.video_capacity + retention.action_capacity + retention.tactile_capacity):
+                raise ValueError("ikv_train_capacity must equal the three v2 modality capacities")
         if (bool(getattr(config, 'use_rgb_motion_tokens', False))
                 and not bool(getattr(config, 'use_mot', False))):
             raise ValueError(
@@ -429,6 +432,7 @@ class Trainer:
             'rgb_motion_patch_indices', 'rgb_motion_indices',
             'rgb_motion_valid_mask', 'motion_indices', 'motion_valid_mask',
             'world_time_id', 'dino_features', 'neoforce_features',
+            'dense_dino_features', 'frame_neoforce_features',
             'observation_flag', 'visual_valid', 'tactile_valid',
             'motion_scores', 'camera_ids', 'patch_uv',
         ):
@@ -1102,6 +1106,15 @@ def run(args):
         config.kv_cache_policy = "global" if args.ikv else "fifo"
     if args.ikv_capacity is not None:
         config.ikv_train_capacity = args.ikv_capacity
+    modality_capacities = getattr(args, "ikv_modality_capacities", None)
+    if modality_capacities is not None:
+        config.kv_retention = dict(getattr(config, "kv_retention", {}))
+        config.kv_retention.update(version=2, **dict(zip(
+            ("video_capacity", "action_capacity", "tactile_capacity"), modality_capacities)))
+        total = sum(modality_capacities)
+        if args.ikv_capacity is not None and args.ikv_capacity != total:
+            raise ValueError("--ikv-capacity must equal --ikv-modality-capacities sum")
+        config.ikv_train_capacity = total
     if args.base_checkpoint is not None:
         config.resume_from = args.base_checkpoint
     if bool(getattr(config, "use_ikv_training", False)):
@@ -1135,6 +1148,9 @@ def main():
                         help="Enable/disable motion patches; retain original N0-TWAM loss")
     parser.add_argument("--ikv", action=argparse.BooleanOptionalAction, default=None,
                         help="Enable/disable IKV historical attention in teacher-forced training")
+    parser.add_argument("--ikv-modality-capacities", type=int, nargs=3, default=None,
+                        metavar=("VIDEO", "ACTION", "TACTILE"),
+                        help="Enable v2 with explicit per-modality token budgets")
     parser.add_argument("--ikv-capacity", type=int, default=None,
                         help="Maximum retained condition tokens, shared across all experts")
     parser.add_argument("--base-checkpoint", default=None,

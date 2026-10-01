@@ -1105,6 +1105,25 @@ class LatentLeRobotDataset(LeRobotDataset):
         own samples. Keeping the grid calculation and sidecar loading here gives
         those entry points one identical opt-in contract.
         """
+        config = getattr(self, "config", None)
+        retention = dict(getattr(config, "kv_retention", {}))
+        if bool(getattr(config, "use_ikv_training", False)) and retention.get("version", 1) == 2:
+            root_name = getattr(config, "ikv_index_root_name", None)
+            if not root_name and retention.get("persistence_weight", 1):
+                raise ValueError("v2 persistence requires ikv_index_root_name full-grid sidecars")
+            if root_name:
+                from n0_twam.dataset.ikv_index import load_dense_index
+                patch = tuple(getattr(config, "patch_size", (1,2,2)))
+                _, h, w, _ = out_dict["latents"].shape
+                path = self._resolve_rgb_motion_file(episode_index, local_start_frame,
+                    local_end_frame, root_name=root_name)
+                dense = load_dense_index(path, camera_keys=self.used_video_keys,
+                    patch_size=patch, grid_shape=(h//patch[1], w//patch[2]),
+                    latent_frame_ids=latent_frame_ids, full_frames=int(expected_full_frames),
+                    start=truncate_start, end=truncate_end)
+                out_dict["dense_dino_features"] = dense["dino_features"]
+                if "frame_neoforce_features" in dense:
+                    out_dict["frame_neoforce_features"] = dense["frame_neoforce_features"]
         if not self.use_rgb_motion_tokens:
             config = getattr(self, "config", None)
             root_name = getattr(config, "ikv_index_root_name", None)

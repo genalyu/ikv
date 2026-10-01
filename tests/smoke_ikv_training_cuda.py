@@ -18,18 +18,22 @@ from test_ikv_training import training_input, original_loss
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--retention-version", type=int, choices=(1, 2), default=1)
+    args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This smoke requires one CUDA GPU")
     with tempfile.TemporaryDirectory() as tmp:
         dist.init_process_group('nccl', init_method='file://' + tmp + '/rendezvous',
                                 rank=0, world_size=1)
         try:
-            run()
+            run(args.retention_version)
         finally:
             dist.destroy_process_group()
 
 
-def run():
+def run(retention_version=1):
     trainer = original_loss()
     trainer.gradient_accumulation_steps = 2
     for motion, ikv in [(False, False), (True, False), (False, True), (True, True)]:
@@ -52,7 +56,12 @@ def run():
             for micro in range(2):
                 data = training_input('cuda', motion)
                 if ikv:
-                    data['ikv_training'] = dict(capacity=12, retention=dict(top_k=2))
+                    retention = dict(top_k=2)
+                    if retention_version == 2:
+                        retention.update(version=2, video_capacity=4, action_capacity=4, tactile_capacity=4)
+                        data['latent_dict']['dense_dino_features'] = torch.ones(1,3,4,2,device='cuda')
+                        data['latent_dict']['frame_neoforce_features'] = torch.ones(1,3,2,device='cuda')
+                    data['ikv_training'] = dict(capacity=12, retention=retention)
                 model.set_requires_gradient_sync(micro == 1)
                 output = model(data, train_mode=True)
                 loss = trainer.compute_loss(data, output)['total_loss']

@@ -34,6 +34,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 from .model import WanTransformerBlock, FlexAttnFunc, custom_sdpa, WanTransformer3DModel
+from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig, token_rows
 
 
@@ -880,6 +881,7 @@ class MoTBackbone(nn.Module):
         semantic_index=None,
         token_valid_mask=None,
         cache_metadata=None,
+        content_observations=None,
         training_context=None,
     ):
         """Run the MoT stack.
@@ -1069,6 +1071,8 @@ class MoTBackbone(nn.Module):
             if policy is not None and update_cache:
                 policy.commit(cache_plan[0], rows, old_mask)
                 policy.add_usage(measurements)
+                if content_observations is not None and policy.config.version == 2:
+                    policy.observe_dense(*content_observations)
         except BaseException:
             if policy_before is not None:
                 policy.restore(policy_before)
@@ -1379,7 +1383,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         if not caches or any(c["mask"].any() for c in caches):
             raise ValueError("configure retention on a new, empty multi-layer KV cache")
         cfg = RetentionConfig(**config)
-        self.mot.retention_policies[cache_name] = GlobalKVRetention(
+        self.mot.retention_policies[cache_name] = make_retention_policy(
             caches[0]["mask"].numel(), caches[0]["mask"].device, cfg)
 
     def get_global_retention(self, cache_name):
@@ -1526,18 +1530,46 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         else:
             slices = [("video", 0, m), ("action", m, m), ("tactile", m, m + t)]
         metadata = None
+        content_observations = None
         policy_enabled = cache_name in getattr(self.mot, "retention_policies", {})
         if cache_context is not None and (policy_enabled or cache_context.get("index") is not None):
-            if policy_enabled and semantic_index is not None:
+            policy = self.mot.retention_policies.get(cache_name)
+            v2 = policy is not None and policy.config.version == 2
+            cache_context = dict(cache_context)
+            if v2 and not action_mode:
+                from .frame_index import dense_observations
+                content_observations = dense_observations(
+                    cache_context.get("index"), cache_context["dense_grid"],
+                    required=bool(update_cache == 2 and policy.config.persistence_weight))
+            if policy_enabled and (semantic_index is not None or (
+                    v2 and cache_context.get("selected_indices") is not None)):
                 if cache_context.get("index") is not None:
-                    raise ValueError("sparse global mode expects selected motion metadata, not dense kv_index")
-                cache_context = dict(cache_context)
-                cache_context["index"] = {name: semantic_index[name]
-                    for name in ("dino", "neoforce", "observation_flag")}
+                    if not v2:
+                        raise ValueError("sparse global mode expects selected motion metadata, not dense kv_index")
+                    selected = cache_context["selected_indices"][0]
+                    dense = cache_context["index"]
+                    cache_context["index"] = {}
+                    for name, value in dense.items():
+                        if not isinstance(value, torch.Tensor):
+                            value = torch.as_tensor(value, device=hidden_states.device)
+                        feature = name in ("dino", "neoforce")
+                        if value.ndim == (3 if feature else 2):
+                            if (value.shape[0] not in (1, hidden_states.shape[0])
+                                    or not torch.equal(value, value[:1].expand_as(value))):
+                                raise ValueError(f"kv_index.{name} differs across CFG batch")
+                            value = value[0]
+                        scalar = value.ndim == 0 or (not feature and value.numel() == 1)
+                        cache_context["index"][name] = value if scalar else value[selected]
+                elif semantic_index is not None:
+                    cache_context["index"] = {name: semantic_index[name]
+                        for name in ("dino", "neoforce", "observation_flag")}
             metadata = token_rows(
                 cache_context, batch_size=hidden_states.shape[0], length=m+t,
                 main_count=m, action_mode=action_mode, update_cache=update_cache,
                 device=hidden_states.device)
+            if v2:
+                from .frame_index import broadcast_frame_contacts
+                metadata = broadcast_frame_contacts(metadata)
             # Dense indexing has no sparse gather and no nonzero-presence
             # requirement. Features are kept out of hidden states and Q/K/V.
             if semantic_index is None and not policy_enabled:
@@ -1560,6 +1592,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             cache_name=cache_name,
             semantic_index=None if policy_enabled else semantic_index,
             token_valid_mask=token_valid_mask,
+            content_observations=content_observations,
             **({"cache_metadata": metadata} if metadata is not None else {}),
         )
 
