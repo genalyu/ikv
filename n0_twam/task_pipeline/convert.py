@@ -66,6 +66,15 @@ def image_stats_rgb(frames):
     } | {"count": [frames_seen]}
 
 
+def image_stats_video(path):
+    import av
+
+    with av.open(str(path)) as video:
+        return image_stats_rgb(
+            frame.to_ndarray(format="rgb24") for frame in video.decode(video=0)
+        )
+
+
 def encode_aligned_video(source, destination, ids, fps):
     import av
 
@@ -197,7 +206,11 @@ def convert(task):
                         shapes[key] = json.loads(marker.read_text())["shapes"][key]
                     else:
                         with video_reader(source) as source_file:
-                            payload = source_file.read()
+                            payload = (
+                                Path(source_file).read_bytes()
+                                if isinstance(source_file, str)
+                                else source_file.read()
+                            )
                         jobs[key] = pool.submit(
                             encode_aligned_video, payload, video, ids, fps
                         )
@@ -236,13 +249,16 @@ def convert(task):
         st = {k: stats(np.stack(df[k])) for k in df.columns}
         # Camera statistics follow LeRobot [C,1,1] normalized-image convention.
         # Compute from actual converted frames, not placeholders.
-        import av
-
-        for key in ep.videos:
-            with av.open(str(root / "videos" / chunk / key / (stem + ".mp4"))) as vid:
-                st[key] = image_stats_rgb(
-                    frame.to_ndarray(format="rgb24") for frame in vid.decode(video=0)
+        with ThreadPoolExecutor(max_workers=min(4, len(ep.videos))) as pool:
+            stat_jobs = {
+                key: pool.submit(
+                    image_stats_video,
+                    root / "videos" / chunk / key / (stem + ".mp4"),
                 )
+                for key in ep.videos
+            }
+            for key, job in stat_jobs.items():
+                st[key] = job.result()
         all_stats.append(dict(episode_index=index, stats=st))
         provenance.append(
             dict(
