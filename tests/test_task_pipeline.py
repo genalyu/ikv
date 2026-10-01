@@ -442,3 +442,23 @@ def test_quality_filter_keeps_only_explicitly_allowed_demonstrations(tmp_path):
     ]:
         episode.metadata = {"quality": {"labels": labels}}
         assert (quality_exclusion_reason(episode, t) is not None) == excluded
+
+
+
+def test_image_stats_rgb_matches_full_precision_reference():
+    from n0_twam.task_pipeline.convert import image_stats_rgb
+
+    rng = np.random.default_rng(5)
+    frames = [rng.integers(0, 256, size=(31, 37, 3), dtype=np.uint8) for _ in range(4)]
+    result = image_stats_rgb(iter(frames))
+    pixels = np.concatenate([x.reshape(-1, 3) for x in frames]).astype(np.float64) / 255
+    for key, expected in {
+        "min": pixels.min(axis=0),
+        "max": pixels.max(axis=0),
+        "mean": pixels.mean(axis=0),
+        "std": pixels.std(axis=0),
+    }.items():
+        np.testing.assert_allclose(
+            np.asarray(result[key]).reshape(3), expected, rtol=1e-8, atol=1e-8
+        )
+    assert result["count"] == [4]

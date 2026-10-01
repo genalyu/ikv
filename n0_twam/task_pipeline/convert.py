@@ -25,6 +25,45 @@ def stats(x):
     }
 
 
+def image_stats_rgb(frames):
+    """Exact RGB statistics without allocating full-resolution float64 images."""
+    import cv2
+
+    count = 0
+    frames_seen = 0
+    sums = np.zeros(3, dtype=np.float64)
+    sums_sq = np.zeros(3, dtype=np.float64)
+    minimum = np.full(3, 255, dtype=np.uint8)
+    maximum = np.zeros(3, dtype=np.uint8)
+    for rgb in frames:
+        if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError("Expected uint8 RGB video frames")
+        pixels = rgb.reshape(-1, 3)
+        n = len(pixels)
+        mean, std = cv2.meanStdDev(rgb)
+        mean = mean[:, 0]
+        std = std[:, 0]
+        sums += mean * n
+        sums_sq += (std * std + mean * mean) * n
+        minimum = np.minimum(minimum, pixels.min(axis=0))
+        maximum = np.maximum(maximum, pixels.max(axis=0))
+        count += n
+        frames_seen += 1
+    if not count:
+        raise ValueError("Empty converted video")
+    mean = sums / count / 255
+    variance = np.maximum(sums_sq / count / (255 * 255) - mean * mean, 0)
+    return {
+        k: np.asarray(v).reshape(3, 1, 1).tolist()
+        for k, v in {
+            "min": minimum.astype(np.float64) / 255,
+            "max": maximum.astype(np.float64) / 255,
+            "mean": mean,
+            "std": np.sqrt(variance),
+        }.items()
+    } | {"count": [frames_seen]}
+
+
 def encode_aligned_video(source, destination, ids, fps):
     import av
 
@@ -169,31 +208,10 @@ def convert(task):
         import av
 
         for key in ep.videos:
-            n = 0
-            sm = np.zeros(3)
-            ss = np.zeros(3)
-            lo = np.ones(3)
-            hi = np.zeros(3)
             with av.open(str(root / "videos" / chunk / key / (stem + ".mp4"))) as vid:
-                for frame in vid.decode(video=0):
-                    rgb = frame.to_ndarray(format="rgb24").astype(np.float64) / 255
-                    pixels = rgb.reshape(-1, 3)
-                    n += len(pixels)
-                    sm += pixels.sum(0)
-                    ss += (pixels * pixels).sum(0)
-                    lo = np.minimum(lo, pixels.min(0))
-                    hi = np.maximum(hi, pixels.max(0))
-            mean = sm / n
-            st[key] = {
-                k: np.asarray(v).reshape(3, 1, 1).tolist()
-                for k, v in dict(
-                    min=lo,
-                    max=hi,
-                    mean=mean,
-                    std=np.sqrt(np.maximum(ss / n - mean * mean, 0)),
-                ).items()
-            }
-            st[key]["count"] = [len(ts)]
+                st[key] = image_stats_rgb(
+                    frame.to_ndarray(format="rgb24") for frame in vid.decode(video=0)
+                )
         all_stats.append(dict(episode_index=index, stats=st))
         provenance.append(
             dict(
