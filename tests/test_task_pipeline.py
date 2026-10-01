@@ -290,6 +290,7 @@ def test_conversion_real_video_and_lerobot_metadata(tmp_path, monkeypatch):
     root = tmp_path / t["name"] / "dataset"
     m = LeRobotDatasetMetadata(repo_id="local/test", root=root)
     assert m.info["total_episodes"] == 2 and m.info["total_frames"] == 26
+    assert m.episodes[0]["action_config"] == [{"start_frame": 0, "end_frame": 13}]
     df = pd.read_parquet(root / "data/chunk-000/episode_000001.parquet")
     assert np.stack(df.action).shape == (13, 20)
     assert np.allclose(np.stack(df.action)[:, 0], 0.5)

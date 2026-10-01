@@ -1,6 +1,8 @@
 """Episode-preserving conversion to official LeRobot v2.1 storage."""
 
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
+import io
 import json
 from pathlib import Path
 import numpy as np
@@ -76,10 +78,15 @@ def encode_aligned_video(source, destination, ids, fps):
 
             yield from image_frames(source)
         else:
-            with video_reader(source) as f:
-                with av.open(f) as container:
+            if isinstance(source, bytes):
+                with av.open(io.BytesIO(source)) as container:
                     for frame in container.decode(video=0):
                         yield frame.to_ndarray(format="rgb24")
+            else:
+                with video_reader(source) as f:
+                    with av.open(f) as container:
+                        for frame in container.decode(video=0):
+                            yield frame.to_ndarray(format="rgb24")
 
     with av.open(str(temp), "w") as out:
         stream = None
@@ -178,14 +185,33 @@ def convert(task):
         stem = f"episode_{index:06d}"
         marker = root / "conversion_episodes" / (stem + ".json")
         alignment = {}
-        for key, source in ep.videos.items():
-            ids = camera_indices[key]
-            alignment[key] = time_audit["cameras"][key]
-            video = root / "videos" / chunk / key / (stem + ".mp4")
-            if marker.exists() and video.exists():
-                shapes[key] = json.loads(marker.read_text())["shapes"][key]
-            else:
-                shapes[key] = encode_aligned_video(source, video, ids, fps)
+        if task["format"] == "collector_v06":
+            # The tar handle is shared; read sources serially, then encode cameras in parallel.
+            jobs = {}
+            with ThreadPoolExecutor(max_workers=min(4, len(ep.videos))) as pool:
+                for key, source in ep.videos.items():
+                    ids = camera_indices[key]
+                    alignment[key] = time_audit["cameras"][key]
+                    video = root / "videos" / chunk / key / (stem + ".mp4")
+                    if marker.exists() and video.exists():
+                        shapes[key] = json.loads(marker.read_text())["shapes"][key]
+                    else:
+                        with video_reader(source) as source_file:
+                            payload = source_file.read()
+                        jobs[key] = pool.submit(
+                            encode_aligned_video, payload, video, ids, fps
+                        )
+                for key, job in jobs.items():
+                    shapes[key] = job.result()
+        else:
+            for key, source in ep.videos.items():
+                ids = camera_indices[key]
+                alignment[key] = time_audit["cameras"][key]
+                video = root / "videos" / chunk / key / (stem + ".mp4")
+                if marker.exists() and video.exists():
+                    shapes[key] = json.loads(marker.read_text())["shapes"][key]
+                else:
+                    shapes[key] = encode_aligned_video(source, video, ids, fps)
         data = dict(
             action=list(a),
             **{"observation.state": list(s)},
@@ -200,7 +226,12 @@ def convert(task):
         target.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(target, index=False)
         all_eps.append(
-            dict(episode_index=index, tasks=[task["prompt"]], length=len(ts))
+            dict(
+                episode_index=index,
+                tasks=[task["prompt"]],
+                length=len(ts),
+                action_config=[dict(start_frame=0, end_frame=len(ts))],
+            )
         )
         st = {k: stats(np.stack(df[k])) for k in df.columns}
         # Camera statistics follow LeRobot [C,1,1] normalized-image convention.
