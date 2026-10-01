@@ -38,3 +38,21 @@ N0-TWAM objective; see [IKV_POST_TRAINING.md](docs/IKV_POST_TRAINING.md).
 Tests: test_rgb_frame_difference.py and test_rgb_frame_difference_server.py.
 The service helper test extracts actual methods and substitutes a deterministic
 DINO encoder; it is not a full checkpoint inference test.
+
+## NeoSim execution diagnostics
+
+Before constructing a NeoSim task, enable warning-level execution logs:
+
+```python
+env_cfg = task_module.TaskCfg()
+env_cfg.logger_level = "warning"
+# Construct the task with env_cfg afterwards.
+```
+
+NeoSim's direct-IK path can report a failed solve at WARNING level while holding
+the arm in place. An ERROR-only task logger suppresses that evidence. Therefore
+absence of IK warnings in an ERROR-only run does not prove successful execution.
+Record the effective logger level and client revision with each evaluation.
+This setting changes diagnostics only, not IK, actions, physics, or success
+criteria. It does not itself improve policy success; also record actual poses
+when quantifying execution error. Do not replace valid failed trials with retries.
