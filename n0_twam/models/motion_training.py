@@ -13,6 +13,13 @@ def prepare_causal_motion(latent, chunk_size):
     K is fixed by the original loader. Content still comes from the appropriate
     target/condition frame and uses that frame's original RoPE coordinates.
     """
+    # The canonical sidecar loader emits motion_indices/motion_valid_mask;
+    # older callers use rgb_motion_patch_indices/rgb_motion_valid_mask.
+    # Normalize once so the condition and target branches use the same keys.
+    if "rgb_motion_patch_indices" not in latent and "motion_indices" in latent:
+        latent["rgb_motion_patch_indices"] = latent["motion_indices"]
+    if "rgb_motion_valid_mask" not in latent and "motion_valid_mask" in latent:
+        latent["rgb_motion_valid_mask"] = latent["motion_valid_mask"]
     if "rgb_motion_patch_indices" not in latent:
         raise ValueError("causal motion training requires loader [B,F,K] patch indices")
     original = {k: latent[k] for k in FIELDS if k in latent}

@@ -124,6 +124,19 @@ def test_motion_support_is_causal_and_keeps_observed_branch():
     assert torch.equal(original["condition_motion"]["rgb_motion_patch_indices"],indices)
     assert torch.equal(original["rgb_motion_patch_indices"],changed["rgb_motion_patch_indices"])
 
+def test_motion_accepts_canonical_loader_indices():
+    from n0_twam.models.motion_training import prepare_causal_motion
+    indices = torch.tensor([[[0, 1], [1, 2], [2, 3]]])
+    grid = torch.arange(3).repeat_interleave(4)[None]
+    latent = dict(motion_indices=indices,
+                  motion_valid_mask=torch.ones_like(indices, dtype=torch.bool),
+                  grid_id=grid)
+    prepare_causal_motion(latent, 1)
+    assert torch.equal(latent["condition_motion"]["rgb_motion_patch_indices"], indices)
+    assert latent["rgb_motion_patch_indices"][0].tolist() == [[-1, -1], [0, 1], [1, 2]]
+    assert latent["rgb_motion_valid_mask"].shape == indices.shape
+
+
 def test_sparse_noisy_and_clean_validity_are_independent():
     shape=(1,2,2,4,4)
     noisy=torch.tensor([[False,False,True,False]])
