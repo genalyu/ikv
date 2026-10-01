@@ -1,0 +1,278 @@
+"""Episode-preserving conversion to official LeRobot v2.1 storage."""
+
+from fractions import Fraction
+import json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from .config import paths, fingerprint, conversion_identity
+from .data import episodes, video_reader, aligned_timeline
+
+
+def stats(x):
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = x[:, None]
+    return {
+        k: np.asarray(v).tolist()
+        for k, v in dict(
+            min=x.min(0),
+            max=x.max(0),
+            mean=x.mean(0),
+            std=x.std(0),
+            count=np.array([len(x)]),
+        ).items()
+    }
+
+
+def encode_aligned_video(source, destination, ids, fps):
+    import av
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp = destination.with_suffix(".partial.mp4")
+
+    def frames():
+        if isinstance(source, dict) and source.get("hdf5"):
+            from .neosim import image_frames
+
+            yield from image_frames(source)
+        else:
+            with video_reader(source) as f:
+                with av.open(f) as container:
+                    for frame in container.decode(video=0):
+                        yield frame.to_ndarray(format="rgb24")
+
+    with av.open(str(temp), "w") as out:
+        stream = None
+        target = 0
+        for index, rgb in enumerate(frames()):
+            if stream is None:
+                stream = out.add_stream("libx264", rate=Fraction(str(fps)))
+                stream.width, stream.height = rgb.shape[1], rgb.shape[0]
+                stream.pix_fmt = "yuv420p"
+                stream.options = {"crf": "18", "preset": "fast"}
+            while target < len(ids) and ids[target] == index:
+                f = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                f.pts = target
+                f.time_base = Fraction(1, 1) / Fraction(str(fps))
+                for packet in stream.encode(f):
+                    out.mux(packet)
+                target += 1
+            if target == len(ids):
+                break
+        if target != len(ids):
+            raise ValueError(
+                f"Video shorter than timestamp table: wrote {target}/{len(ids)}"
+            )
+        for packet in stream.encode():
+            out.mux(packet)
+    temp.replace(destination)
+    return [stream.height, stream.width, 3]
+
+
+def convert(task):
+    if (
+        task["format"] == "neosim_hdf5"
+        and task.get("action_labels") != "next_observation"
+    ):
+        raise ValueError(
+            "NeoSim has no commanded actions; explicitly choose action_labels=next_observation or supply command data"
+        )
+    p = paths(task)
+    root = p["dataset"]
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = root / "conversion.json"
+    if Path(task["source"]).is_dir() and root.resolve().is_relative_to(
+        Path(task["source"]).resolve()
+    ):
+        raise ValueError("Conversion output must be outside the source tree")
+    identity = conversion_identity(task)
+    spec = fingerprint(identity)
+    if stamp.exists():
+        old = json.loads(stamp.read_text())
+        if old["fingerprint"] != spec:
+            raise ValueError(
+                "Output belongs to a different conversion; choose another work root"
+            )
+        print(f"Conversion already complete: {root}")
+        return
+    # A partial conversion is restartable only for the identical inputs/configuration.
+    pending = root / "conversion_pending.json"
+    if pending.exists() and json.loads(pending.read_text())["fingerprint"] != spec:
+        raise ValueError("Partial conversion configuration differs")
+    pending.write_text(json.dumps({"fingerprint": spec}))
+    fps = 30
+    robot = task["robot"]
+    all_eps = []
+    all_stats = []
+    provenance = []
+    shapes = {}
+    total = 0
+    excluded = []
+    source_count = 0
+    width = robot.get("arms", 1) * 10
+    for ep in episodes(task):
+        source_count += 1
+        if len(ep.timestamps) < 2:
+            raise ValueError("Episode too short")
+        if not np.isfinite(ep.action).all():
+            raise ValueError("Missing finite supervised action labels")
+        try:
+            ts, ai, camera_indices, time_audit = aligned_timeline(ep, robot)
+        except ValueError as error:
+            if task.get("on_invalid_alignment", "error") != "exclude":
+                raise
+            excluded.append(dict(source_id=ep.source_id, reason=str(error)))
+            print(f"EXCLUDED {ep.source_id}: {error}", flush=True)
+            continue
+        index = len(all_eps)
+        a = np.zeros((len(ts), 20), np.float32)
+        s = a.copy()
+        a[:, :width] = ep.action[ai]
+        s[:, :width] = ep.state[ai]
+        chunk = f"chunk-{index // 1000:03d}"
+        stem = f"episode_{index:06d}"
+        marker = root / "conversion_episodes" / (stem + ".json")
+        alignment = {}
+        for key, source in ep.videos.items():
+            ids = camera_indices[key]
+            alignment[key] = time_audit["cameras"][key]
+            video = root / "videos" / chunk / key / (stem + ".mp4")
+            if marker.exists() and video.exists():
+                shapes[key] = json.loads(marker.read_text())["shapes"][key]
+            else:
+                shapes[key] = encode_aligned_video(source, video, ids, fps)
+        data = dict(
+            action=list(a),
+            **{"observation.state": list(s)},
+            timestamp=np.arange(len(ts), dtype=np.float32) / fps,
+            frame_index=np.arange(len(ts), dtype=np.int64),
+            episode_index=np.full(len(ts), index, dtype=np.int64),
+            index=np.arange(total, total + len(ts), dtype=np.int64),
+            task_index=np.zeros(len(ts), dtype=np.int64),
+        )
+        df = pd.DataFrame(data)
+        target = root / "data" / chunk / (stem + ".parquet")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(target, index=False)
+        all_eps.append(
+            dict(episode_index=index, tasks=[task["prompt"]], length=len(ts))
+        )
+        st = {k: stats(np.stack(df[k])) for k in df.columns}
+        # Camera statistics follow LeRobot [C,1,1] normalized-image convention.
+        # Compute from actual converted frames, not placeholders.
+        import av
+
+        for key in ep.videos:
+            n = 0
+            sm = np.zeros(3)
+            ss = np.zeros(3)
+            lo = np.ones(3)
+            hi = np.zeros(3)
+            with av.open(str(root / "videos" / chunk / key / (stem + ".mp4"))) as vid:
+                for frame in vid.decode(video=0):
+                    rgb = frame.to_ndarray(format="rgb24").astype(np.float64) / 255
+                    pixels = rgb.reshape(-1, 3)
+                    n += len(pixels)
+                    sm += pixels.sum(0)
+                    ss += (pixels * pixels).sum(0)
+                    lo = np.minimum(lo, pixels.min(0))
+                    hi = np.maximum(hi, pixels.max(0))
+            mean = sm / n
+            st[key] = {
+                k: np.asarray(v).reshape(3, 1, 1).tolist()
+                for k, v in dict(
+                    min=lo,
+                    max=hi,
+                    mean=mean,
+                    std=np.sqrt(np.maximum(ss / n - mean * mean, 0)),
+                ).items()
+            }
+            st[key]["count"] = [len(ts)]
+        all_stats.append(dict(episode_index=index, stats=st))
+        provenance.append(
+            dict(
+                episode_index=index,
+                source_id=ep.source_id,
+                source_metadata=ep.metadata,
+                alignment=alignment,
+                time_alignment=time_audit,
+            )
+        )
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"shapes": shapes}))
+        total += len(ts)
+        print(f"Converted {index}: {ep.source_id} ({len(ts)} frames)", flush=True)
+    if not all_eps:
+        raise ValueError("Empty input")
+    features = {}
+    for key in ("action", "observation.state"):
+        features[key] = {
+            "dtype": "float32",
+            "shape": [20],
+            "names": [f"channel_{i}" for i in range(20)],
+        }
+    for key in ("timestamp", "frame_index", "episode_index", "index", "task_index"):
+        features[key] = {
+            "dtype": "float32" if key == "timestamp" else "int64",
+            "shape": [1],
+            "names": None,
+        }
+    for key, shape in shapes.items():
+        features[key] = {
+            "dtype": "video",
+            "shape": shape,
+            "names": ["height", "width", "channels"],
+            "video_info": {
+                "video.fps": fps,
+                "video.codec": "h264",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "has_audio": False,
+            },
+        }
+    info = dict(
+        codebase_version="v2.1",
+        robot_type=robot["name"],
+        fps=fps,
+        total_episodes=len(all_eps),
+        total_frames=total,
+        source_total_episodes=source_count,
+        excluded_episodes=len(excluded),
+        total_tasks=1,
+        total_videos=len(all_eps) * len(shapes),
+        chunks_size=1000,
+        total_chunks=(len(all_eps) + 999) // 1000,
+        splits={"train": f"0:{len(all_eps)}"},
+        data_path="data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        video_path="videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        features=features,
+    )
+    meta = root / "meta"
+    meta.mkdir(exist_ok=True)
+    (meta / "info.json").write_text(json.dumps(info, indent=2))
+    for name, items in (
+        ("episodes", all_eps),
+        ("episodes_stats", all_stats),
+        ("tasks", [{"task_index": 0, "task": task["prompt"]}]),
+        ("source_provenance", provenance),
+    ):
+        (meta / (name + ".jsonl")).write_text(
+            "".join(
+                json.dumps(x, ensure_ascii=False, default=str) + "\n" for x in items
+            )
+        )
+    (meta / "excluded_episodes.json").write_text(json.dumps(excluded, indent=2))
+    stamp.write_text(
+        json.dumps(
+            dict(
+                fingerprint=spec,
+                episodes=len(all_eps),
+                frames=total,
+                source=task["source"],
+                identity=identity,
+            ),
+            indent=2,
+        )
+    )
+    pending.unlink()

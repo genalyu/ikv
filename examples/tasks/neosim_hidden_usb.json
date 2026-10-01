@@ -1,0 +1,44 @@
+{
+  "name": "neosim_hidden_usb",
+  "format": "neosim_hdf5",
+  "source": "${TASK_SOURCE}",
+  "prompt": "Remember which USB slot is highlighted. After the highlight disappears and the waiting period ends, insert the USB into that same slot.",
+  "seed": 42,
+  "action_labels": "unavailable",
+  "expected_episodes": 210,
+  "robot": {
+    "name": "neosim_franka",
+    "arms": 1,
+    "coordinate_frame": "world",
+    "position_unit": "m",
+    "action_representation": "absolute_eef_rot6d",
+    "quaternion_order": "wxyz",
+    "action_gripper": "open_ratio",
+    "state_gripper": "open_ratio",
+    "gripper_stroke_m": 0.078,
+    "gripper_joint_indices": [
+      7,
+      8
+    ],
+    "fps": 60,
+    "simulation_hz": 120,
+    "max_alignment_age_s": 0.1,
+    "cameras": {
+      "observation/head/rgb": "observation.images.top",
+      "observation/wrist/rgb": "observation.images.wrist_l"
+    },
+    "tactile": {
+      "tactile/left_tactile/rgb": "observation.images.tactile_a",
+      "tactile/right_tactile/rgb": "observation.images.tactile_b"
+    }
+  },
+  "runtime": {
+    "work_root": "${TASK_WORK_ROOT}",
+    "base_checkpoint": "${BASE_CHECKPOINT}",
+    "dino_model": "${DINO_MODEL}"
+  },
+  "features": {
+    "motion_threshold": 0.02,
+    "ikv_capacity": 4096
+  }
+}

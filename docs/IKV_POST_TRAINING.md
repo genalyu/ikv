@@ -208,3 +208,8 @@ activation checkpointing, two accumulated microbatches per update, and two
 updates in every switch combination. It checks losses and every parameter's
 gradient against an unsharded reference, with BF16 tolerances. This is not a
 multi-GPU communication test or a full-size checkpoint memory benchmark.
+
+
+## 可复用真机 / 仿真任务入口
+
+任务数据分析、LeRobot 转换、1/2/8 卡等效 batch、四种消融及完整恢复见 [任务训练指南](TASK_PIPELINE.md)。

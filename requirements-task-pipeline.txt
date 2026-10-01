@@ -1,0 +1,10 @@
+# Install in the existing N0-TWAM environment; do not upgrade torch/diffusers.
+numpy
+pandas
+pyarrow
+av
+h5py
+matplotlib
+plotly
+# Training dataset runtime: install separately with --no-deps:
+# lerobot==0.3.3 (its unconstrained deps may replace the validated torch stack)

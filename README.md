@@ -233,3 +233,8 @@ Released under the CC-BY-NC-SA-4.0 license. See [LICENSE](LICENSE).
 Redistributed third-party components keep their own licenses (the Wan2.2
 VAE / text encoder / tokenizer and the openpi-derived websocket client are
 Apache-2.0 — their notices are retained).
+
+
+### Reusable task analysis and post-training
+
+See [任务数据分析与后训练](docs/TASK_PIPELINE.md) for real/NeoSim adapters, offline trajectory reports, the official recipe on 1/2/8 GPUs, four ablations, and full-state resume.

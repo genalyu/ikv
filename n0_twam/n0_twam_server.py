@@ -3363,7 +3363,16 @@ class TWAM_Server:
 
 def run(args):    
     
-    config = TWAM_CONFIGS[args.config_name]
+    import copy
+    config = copy.deepcopy(TWAM_CONFIGS[args.config_name])
+    if getattr(args, 'task_overrides', None):
+        with open(args.task_overrides) as f:
+            overrides = json.load(f)
+        if not isinstance(overrides, dict) or {'rank', 'local_rank', 'world_size'} & set(overrides):
+            raise ValueError("Invalid task overrides")
+        config.update(overrides)
+    if getattr(args, 'bundle', None):
+        config.wan22_pretrained_model_name_or_path = args.bundle
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
@@ -3406,6 +3415,8 @@ def main():
         default=None,
         help='save root'
     )
+    parser.add_argument("--task-overrides", help="Generated run/serve_overrides.json")
+    parser.add_argument("--bundle", help="Trained serve bundle")
     args = parser.parse_args()
     run(args)
     logger.info("Finish all process!!!!!!!!!!!!")

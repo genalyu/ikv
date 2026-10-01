@@ -268,7 +268,7 @@ class Trainer:
                 num_replicas=config.world_size,
                 rank=config.rank,
                 shuffle=True,
-                seed=42,
+                seed=getattr(config, 'seed', 42),
                 drop_last=True,
             )
             self.train_loader = DataLoader(
@@ -287,14 +287,16 @@ class Trainer:
                 num_replicas=config.world_size,
                 rank=config.rank,
                 shuffle=True,
-                seed=42
-            ) if config.world_size > 1 else None
+                seed=getattr(config, 'seed', 42)
+            ) if config.world_size > 1 or getattr(config, 'save_training_state', False) else None
             self.train_loader = DataLoader(
                 train_dataset,
                 batch_size=config.batch_size,
                 shuffle=(train_sampler is None),
                 num_workers=config.load_worker,
                 sampler=train_sampler,
+                generator=(torch.Generator().manual_seed(getattr(config, 'seed', 42))
+                           if getattr(config, 'save_training_state', False) else None),
             )
 
         # Optional validation set: episode-level held-out repos. Loss-only —
@@ -328,6 +330,8 @@ class Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.train_loader_iter = None
+        self.data_epoch = 0
+        self.data_offset = 0
     
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
@@ -337,6 +341,8 @@ class Trainer:
         try:
             batch = next(self.train_loader_iter)
         except StopIteration:
+            self.data_epoch = getattr(self, 'data_epoch', 0) + 1
+            self.data_offset = 0
             # Reset sampler/batch_sampler and iterator when epoch finishes.
             # batch_size>1 uses a bucketed batch_sampler; batch_size==1 uses a
             # plain (Distributed)Sampler. Both expose set_epoch for reshuffle.
@@ -348,6 +354,7 @@ class Trainer:
             self.train_loader_iter = iter(self.train_loader)
             batch = next(self.train_loader_iter)
         
+        self.data_offset = getattr(self, 'data_offset', 0) + 1
         return batch
 
     @torch.no_grad()
@@ -894,6 +901,9 @@ class Trainer:
                     'use_local_tactile': bool(getattr(_c, 'use_local_tactile', False)),
                     'local_tactile_mode': getattr(_c, 'local_tactile_mode', None),
                     'tactile_global_zero': bool(getattr(_c, 'tactile_global_zero', False)),
+                    'kv_cache_policy': getattr(_c, 'kv_cache_policy', 'fifo'),
+                    'rgb_motion_input_mode': getattr(_c, 'rgb_motion_input_mode', 'rgb'),
+                    'rgb_motion_rgb_threshold': float(getattr(_c, 'rgb_motion_rgb_threshold', .02)),
                     'use_ikv_training': bool(getattr(_c, 'use_ikv_training', False)),
                     'ikv_train_capacity': int(getattr(_c, 'ikv_train_capacity', 0)),
                     'kv_retention': dict(getattr(_c, 'kv_retention', {})),
@@ -949,6 +959,10 @@ class Trainer:
             raise RuntimeError(
                 f'checkpoint save failed at step {self.step} — refusing to '
                 'continue training with unsaved weights') from save_error
+
+        if getattr(self.config, 'save_training_state', False):
+            from n0_twam.task_pipeline.checkpoint import save_training_state
+            save_training_state(self, self.save_dir / f"checkpoint_step_{self.step}" / "training_state")
 
     def train(self):
         """Main training loop - train by steps instead of epochs."""
@@ -1085,7 +1099,21 @@ class Trainer:
 
 def run(args):
     """Main entry point."""
-    config = TWAM_CONFIGS[args.config_name]
+    import copy
+    config = copy.deepcopy(TWAM_CONFIGS[args.config_name])
+    if getattr(args, 'resume_training', None) and not getattr(args, 'task_config', None):
+        raise ValueError("--resume-training requires --task-config")
+    if getattr(args, 'task_config', None) and any(
+        getattr(args, name, None) is not None
+        for name in ('motion', 'ikv', 'ikv_capacity', 'base_checkpoint', 'save_root')
+    ):
+        raise ValueError("Use task JSON and --mode instead of legacy overrides with --task-config")
+    if getattr(args, 'task_config', None):
+        from n0_twam.task_pipeline.config import load_task, training_config
+        config = training_config(load_task(args.task_config), args.mode, int(os.environ.get('WORLD_SIZE', 1)))
+        config.save_training_state = True
+        if args.resume_training:
+            config.resume_from = str(Path(args.resume_training).parent)
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -1124,7 +1152,16 @@ def run(args):
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
 
+    if getattr(args, 'task_config', None):
+        import random
+        import numpy as np
+        random.seed(config.seed); np.random.seed(config.seed); torch.manual_seed(config.seed)
     trainer = Trainer(config)
+    if getattr(args, 'task_config', None):
+        random.seed(config.seed + rank); np.random.seed(config.seed + rank); torch.manual_seed(config.seed + rank)
+    if getattr(args, 'resume_training', None):
+        from n0_twam.task_pipeline.checkpoint import load_training_state
+        load_training_state(trainer, args.resume_training)
     trainer.train()
 
 
@@ -1155,6 +1192,9 @@ def main():
                         help="Maximum retained condition tokens, shared across all experts")
     parser.add_argument("--base-checkpoint", default=None,
                         help="Released MoT base directory with transformer/; initializes original trainer")
+    parser.add_argument("--task-config", default=None)
+    parser.add_argument("--mode", choices=["baseline","motion","ikv","motion_ikv"], default="baseline")
+    parser.add_argument("--resume-training", default=None, help="Complete checkpoint/training_state directory; same GPU count")
     args = parser.parse_args()
     run(args)
 

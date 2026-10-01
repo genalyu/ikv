@@ -1,0 +1,37 @@
+{
+  "name": "ur5e_phone_weight",
+  "format": "collector_v06",
+  "source": "${TASK_SOURCE}",
+  "prompt": "Three phone boxes are on the table. Lift each in sequence to measure weight, then sort them from lightest to heaviest",
+  "seed": 42,
+  "robot": {
+    "name": "ur5e",
+    "arms": 1,
+    "coordinate_frame": "ur_base",
+    "position_unit": "m",
+    "action_representation": "absolute_eef_rot6d",
+    "action_gripper": "open_ratio",
+    "state_gripper": "width_m",
+    "gripper_stroke_m": 0.085,
+    "fps": 30,
+    "max_alignment_age_s": 0.1,
+    "cameras": {
+      "observation.image.third_view": "observation.images.top",
+      "observation.image.left_wrist_view": "observation.images.wrist_l"
+    },
+    "tactile": {
+      "observation.image.left_wrist_left_tactile": "observation.images.tactile_a",
+      "observation.image.left_wrist_right_tactile": "observation.images.tactile_b"
+    }
+  },
+  "runtime": {
+    "work_root": "${TASK_WORK_ROOT}",
+    "base_checkpoint": "${BASE_CHECKPOINT}",
+    "dino_model": "${DINO_MODEL}"
+  },
+  "features": {
+    "motion_threshold": 0.02,
+    "ikv_capacity": 4096
+  },
+  "on_invalid_alignment": "exclude"
+}
