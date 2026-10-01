@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 import torch
 from n0_twam.task_pipeline.config import accumulation, training_config
-from n0_twam.task_pipeline.data import causal_indices, normalize_grip, validate_pose
+from n0_twam.task_pipeline.data import (
+    causal_indices,
+    normalize_grip,
+    quality_exclusion_reason,
+    validate_pose,
+)
 from n0_twam.task_pipeline.neosim import quaternion_to_rot6d
 from n0_twam.task_pipeline.features import build_payloads
 
@@ -26,7 +31,7 @@ def task(tmp_path):
     return t
 
 
-@pytest.mark.parametrize("world,acc", [(1, 32), (2, 16), (8, 4)])
+@pytest.mark.parametrize("world,acc", [(1, 32), (2, 16), (4, 8), (8, 4)])
 def test_official_effective_batch_and_four_modes(tmp_path, world, acc):
     assert accumulation(world) == acc
     t = task(tmp_path)
@@ -373,3 +378,67 @@ def test_neosim_observations_do_not_expose_oracle(tmp_path):
     t["action_labels"] = "unavailable"
     ep = next(iter_neosim(t))
     assert np.isnan(ep.action).all() and len(ep.state) == 5
+
+
+def test_two_collector_tars_are_one_task_with_distinct_episode_ids(tmp_path):
+    import io
+    import tarfile
+    from n0_twam.task_pipeline.config import load_task, source_inventory
+    from n0_twam.task_pipeline.data import iter_collector
+
+    t = task(tmp_path)
+    episode = "yanqiang/episode_0000"
+    actions = (
+        "timestamp_ms,tcp.x,tcp.y,tcp.z,tcp.r1,tcp.r2,tcp.r3,tcp.r4,tcp.r5,tcp.r6,gripper.pos\n"
+        + "".join(f"{ms},0.5,0.2,0.3,1,0,0,0,1,0,0.5\n" for ms in (0, 33, 66))
+    )
+    states = (
+        "timestamp_ms,x,y,z,r1,r2,r3,r4,r5,r6,gripper\n"
+        + "".join(f"{ms},0.5,0.2,0.3,1,0,0,0,1,0,0.0425\n" for ms in (0, 33, 66))
+    )
+    stamps = "timestamp_ms,is_new\n0,1\n33,1\n66,1\n"
+    for number in range(2):
+        archive = tmp_path / f"day_{number}.tar"
+        with tarfile.open(archive, "w") as tar:
+            entries = {
+                f"{episode}/metadata.json": json.dumps(
+                    {"version": "v0.6", "fps_config": 30}
+                ),
+                f"{episode}/actions.eef_pose/data.csv": actions,
+                f"{episode}/observation.state.eef_pose/data.csv": states,
+            }
+            for camera in [*t["robot"]["cameras"], *t["robot"]["tactile"]]:
+                entries[f"{episode}/{camera}/timestamps.csv"] = stamps
+            for name, contents in entries.items():
+                data = contents.encode()
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                tar.addfile(member, io.BytesIO(data))
+    t["source"] = ["day_0.tar", "day_1.tar"]
+    path = tmp_path / "task.json"
+    path.write_text(json.dumps(t))
+    merged = load_task(path)
+    assert len(source_inventory(merged["source"])) == 2
+    eps = list(iter_collector(merged))
+    assert len(eps) == 2
+    assert eps[0].source_id != eps[1].source_id
+    assert all(ep.action.shape == (3, 10) for ep in eps)
+    assert all(np.allclose(ep.state[:, -1], 0.5) for ep in eps)
+
+
+
+def test_quality_filter_keeps_only_explicitly_allowed_demonstrations(tmp_path):
+    from n0_twam.task_pipeline.data import Episode
+
+    t = task(tmp_path)
+    t["allowed_quality_labels"] = ["完全正常"]
+    pose = np.tile([0.5, 0.2, 0.3, 1, 0, 0, 0, 1, 0, 0.5], (3, 1))
+    episode = Episode("example", np.arange(3) / 30, pose, pose, {})
+    for labels, excluded in [
+        (["完全正常"], False),
+        (["测试任务"], True),
+        (["完全正常", "机械臂放置物体失败"], True),
+        ([], True),
+    ]:
+        episode.metadata = {"quality": {"labels": labels}}
+        assert (quality_exclusion_reason(episode, t) is not None) == excluded

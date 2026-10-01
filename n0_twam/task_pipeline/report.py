@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from .data import episodes, causal_indices, aligned_timeline
+from .data import episodes, causal_indices, aligned_timeline, quality_exclusion_reason
 from .config import paths, fingerprint
 
 
@@ -38,6 +38,11 @@ def analyze(task):
             ),
             state_alignment_max_s=ep.metadata.get("state_alignment_max_s", 0),
         )
+        labels = ep.metadata.get("quality", {}).get("labels", [])
+        quality_reason = quality_exclusion_reason(ep, task)
+        row["quality_labels"] = "|".join(labels)
+        row["training_quality_valid"] = quality_reason is None
+        row["training_exclusion_reason"] = quality_reason or ""
         alignment = {}
         common_start = max([t[0]] + [ct[0] for ct in ep.camera_times.values()])
         row["common_start_offset_s"] = float(common_start - t[0])
@@ -46,7 +51,14 @@ def analyze(task):
             row["training_alignment_valid"] = True
         except ValueError as error:
             row["training_alignment_valid"] = False
-            row["training_exclusion_reason"] = str(error)
+            reason = str(error)
+            row["training_exclusion_reason"] = (
+                f"{row['training_exclusion_reason']}; {reason}"
+                if row["training_exclusion_reason"] else reason
+            )
+        row["training_usable"] = (
+            row["training_quality_valid"] and row["training_alignment_valid"]
+        )
         for cam, cts in ep.camera_times.items():
             try:
                 ids, age = causal_indices(
@@ -137,6 +149,9 @@ def analyze(task):
         duplicate_timestamps=int(df.duplicate_timestamps.sum()),
         alignment_valid_episodes=int(df.training_alignment_valid.sum()),
         alignment_excluded_episodes=int((~df.training_alignment_valid).sum()),
+        quality_excluded_episodes=int((~df.training_quality_valid).sum()),
+        training_usable_episodes=int(df.training_usable.sum()),
+        training_excluded_episodes=int((~df.training_usable).sum()),
         action_label_policy=task.get("action_labels", "recorded_command"),
         scope=task.get("dataset_scope", "all_local_episodes"),
         note="Integrity labels are not task success measurements. Oracle labels are analysis-only.",
@@ -255,9 +270,9 @@ def analyze(task):
         + __import__("html").escape(json.dumps(summary, ensure_ascii=False, indent=2))
         + "</pre>"
     )
-    invalid = df.loc[~df.training_alignment_valid]
+    invalid = df.loc[~df.training_usable]
     if not invalid.empty:
-        intro += "<h2>Alignment exclusions for training</h2>" + invalid[
+        intro += "<h2>Quality and alignment exclusions for training</h2>" + invalid[
             ["episode", "training_exclusion_reason"]
         ].to_html(index=False, escape=True)
     html = view.to_html(include_plotlyjs=True, full_html=True)

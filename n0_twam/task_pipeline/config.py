@@ -54,19 +54,41 @@ def load_task(path):
         raise ValueError("An explicit generic task prompt is required")
     if task["format"] not in ("collector_v06", "lerobot_v21", "neosim_hdf5"):
         raise ValueError("Unsupported format; define an explicit adapter")
+    if isinstance(task["source"], list):
+        if (
+            task["format"] != "collector_v06"
+            or not task["source"]
+            or not all(isinstance(item, str) for item in task["source"])
+            or len(set(task["source"])) != len(task["source"])
+        ):
+            raise ValueError("Source lists require distinct collector_v06 paths")
+    allowed = task.get("allowed_quality_labels")
+    if allowed is not None and (
+        task["format"] != "collector_v06"
+        or not isinstance(allowed, list)
+        or not allowed
+        or not all(isinstance(x, str) for x in allowed)
+    ):
+        raise ValueError(
+            "allowed_quality_labels requires collector_v06 and a nonempty string list"
+        )
     for owner, names in (
         (task, ("source",)),
         (task["runtime"], ("work_root", "base_checkpoint", "model_path", "dino_model")),
     ):
         for key in names:
             if key in owner:
-                raw = os.path.expandvars(os.path.expanduser(owner[key]))
-                if "$" in raw:
-                    raise ValueError(f"Unresolved environment variable: {key}={raw}")
-                p = Path(raw)
-                owner[key] = str(
-                    (path.parent / p).resolve() if not p.is_absolute() else p
-                )
+                values = owner[key] if isinstance(owner[key], list) else [owner[key]]
+                resolved = []
+                for value in values:
+                    raw = os.path.expandvars(os.path.expanduser(value))
+                    if "$" in raw:
+                        raise ValueError(f"Unresolved environment variable: {key}={raw}")
+                    p = Path(raw)
+                    resolved.append(
+                        str((path.parent / p).resolve() if not p.is_absolute() else p)
+                    )
+                owner[key] = resolved if isinstance(owner[key], list) else resolved[0]
     robot = task["robot"]
     if robot.get("action_representation") != "absolute_eef_rot6d":
         raise ValueError(
@@ -98,8 +120,8 @@ def paths(task):
 
 
 def accumulation(world_size):
-    if world_size not in (1, 2, 8):
-        raise ValueError("Supported GPU/process counts: 1, 2, 8")
+    if world_size not in (1, 2, 4, 8):
+        raise ValueError("Supported GPU/process counts: 1, 2, 4, 8")
     return 32 // world_size
 
 
@@ -158,11 +180,14 @@ def training_config(task, mode, world_size, *, require_ready=True):
     cfg.per_repo_norm_stat = {}
     cfg.task_fingerprint = fingerprint(task)
     cfg.task_mode = mode
+    cfg.enable_wandb = bool(task.get("monitoring", {}).get("wandb", False))
     cfg.official_revision = OFFICIAL_REVISION
     return cfg
 
 
 def source_inventory(source):
+    if isinstance(source, list):
+        return [{"source": path, "files": source_inventory(path)} for path in source]
     root = Path(source)
     if not root.exists():
         raise FileNotFoundError(root)
@@ -197,6 +222,7 @@ def conversion_identity(task):
             "robot",
             "action_labels",
             "on_invalid_alignment",
+            "allowed_quality_labels",
         )
     }
     fields["source_inventory"] = source_inventory(task["source"])

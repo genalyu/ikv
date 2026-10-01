@@ -52,6 +52,14 @@ def check(task, mode="baseline"):
         errors.append(
             f"Expected {task['expected_episodes']} episodes; found {info['total_episodes']}. Download full dataset or explicitly configure a subset."
         )
+    if (
+        task.get("expected_usable_episodes")
+        and info["total_episodes"] != task["expected_usable_episodes"]
+    ):
+        errors.append(
+            f"Expected {task['expected_usable_episodes']} usable episodes; "
+            f"converted {info['total_episodes']}"
+        )
     cameras = list(task["robot"]["cameras"].values())
     tactile = list(task["robot"]["tactile"].values())
     if info["fps"] != 30:
@@ -308,7 +316,7 @@ def main(argv=None):
         default="convert",
     )
     ap.add_argument("--mode", choices=list(MODES), default="baseline")
-    ap.add_argument("--gpus", type=int, choices=[1, 2, 8], default=1)
+    ap.add_argument("--gpus", type=int, choices=[1, 2, 4, 8], default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--resume", type=Path)
@@ -390,6 +398,14 @@ def main(argv=None):
         )
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         env["TOKENIZERS_PARALLELISM"] = "false"
+        if cfg.enable_wandb:
+            if not env.get("WANDB_API_KEY"):
+                raise RuntimeError("WandB enabled but WANDB_API_KEY is missing")
+            env.setdefault(
+                "WANDB_PROJECT",
+                task.get("monitoring", {}).get("project", "ikv-phone-weight"),
+            )
+            env.setdefault("WANDB_RUN_NAME", f"{task['name']}-{args.mode}")
         subprocess.run(command, cwd=REPO, env=env, check=True)
 
 

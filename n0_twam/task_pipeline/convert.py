@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from .config import paths, fingerprint, conversion_identity
-from .data import episodes, video_reader, aligned_timeline
+from .data import episodes, video_reader, aligned_timeline, quality_exclusion_reason
 
 
 def stats(x):
@@ -82,10 +82,10 @@ def convert(task):
     root = p["dataset"]
     root.mkdir(parents=True, exist_ok=True)
     stamp = root / "conversion.json"
-    if Path(task["source"]).is_dir() and root.resolve().is_relative_to(
-        Path(task["source"]).resolve()
-    ):
-        raise ValueError("Conversion output must be outside the source tree")
+    sources = task["source"] if isinstance(task["source"], list) else [task["source"]]
+    for src in sources:
+        if Path(src).is_dir() and root.resolve().is_relative_to(Path(src).resolve()):
+            raise ValueError("Conversion output must be outside the source tree")
     identity = conversion_identity(task)
     spec = fingerprint(identity)
     if stamp.exists():
@@ -117,6 +117,11 @@ def convert(task):
             raise ValueError("Episode too short")
         if not np.isfinite(ep.action).all():
             raise ValueError("Missing finite supervised action labels")
+        quality_reason = quality_exclusion_reason(ep, task)
+        if quality_reason:
+            excluded.append(dict(source_id=ep.source_id, reason=quality_reason))
+            print(f"EXCLUDED {ep.source_id}: {quality_reason}", flush=True)
+            continue
         try:
             ts, ai, camera_indices, time_audit = aligned_timeline(ep, robot)
         except ValueError as error:

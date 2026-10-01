@@ -110,13 +110,13 @@ def normalize_grip(x, representation, stroke):
     return x
 
 
-def iter_collector(task):
+def _iter_collector_source(task, path, source_id_prefix=""):
     robot = task["robot"]
     if robot.get("arms", 1) != 1:
         raise ValueError(
             "collector_v06 adapter currently supports the verified single-arm schema"
         )
-    source = Collector(task["source"])
+    source = Collector(path)
     cameras = {**robot["cameras"], **robot["tactile"]}
     try:
         for ep in source.episodes:
@@ -173,9 +173,26 @@ def iter_collector(task):
             meta["duplicate_timestamp_policy"] = (
                 "causal last at equal time; zero-dt excluded from speed"
             )
-            yield Episode(ep, ts, a, s, meta, videos, times)
+            yield Episode(source_id_prefix + ep, ts, a, s, meta, videos, times)
     finally:
         source.close()
+
+
+def quality_exclusion_reason(ep, task):
+    allowed = task.get("allowed_quality_labels")
+    if allowed is None:
+        return None
+    labels = ep.metadata.get("quality", {}).get("labels", [])
+    if sorted(labels) != sorted(allowed):
+        return f"Quality labels {labels!r} do not match allowed {allowed!r}"
+    return None
+
+
+def iter_collector(task):
+    sources = task["source"] if isinstance(task["source"], list) else [task["source"]]
+    for i, path in enumerate(sources):
+        prefix = f"{i}:{Path(path).name}:" if len(sources) > 1 else ""
+        yield from _iter_collector_source(task, path, prefix)
 
 
 def iter_lerobot(task):
