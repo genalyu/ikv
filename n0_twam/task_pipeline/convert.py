@@ -193,6 +193,8 @@ def convert(task):
         chunk = f"chunk-{index // 1000:03d}"
         stem = f"episode_{index:06d}"
         marker = root / "conversion_episodes" / (stem + ".json")
+        marker_data = json.loads(marker.read_text()) if marker.exists() else None
+        encoded = False
         alignment = {}
         if task["format"] == "collector_v06":
             # The tar handle is shared; read sources serially, then encode cameras in parallel.
@@ -202,9 +204,10 @@ def convert(task):
                     ids = camera_indices[key]
                     alignment[key] = time_audit["cameras"][key]
                     video = root / "videos" / chunk / key / (stem + ".mp4")
-                    if marker.exists() and video.exists():
-                        shapes[key] = json.loads(marker.read_text())["shapes"][key]
+                    if marker_data is not None and video.exists():
+                        shapes[key] = marker_data["shapes"][key]
                     else:
+                        encoded = True
                         with video_reader(source) as source_file:
                             payload = (
                                 Path(source_file).read_bytes()
@@ -221,9 +224,10 @@ def convert(task):
                 ids = camera_indices[key]
                 alignment[key] = time_audit["cameras"][key]
                 video = root / "videos" / chunk / key / (stem + ".mp4")
-                if marker.exists() and video.exists():
-                    shapes[key] = json.loads(marker.read_text())["shapes"][key]
+                if marker_data is not None and video.exists():
+                    shapes[key] = marker_data["shapes"][key]
                 else:
+                    encoded = True
                     shapes[key] = encode_aligned_video(source, video, ids, fps)
         data = dict(
             action=list(a),
@@ -247,18 +251,21 @@ def convert(task):
             )
         )
         st = {k: stats(np.stack(df[k])) for k in df.columns}
-        # Camera statistics follow LeRobot [C,1,1] normalized-image convention.
-        # Compute from actual converted frames, not placeholders.
-        with ThreadPoolExecutor(max_workers=min(4, len(ep.videos))) as pool:
-            stat_jobs = {
-                key: pool.submit(
-                    image_stats_video,
-                    root / "videos" / chunk / key / (stem + ".mp4"),
-                )
-                for key in ep.videos
-            }
-            for key, job in stat_jobs.items():
-                st[key] = job.result()
+        # Cache exact converted-video statistics at the episode boundary so a
+        # preempted conversion never decodes completed episodes twice.
+        if marker_data is not None and not encoded and "video_stats" in marker_data:
+            st.update(marker_data["video_stats"])
+        else:
+            with ThreadPoolExecutor(max_workers=min(4, len(ep.videos))) as pool:
+                stat_jobs = {
+                    key: pool.submit(
+                        image_stats_video,
+                        root / "videos" / chunk / key / (stem + ".mp4"),
+                    )
+                    for key in ep.videos
+                }
+                for key, job in stat_jobs.items():
+                    st[key] = job.result()
         all_stats.append(dict(episode_index=index, stats=st))
         provenance.append(
             dict(
@@ -270,7 +277,12 @@ def convert(task):
             )
         )
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps({"shapes": shapes}))
+        marker_tmp = marker.with_suffix(".tmp")
+        marker_tmp.write_text(json.dumps({
+            "shapes": shapes,
+            "video_stats": {key: st[key] for key in ep.videos},
+        }))
+        marker_tmp.replace(marker)
         total += len(ts)
         print(f"Converted {index}: {ep.source_id} ({len(ts)} frames)", flush=True)
     if not all_eps:

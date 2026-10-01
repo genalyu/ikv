@@ -307,7 +307,19 @@ def test_conversion_real_video_and_lerobot_metadata(tmp_path, monkeypatch):
         for x in (root / "meta/source_provenance.jsonl").read_text().splitlines()
     ]
     assert [x["source_id"] for x in provenance] == ["episode_0004", "episode_0106"]
-    conversion.convert(t)  # same configuration is safely reusable
+    marker = root / "conversion_episodes/episode_000000.json"
+    assert set(json.loads(marker.read_text())["video_stats"]) == set(t["robot"]["cameras"].values()) | set(t["robot"]["tactile"].values())
+    from n0_twam.task_pipeline.config import conversion_identity, fingerprint
+
+    (root / "conversion.json").unlink()
+    (root / "conversion_pending.json").write_text(
+        json.dumps({"fingerprint": fingerprint(conversion_identity(t))})
+    )
+    def fail_if_redecoded(_):
+        raise AssertionError("Completed episode video statistics were recalculated")
+    monkeypatch.setattr(conversion, "image_stats_video", fail_if_redecoded)
+    conversion.convert(t)  # interrupted conversion reuses episode statistics
+    conversion.convert(t)  # complete configuration is safely reusable
     t["prompt"] = "changed"
     with pytest.raises(ValueError, match="different conversion"):
         conversion.convert(t)
