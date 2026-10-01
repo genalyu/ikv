@@ -1067,7 +1067,7 @@ class Trainer:
 
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
-                    progress_bar.n += self.gradient_accumulation_steps
+                    progress_bar.update(1)
                     progress_postfix = {
                         'latent_loss':  f'{metric_shows.get("latent_loss", 0.0):.4f}',
                         'action_loss':  f'{metric_shows.get("action_loss", 0.0):.4f}',
