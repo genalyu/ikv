@@ -57,6 +57,45 @@ def test_official_effective_batch_and_four_modes(tmp_path, world, acc):
         assert c.used_action_channel_ids == list(range(10))
 
 
+def test_accumulated_microbatches_sync_sharded_gradients_before_update():
+    from test_rgb_motion_model_integration import _load_trainer_class
+
+    class TinyTransformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.5))
+            self.sync_calls = []
+
+        def set_requires_gradient_sync(self, enabled):
+            self.sync_calls.append(enabled)
+
+        def forward(self, batch, train_mode):
+            assert train_mode
+            return self.weight * batch
+
+    trainer = _load_trainer_class().__new__(_load_trainer_class())
+    trainer.gradient_accumulation_steps = 2
+    trainer.transformer = TinyTransformer()
+    trainer.optimizer = torch.optim.SGD(trainer.transformer.parameters(), lr=0.1)
+    trainer.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        trainer.optimizer, lambda _: 1.0
+    )
+    trainer.convert_input_format = lambda batch: batch
+    trainer._prepare_input_dict = lambda batch: batch
+    trainer.compute_loss = lambda batch, output: {
+        "total_loss": (output - 1).square() / 2
+    }
+
+    first = trainer._train_step(torch.tensor(2.0), 0)
+    assert not first["should_log"]
+    assert trainer.transformer.weight.item() == pytest.approx(0.5)
+    second = trainer._train_step(torch.tensor(3.0), 1)
+    assert second["should_log"]
+    assert trainer.transformer.sync_calls == [True, True]
+    assert trainer.transformer.weight.item() == pytest.approx(0.35)
+    assert trainer.lr_scheduler.last_epoch == 1
+
+
 def test_causal_alignment_duplicate_timestamps_and_stale_rejection():
     ids, age = causal_indices([0, 0.03, 0.03, 0.06], [0, 0.033, 0.066])
     assert ids.tolist() == [0, 2, 3]

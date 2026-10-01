@@ -62,7 +62,7 @@ def run(retention_version=1):
                         data['latent_dict']['dense_dino_features'] = torch.ones(1,3,4,2,device='cuda')
                         data['latent_dict']['frame_neoforce_features'] = torch.ones(1,3,2,device='cuda')
                     data['ikv_training'] = dict(capacity=12, retention=retention)
-                model.set_requires_gradient_sync(micro == 1)
+                model.set_requires_gradient_sync(True)
                 output = model(data, train_mode=True)
                 loss = trainer.compute_loss(data, output)['total_loss']
                 loss.backward()

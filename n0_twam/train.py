@@ -801,14 +801,12 @@ class Trainer:
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
 
-        # batch_idx is the micro-step index inside the accumulation window.
-        # FSDP gradient sync is skipped until the last micro-step.
-        should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-
-        if not should_sync:
-            self.transformer.set_requires_gradient_sync(False)
-        else:
-            self.transformer.set_requires_gradient_sync(True)
+        # Synchronize each scaled micro-batch into FSDP's sharded gradients.
+        # Deferring synchronization retains full, unsharded gradients across
+        # micro-batches and OOMs on long real episodes. The optimizer still
+        # updates only after the complete accumulation window.
+        should_update = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+        self.transformer.set_requires_gradient_sync(True)
 
         output = self.transformer(input_dict, train_mode=True)
         loss_dict = self.compute_loss(input_dict, output)
@@ -825,7 +823,7 @@ class Trainer:
             losses["ikv_capacity"] = torch.tensor(float(sampled_k), device=self.device)
         
         # Only update weights after accumulating gradients
-        if should_sync:
+        if should_update:
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()
