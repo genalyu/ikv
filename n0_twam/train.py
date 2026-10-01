@@ -507,6 +507,12 @@ class Trainer:
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
         }
+        if bool(getattr(self.config, "use_ikv_training", False)) and dist.is_initialized():
+            # Recurrent IKV invokes FSDP once per phase. Share the phase width
+            # across ranks; variable trajectory lengths are padded below.
+            shared_chunk = torch.tensor(input_dict["chunk_size"], device=self.device)
+            dist.broadcast(shared_chunk, src=0)
+            input_dict["chunk_size"] = int(shared_chunk.item())
         if bool(getattr(self.config, "use_rgb_motion_tokens", False)):
             from n0_twam.models.motion_training import prepare_causal_motion
             prepare_causal_motion(latent_dict, input_dict["chunk_size"])

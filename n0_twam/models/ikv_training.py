@@ -5,6 +5,7 @@ denoising targets and losses remain owned by the original Trainer/model.
 No persistent inference pool or detached historical K/V is used here.
 """
 import torch
+import torch.distributed as dist
 from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig
 
@@ -82,6 +83,14 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
     if text is not None and text.shape[1] % batches:
         raise ValueError("text tokens must divide evenly across packed samples")
     outputs, addresses = [], []
+    local_phases = sum(len(torch.unique(phase[seq == batch])) for batch in valid_seqs)
+    max_phases = local_phases
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        if batches != 1:
+            raise ValueError("Distributed IKV currently requires per-rank batch_size=1")
+        count = torch.tensor(local_phases, dtype=torch.long, device=hidden.device)
+        dist.all_reduce(count, op=dist.ReduceOp.MAX)
+        max_phases = int(count.item())
     for batch in valid_seqs:
         policy = make_retention_policy(capacity, hidden.device, retention)
         mask = torch.zeros(capacity, dtype=torch.bool, device=hidden.device)
@@ -165,4 +174,24 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
                             policy.observe_dense(features.flatten(0, 1), times, torch.ones_like(times))
             slots = combined_slots
     result = torch.zeros_like(hidden)
-    return result.index_copy(1, torch.cat(addresses), torch.cat(outputs, dim=1))
+    result = result.index_copy(1, torch.cat(addresses), torch.cat(outputs, dim=1))
+    # FSDP2 collectives require identical MoT calls on every rank. Variable
+    # episode lengths yield different phase counts even with a shared chunk
+    # width. Zero-weight dummy phases preserve the data loss and gradients.
+    if max_phases > local_phases:
+        first = (seq == valid_seqs[0]).nonzero().flatten()[:1]
+        repeated = first.repeat(3)
+        dummy_slices = [("video", 0, 1), ("action", 1, 2), ("tactile", 2, 3)]
+        dummy_context = dict(past=[None] * mot.num_layers,
+                             mask=torch.ones(1, 1, 3, 3, dtype=torch.bool, device=hidden.device),
+                             clean_positions=torch.arange(3, device=hidden.device))
+        dummy_text = None if text is None else text.chunk(batches, dim=1)[0]
+        zero_anchor = hidden.new_zeros(())
+        for _ in range(max_phases - local_phases):
+            mot.set_masks(self_block_mask=None, cross_masks={})
+            dummy, _ = mot(hidden[:, repeated], dummy_text, timestep[:, repeated],
+                           temb[:, repeated], rope[:, repeated], dummy_slices,
+                           training_context=dummy_context)
+            zero_anchor = zero_anchor + dummy.sum() * 0.0
+        result = result + zero_anchor
+    return result
