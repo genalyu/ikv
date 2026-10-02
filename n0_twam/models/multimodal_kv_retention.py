@@ -48,7 +48,13 @@ class ContentHistory:
                         candidates = [i for i in range(len(self.features)) if i not in seen]
                         if not candidates:
                             continue
-                        best = min(candidates, key=lambda i: float(self.last_time[i]))
+                        # Candidates retain ascending slot order. argmin selects
+                        # the first minimum, matching Python min's tie rule,
+                        # with one device-to-host scalar read instead of one
+                        # synchronization for every candidate.
+                        candidate_ids = torch.tensor(candidates, device=self.device,
+                                                     dtype=torch.long)
+                        best = candidates[int(self.last_time[candidate_ids].argmin())]
                         self.features[best] = feature
                         self.duration[best] = 0
                         self.last_time[best] = t
