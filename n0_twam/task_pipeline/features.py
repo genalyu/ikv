@@ -1,6 +1,7 @@
 """Bounded-memory RGB-native sidecars using the online motion implementation."""
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
@@ -117,6 +118,30 @@ def build_payloads(
     return result, dense_payload
 
 
+
+def _existing_sidecars_match(motion_path, dense_path, frame_ids, anchors, camera_keys, threshold):
+    """Only skip atomically completed sidecars aligned to this source episode."""
+    if not motion_path.is_file() or not dense_path.is_file():
+        return False
+    try:
+        motion = torch.load(motion_path, map_location="cpu", weights_only=True)
+        dense = torch.load(dense_path, map_location="cpu", weights_only=True)
+        return (
+            motion["frame_ids"] == frame_ids
+            and dense["frame_ids"] == frame_ids
+            and motion["camera_keys"] == camera_keys
+            and dense["camera_keys"] == camera_keys
+            and motion["latent_num_frames"] == len(anchors)
+            and motion["motion_indices"].shape[0] == len(anchors)
+            and dense["dino_features"].shape[0] == len(anchors)
+            and motion["provenance"]["anchor_indices"] == anchors
+            and motion["provenance"]["input_mode"] == "rgb"
+            and motion["provenance"]["threshold"] == threshold
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def build_features(task, device="cuda"):
     from n0_twam.preprocessing.dinov2 import FrozenDinoV2PatchEncoder
 
@@ -127,11 +152,32 @@ def build_features(task, device="cuda"):
         raise FileNotFoundError(
             "Set runtime.dino_model to local DINOv2 weights; no implicit downloads"
         )
+    progress_path = root / "features.progress.json"
+    progress = dict(task_fingerprint=fingerprint(task), builder_version=1)
+    if progress_path.exists():
+        if json.loads(progress_path.read_text()) != progress:
+            raise ValueError(
+                "Feature sidecars belong to a different task configuration; "
+                "use a new task root or remove the stale sidecars and progress file"
+            )
+    else:
+        if any((root / name).glob("chunk-*/*.pth") for name in ("rgb_motion", "ikv_index")):
+            raise ValueError(
+                "Existing feature sidecars lack a matching progress manifest; "
+                "remove or migrate them before rebuilding"
+            )
+        progress_path.write_text(json.dumps(progress, indent=2))
     encoder = FrozenDinoV2PatchEncoder.from_pretrained(model, device=device)
     latent_files = sorted((root / "latents").glob(f"chunk-*/{keys[0]}/episode_*.pth"))
     if not latent_files:
         raise FileNotFoundError("Encode RGB latents first")
-    for lp in latent_files:
+    shard_count = int(os.environ.get("IKV_FEATURE_SHARD_COUNT", "1"))
+    shard_id = int(os.environ.get("IKV_FEATURE_SHARD_ID", "0"))
+    if shard_count < 1 or not 0 <= shard_id < shard_count:
+        raise ValueError("Invalid feature shard configuration")
+    for episode_index, lp in enumerate(latent_files):
+        if episode_index % shard_count != shard_id:
+            continue
         chunk = lp.parent.parent.name
         reference = torch.load(lp, map_location="cpu", weights_only=True)
         ids = reference["frame_ids"]
@@ -151,6 +197,14 @@ def build_features(task, device="cuda"):
             ):
                 if other[field] != reference[field]:
                     raise ValueError(f"Unaligned cameras: {field}")
+        motion_dest = root / "rgb_motion" / chunk / lp.name
+        dense_dest = root / "ikv_index" / chunk / lp.name
+        threshold = float(task.get("features", {}).get("motion_threshold", 0.02))
+        if _existing_sidecars_match(
+            motion_dest, dense_dest, ids, anchors, keys, threshold
+        ):
+            print(f"Skipped existing features {lp.name}", flush=True)
+            continue
         streams = {}
         for key in keys:
             stem = "_".join(lp.stem.split("_")[:2])
@@ -162,14 +216,15 @@ def build_features(task, device="cuda"):
             ids,
             anchors,
             encoder,
-            float(task.get("features", {}).get("motion_threshold", 0.02)),
+            threshold,
         )
-        for name, payload in (("rgb_motion", motion), ("ikv_index", dense)):
-            dest = root / name / chunk / lp.name
+        for dest, payload in ((motion_dest, motion), (dense_dest, dense)):
             dest.parent.mkdir(parents=True, exist_ok=True)
             torch.save(payload, dest.with_suffix(".tmp"))
             dest.with_suffix(".tmp").replace(dest)
         print(f"Indexed {lp.name}", flush=True)
+    if shard_count > 1:
+        return
     (root / "features.json").write_text(
         json.dumps(
             dict(

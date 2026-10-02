@@ -524,3 +524,26 @@ def test_image_stats_rgb_matches_full_precision_reference():
             np.asarray(result[key]).reshape(3), expected, rtol=1e-8, atol=1e-8
         )
     assert result["count"] == [4]
+
+
+def test_relocated_dino_preserves_task_identity_only_for_identical_weights(tmp_path):
+    import hashlib
+    from n0_twam.task_pipeline.config import fingerprint
+
+    original = task(tmp_path)
+    original["runtime"]["dino_model"] = str(tmp_path / "old-dino")
+    expected = fingerprint(original)
+    replacement = tmp_path / "new-dino"
+    replacement.mkdir()
+    weights = replacement / "model.safetensors"
+    weights.write_bytes(b"frozen DINO weights")
+    relocated = copy.deepcopy(original)
+    relocated["runtime"]["dino_model"] = str(replacement)
+    relocated["runtime"]["dino_model_fingerprint_compat"] = {
+        "original_path": original["runtime"]["dino_model"],
+        "model_sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
+    }
+    assert fingerprint(relocated) == expected
+    weights.write_bytes(b"different DINO weights")
+    with pytest.raises(ValueError, match="differs from feature source"):
+        fingerprint(relocated)

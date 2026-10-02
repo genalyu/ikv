@@ -31,6 +31,24 @@ RECIPE = dict(
 
 
 def fingerprint(value):
+    # A byte-identical frozen model may move without invalidating derived features
+    # or optimizer checkpoints.  Keep the original task identity only when the
+    # replacement DINO weight has been verified against the recorded digest.
+    if isinstance(value, dict) and isinstance(value.get("runtime"), dict):
+        migration = value["runtime"].get("dino_model_fingerprint_compat")
+        if migration is not None:
+            if set(migration) != {"original_path", "model_sha256"}:
+                raise ValueError("Invalid DINO model fingerprint migration")
+            replacement = Path(value["runtime"]["dino_model"]) / "model.safetensors"
+            digest = hashlib.sha256()
+            with replacement.open("rb") as weights:
+                for block in iter(lambda: weights.read(4 * 1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != migration["model_sha256"]:
+                raise ValueError("Relocated DINO model differs from feature source")
+            value = deepcopy(value)
+            value["runtime"]["dino_model"] = migration["original_path"]
+            del value["runtime"]["dino_model_fingerprint_compat"]
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, default=str).encode()
     ).hexdigest()
