@@ -525,6 +525,8 @@ class Trainer:
                 capacity=self.config.ikv_train_capacity,
                 retention=retention, execution=execution,
                 block_size=int(getattr(self.config, "ikv_train_block_size", 128)),
+                compact_attention=bool(getattr(self.config, "ikv_train_compact_attention", False)),
+                compact_max_packed_keys=int(getattr(self.config, "ikv_train_compact_max_packed_keys", 65536)),
                 sample_capacity=bool(getattr(self.config, "ikv_train_sample_capacity", False)),
                 min_capacity=int(getattr(self.config, "ikv_train_min_capacity",
                                          (self.config.ikv_train_capacity + 1) // 2)))
@@ -924,6 +926,8 @@ class Trainer:
                     'ikv_train_capacity': int(getattr(_c, 'ikv_train_capacity', 0)),
                     'ikv_train_execution': getattr(_c, 'ikv_train_execution', 'recurrent'),
                     'ikv_train_block_size': int(getattr(_c, 'ikv_train_block_size', 128)),
+                    'ikv_train_compact_attention': bool(getattr(_c, 'ikv_train_compact_attention', False)),
+                    'ikv_train_compact_max_packed_keys': int(getattr(_c, 'ikv_train_compact_max_packed_keys', 65536)),
                     'ikv_train_sample_capacity': bool(getattr(_c, 'ikv_train_sample_capacity', False)),
                     'ikv_train_min_capacity': int(getattr(_c, 'ikv_train_min_capacity', 0)),
                     'kv_retention': dict(getattr(_c, 'kv_retention', {})),

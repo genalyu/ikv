@@ -187,3 +187,47 @@ def test_refined_mask_preserves_visibility_and_coarse_full_block_order(q_len, kv
     expected = full_blocks(coarse).repeat_interleave(2, -2).repeat_interleave(2, -1)
     actual = full_blocks(refined)
     assert torch.equal(actual, expected[..., :actual.shape[-2], :actual.shape[-1]])
+
+
+@pytest.mark.parametrize("capacity,version", [(32, 1), (4, 1), (4, 2)])
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_compact_matches_masked_output_and_full_gradients(capacity, version, checkpoint):
+    from n0_twam.models.compact_ikv_attention import build_compact_ikv_groups
+    reference = tiny_model(False).mot
+    compact = deepcopy(reference)
+    reference.gradient_checkpointing = compact.gradient_checkpointing = checkpoint
+    hidden, text, timestep, temb, rope, memory = prepared_case(capacity, version)
+    plan = build_ikv_support_plan(memory, torch.device("cpu"))
+    groups = build_compact_ikv_groups(memory["layout"], plan)
+    phase = memory["layout"]["phase"]
+    clean = memory["layout"]["clean"]
+    for query, keys in groups:
+        stage = int(phase[query[0]])
+        branch = bool(clean[query[0]])
+        expected = ((phase == stage) & (clean == branch)) | (
+            (phase < stage) & clean &
+            plan["clean" if branch else "noisy"][stage]
+        )
+        torch.testing.assert_close(
+            torch.zeros(len(phase), dtype=torch.bool).index_fill(0, keys, True),
+            expected,
+        )
+    a = hidden.detach().clone().requires_grad_()
+    b = hidden.detach().clone().requires_grad_()
+    expected = run_ikv_masked_training(
+        reference, a, text, timestep, temb, rope, memory)
+    compact_memory = deepcopy(memory)
+    compact_memory["config"]["compact_attention"] = True
+    actual = run_ikv_masked_training(
+        compact, b, text, timestep, temb, rope, compact_memory)
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    torch.testing.assert_close(b.grad, a.grad, rtol=3e-4, atol=3e-6)
+    for (name, left), (_, right) in zip(
+        reference.named_parameters(), compact.named_parameters()
+    ):
+        if left.grad is not None:
+            torch.testing.assert_close(
+                right.grad, left.grad, rtol=3e-4, atol=3e-6,
+                msg=lambda m: name + ": " + m)

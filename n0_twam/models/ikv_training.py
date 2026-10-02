@@ -375,13 +375,17 @@ def run_ikv_masked_training(mot, hidden, text, timestep, temb, rope, memory):
         return same_sample & (same_phase | (past_clean & retained))
 
     length = len(seq)
+    compact_groups = None
+    if memory["config"].get("compact_attention", False):
+        from .compact_ikv_attention import build_compact_ikv_groups
+        compact_groups = build_compact_ikv_groups(layout, plan)
     dense_mask = None
     block_mask = None
-    if hidden.device.type == "cpu" or hidden.shape[-1] < 16:
+    if compact_groups is None and (hidden.device.type == "cpu" or hidden.shape[-1] < 16):
         q = torch.arange(length, device=hidden.device)[:, None]
         k = torch.arange(length, device=hidden.device)[None, :]
         dense_mask = mask_mod(None, None, q, k)[None, None]
-    else:
+    elif compact_groups is None:
         block_mask = FlexAttnFunc.compiled_create_block_mask(
             mask_mod, 1, 1, length, length, device=hidden.device,
             BLOCK_SIZE=int(memory["config"].get("block_size", 128)), _compile=True)
@@ -391,6 +395,9 @@ def run_ikv_masked_training(mot, hidden, text, timestep, temb, rope, memory):
     action = splits[2] + splits[3]
     slices = [("video", 0, video), ("action", video, video + action),
               ("tactile", video + action, length)]
-    mot.set_masks(self_block_mask=block_mask, dense_self_mask=dense_mask, cross_masks={})
+    mot.set_masks(self_block_mask=block_mask, dense_self_mask=dense_mask,
+                  compact_self_groups=compact_groups,
+                  compact_max_packed_keys=int(memory["config"].get("compact_max_packed_keys", 65536)),
+                  cross_masks={})
     result = mot(hidden, text, timestep, temb, rope, slices)
     return result.masked_fill(~valid[None, :, None], 0)

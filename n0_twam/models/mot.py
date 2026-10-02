@@ -34,6 +34,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 from .model import WanTransformerBlock, FlexAttnFunc, custom_sdpa, WanTransformer3DModel
+from .compact_ikv_attention import compact_ikv_attention, streamed_packed_ikv_attention
 from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig, token_rows
 
@@ -53,6 +54,8 @@ class SharedSelfAttention(nn.Module):
         super().__init__()
         self.flex = FlexAttnFunc(is_cross=False)
         self._dense_mask: Optional[torch.Tensor] = None
+        self.compact_groups = None
+        self.compact_max_packed_keys = 65536
         self.attn_caches = {}  # streaming KV-cache pools per cache_name
 
     def set_block_mask(self, block_mask) -> None:
@@ -149,6 +152,13 @@ class SharedSelfAttention(nn.Module):
             semantic_mask = (
                 current_valid[:, None, :, None] & current_valid[:, None, None, :]
             )
+        if self.compact_groups is not None:
+            if semantic_mask is not None:
+                raise ValueError("Compact IKV groups already encode valid tokens")
+            if q.is_cuda:
+                return streamed_packed_ikv_attention(
+                    q, k, v, self.compact_groups, self.compact_max_packed_keys)
+            return compact_ikv_attention(q, k, v, self.compact_groups)
         if self._dense_mask is not None:
             attn_mask = self._dense_mask.to(q.device)
             if semantic_mask is not None:
@@ -854,11 +864,14 @@ class MoTBackbone(nn.Module):
             self.commit_cache_transaction(transaction)
 
     # ───────────────────────── mask wiring ─────────────────────────
-    def set_masks(self, self_block_mask=None, dense_self_mask=None, cross_masks=None):
+    def set_masks(self, self_block_mask=None, dense_self_mask=None, cross_masks=None,
+                  compact_self_groups=None, compact_max_packed_keys=65536):
         """Set the shared self-attn mask (all layers) and per-expert cross masks.
         `self_block_mask` (flex, GPU) OR `dense_self_mask` (bool [S,S], CPU);
         `cross_masks` maps expert name -> dense bool (1,1,S_q,S_text)."""
         for layer in range(self.num_layers):
+            self.shared_attn[layer].compact_groups = compact_self_groups
+            self.shared_attn[layer].compact_max_packed_keys = compact_max_packed_keys
             if dense_self_mask is not None:
                 self.shared_attn[layer].set_dense_mask(dense_self_mask)
             else:

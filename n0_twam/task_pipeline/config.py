@@ -167,6 +167,16 @@ def training_config(task, mode, world_size, *, require_ready=True):
     cfg.ikv_train_capacity = int(task.get("features", {}).get("ikv_capacity", 4096))
     # Sparse mask granularity is independent of the attention matmul tile sizes.
     cfg.ikv_train_block_size = int(task.get("features", {}).get("ikv_block_size", 64))
+    # Runtime override permits switching kernels without invalidating prepared
+    # task-data fingerprints, which include every field in the task JSON.
+    cfg.ikv_train_compact_attention = bool(ikv and (
+        task.get("features", {}).get("ikv_compact_attention", False)
+        or os.environ.get("IKV_COMPACT_ATTENTION") == "1"))
+    cfg.ikv_train_compact_max_packed_keys = int(os.environ.get(
+        "IKV_COMPACT_MAX_PACKED_KEYS",
+        task.get("features", {}).get("ikv_compact_max_packed_keys", 65536)))
+    if cfg.ikv_train_compact_max_packed_keys < 1:
+        raise ValueError("ikv_compact_max_packed_keys must be positive")
     if cfg.ikv_train_block_size not in (64, 128):
         raise ValueError("ikv_block_size must be 64 or 128 for the current attention kernels")
     cfg.ikv_train_execution = (task.get("features", {}).get("ikv_training_execution", "masked")

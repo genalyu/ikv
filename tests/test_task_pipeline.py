@@ -547,3 +547,18 @@ def test_relocated_dino_preserves_task_identity_only_for_identical_weights(tmp_p
     weights.write_bytes(b"different DINO weights")
     with pytest.raises(ValueError, match="differs from feature source"):
         fingerprint(relocated)
+
+
+
+def test_compact_attention_runtime_override_preserves_prepared_task_identity(tmp_path, monkeypatch):
+    from n0_twam.task_pipeline.config import fingerprint
+    current = task(tmp_path)
+    before = fingerprint(current)
+    monkeypatch.setenv("IKV_COMPACT_ATTENTION", "1")
+    monkeypatch.setenv("IKV_COMPACT_MAX_PACKED_KEYS", "32768")
+    compact = training_config(current, "ikv", 4, require_ready=False)
+    baseline = training_config(current, "baseline", 4, require_ready=False)
+    assert compact.ikv_train_compact_attention is True
+    assert compact.ikv_train_compact_max_packed_keys == 32768
+    assert baseline.ikv_train_compact_attention is False
+    assert fingerprint(current) == before
