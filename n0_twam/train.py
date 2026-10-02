@@ -524,6 +524,7 @@ class Trainer:
             input_dict["ikv_training"] = dict(
                 capacity=self.config.ikv_train_capacity,
                 retention=retention, execution=execution,
+                block_size=int(getattr(self.config, "ikv_train_block_size", 128)),
                 sample_capacity=bool(getattr(self.config, "ikv_train_sample_capacity", False)),
                 min_capacity=int(getattr(self.config, "ikv_train_min_capacity",
                                          (self.config.ikv_train_capacity + 1) // 2)))
@@ -922,6 +923,7 @@ class Trainer:
                     'use_ikv_training': bool(getattr(_c, 'use_ikv_training', False)),
                     'ikv_train_capacity': int(getattr(_c, 'ikv_train_capacity', 0)),
                     'ikv_train_execution': getattr(_c, 'ikv_train_execution', 'recurrent'),
+                    'ikv_train_block_size': int(getattr(_c, 'ikv_train_block_size', 128)),
                     'ikv_train_sample_capacity': bool(getattr(_c, 'ikv_train_sample_capacity', False)),
                     'ikv_train_min_capacity': int(getattr(_c, 'ikv_train_min_capacity', 0)),
                     'kv_retention': dict(getattr(_c, 'kv_retention', {})),

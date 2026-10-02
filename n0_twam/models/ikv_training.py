@@ -311,6 +311,48 @@ def build_ikv_support_plan(memory, device):
     return dict(clean=support_clean, noisy=support_noisy)
 
 
+def _preserve_parent_full_blocks(mask):
+    """Keep 128-block traversal order while pruning empty 64 blocks.
+
+    Newly full child blocks must stay in the partial loop: moving them to the
+    full loop changes softmax reduction order and can amplify BF16 rounding.
+    """
+    from torch.nn.attention.flex_attention import BlockMask
+
+    if mask.BLOCK_SIZE != (64, 64) or mask.full_kv_num_blocks is None:
+        return mask
+
+    def dense(count, indices):
+        columns = torch.arange(indices.shape[-1], device=indices.device)
+        flags = (columns < count[..., None]).to(torch.int32)
+        return torch.zeros_like(indices, dtype=torch.int32).scatter_add(
+            -1, indices.long(), flags
+        ).bool()
+
+    partial = dense(mask.kv_num_blocks, mask.kv_indices)
+    full = dense(mask.full_kv_num_blocks, mask.full_kv_indices)
+    nq, nk = full.shape[-2:]
+    padded = torch.nn.functional.pad(full, (0, nk % 2, 0, nq % 2))
+    parent = padded.reshape(
+        *full.shape[:-2], (nq + 1) // 2, 2, (nk + 1) // 2, 2
+    ).all(-1).all(-2)
+    kept_full = parent.repeat_interleave(2, -2).repeat_interleave(2, -1)[..., :nq, :nk]
+    refined_partial = (partial | full) & ~kept_full
+
+    def ordered(blocks):
+        blocks = blocks.to(torch.int32)
+        counts = blocks.sum(-1).to(torch.int32)
+        indices = blocks.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
+        return counts, indices
+
+    partial_counts, partial_indices = ordered(refined_partial)
+    full_counts, full_indices = ordered(kept_full)
+    return BlockMask.from_kv_blocks(
+        partial_counts, partial_indices, full_counts, full_indices,
+        BLOCK_SIZE=64, mask_mod=mask.mask_mod, seq_lengths=mask.seq_lengths,
+    )
+
+
 def run_ikv_masked_training(mot, hidden, text, timestep, temb, rope, memory):
     """Use the normal one-pass MoT backward with IKV-derived visibility."""
     from .model import FlexAttnFunc
@@ -341,7 +383,9 @@ def run_ikv_masked_training(mot, hidden, text, timestep, temb, rope, memory):
         dense_mask = mask_mod(None, None, q, k)[None, None]
     else:
         block_mask = FlexAttnFunc.compiled_create_block_mask(
-            mask_mod, 1, 1, length, length, device=hidden.device, _compile=True)
+            mask_mod, 1, 1, length, length, device=hidden.device,
+            BLOCK_SIZE=int(memory["config"].get("block_size", 128)), _compile=True)
+        block_mask = _preserve_parent_full_blocks(block_mask)
     splits = memory["splits"]
     video = splits[0] + splits[1]
     action = splits[2] + splits[3]

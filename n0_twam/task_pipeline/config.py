@@ -165,6 +165,10 @@ def training_config(task, mode, world_size, *, require_ready=True):
     cfg.use_rgb_motion_tokens, cfg.use_ikv_training = motion, ikv
     cfg.kv_cache_policy = "global" if ikv else "fifo"
     cfg.ikv_train_capacity = int(task.get("features", {}).get("ikv_capacity", 4096))
+    # Sparse mask granularity is independent of the attention matmul tile sizes.
+    cfg.ikv_train_block_size = int(task.get("features", {}).get("ikv_block_size", 64))
+    if cfg.ikv_train_block_size not in (64, 128):
+        raise ValueError("ikv_block_size must be 64 or 128 for the current attention kernels")
     cfg.ikv_train_execution = (task.get("features", {}).get("ikv_training_execution", "masked")
                                if ikv else "recurrent")
     cfg.ikv_train_sample_capacity = bool(ikv and cfg.ikv_train_execution == "masked"

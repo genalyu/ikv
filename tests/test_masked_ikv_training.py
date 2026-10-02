@@ -162,3 +162,28 @@ def test_sampled_k_does_not_depend_on_future_layout():
     torch.manual_seed(37)
     k2, r2 = sample_ikv_capacity(future, torch.device("cpu"), cfg)
     assert k1 == k2 and r1 == r2
+
+
+@pytest.mark.parametrize("q_len,kv_len", [(512, 512), (320, 448)])
+def test_refined_mask_preserves_visibility_and_coarse_full_block_order(q_len, kv_len):
+    from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+    from n0_twam.models.ikv_training import _preserve_parent_full_blocks
+
+    def visible(b, h, q, k):
+        return (q < q_len) & (k < kv_len) & ((q // 160 == k // 160) | (k < 64))
+
+    coarse = create_block_mask(visible, 1, 1, q_len, kv_len, device="cpu", BLOCK_SIZE=128)
+    fine = create_block_mask(visible, 1, 1, q_len, kv_len, device="cpu", BLOCK_SIZE=64)
+    refined = _preserve_parent_full_blocks(fine)
+    assert torch.equal(refined.to_dense(), fine.to_dense())
+    assert refined.mask_mod is fine.mask_mod
+
+    def full_blocks(mask):
+        return BlockMask.from_kv_blocks(
+            mask.full_kv_num_blocks, mask.full_kv_indices,
+            BLOCK_SIZE=mask.BLOCK_SIZE, seq_lengths=mask.seq_lengths,
+        ).to_dense()
+
+    expected = full_blocks(coarse).repeat_interleave(2, -2).repeat_interleave(2, -1)
+    actual = full_blocks(refined)
+    assert torch.equal(actual, expected[..., :actual.shape[-2], :actual.shape[-1]])
