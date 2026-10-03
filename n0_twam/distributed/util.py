@@ -45,3 +45,13 @@ def dist_max(local_tensor):
     if dist.is_initialized():
         dist.all_reduce(local_tensor, op=dist.ReduceOp.MAX)
     return local_tensor
+
+
+def dist_mean_and_max(local_tensor):
+    """Reduce a vector of metrics with two collectives, without mutating input."""
+    mean, maximum = local_tensor.clone(), local_tensor.clone()
+    if dist.is_initialized():
+        dist.all_reduce(mean, op=dist.ReduceOp.SUM)
+        mean.div_(dist.get_world_size())
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    return mean, maximum

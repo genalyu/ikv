@@ -26,7 +26,7 @@ from distributed.util import (
     _configure_model, 
     init_distributed, 
     dist_mean, 
-    dist_max
+    dist_mean_and_max,
 )
 from einops import rearrange
 from models.utils import (
@@ -275,6 +275,7 @@ class Trainer:
                 train_dataset,
                 batch_sampler=train_batch_sampler,
                 num_workers=config.load_worker,
+                pin_memory=bool(getattr(config, "pin_memory", True)),
             )
             if config.rank == 0:
                 logger.info(
@@ -294,6 +295,7 @@ class Trainer:
                 batch_size=config.batch_size,
                 shuffle=(train_sampler is None),
                 num_workers=config.load_worker,
+                pin_memory=bool(getattr(config, "pin_memory", True)),
                 sampler=train_sampler,
                 generator=(torch.Generator().manual_seed(getattr(config, 'seed', 42))
                            if getattr(config, 'save_training_state', False) else None),
@@ -319,6 +321,7 @@ class Trainer:
                 batch_size=config.batch_size,
                 shuffle=False,
                 num_workers=2,
+                pin_memory=bool(getattr(config, "pin_memory", True)),
                 sampler=val_sampler,
             )
             self.val_interval = int(getattr(config, 'val_interval', 100))
@@ -556,7 +559,7 @@ class Trainer:
                 'tactile_local_latent',
             ):
                 continue
-            input_dict[key] = value.to(self.device)#.to(self.dtype)
+            input_dict[key] = value.to(self.device, non_blocking=True)
         return input_dict
 
     def _compute_latent_loss(self, input_dict, latent_pred):
@@ -1051,15 +1054,16 @@ class Trainer:
             if losses['should_log']:
                 lr = self.lr_scheduler.get_last_lr()[0]
 
-                metric_shows = {}
-                max_metric_shows = {}
+                names, local_metrics = [], []
                 for name, values in accumulated_metrics.items():
                     if not values:
                         continue
-                    metric_tensor = (torch.stack(values).mean() if name == "ikv_capacity"
-                                     else torch.stack(values).sum())
-                    metric_shows[name] = dist_mean(metric_tensor).detach().cpu().item()
-                    max_metric_shows[name] = dist_max(metric_tensor).detach().cpu().item()
+                    names.append(name)
+                    local_metrics.append(torch.stack(values).mean() if name == "ikv_capacity"
+                                         else torch.stack(values).sum())
+                means, maxima = dist_mean_and_max(torch.stack(local_metrics))
+                metric_shows = dict(zip(names, means.detach().cpu().tolist()))
+                max_metric_shows = dict(zip(names, maxima.detach().cpu().tolist()))
 
                 accumulated_metrics = {name: [] for name in metric_names}
                 step_in_accumulation = 0

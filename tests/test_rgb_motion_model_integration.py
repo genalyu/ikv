@@ -41,6 +41,7 @@ def _load_trainer_class():
     distributed_util.init_distributed = lambda *args, **kwargs: None
     distributed_util.dist_mean = lambda value: value
     distributed_util.dist_max = lambda value: value
+    distributed_util.dist_mean_and_max = lambda value: (value.clone(), value.clone())
 
     models = types.ModuleType("models")
     models.__path__ = []

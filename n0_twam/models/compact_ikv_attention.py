@@ -162,11 +162,12 @@ class _StreamedPackedIKV(torch.autograd.Function):
         return dq, dk.to(k.dtype), dv.to(v.dtype), None
 
 
-def streamed_packed_ikv_attention(q, k, v, groups, max_keys=65536):
+def streamed_packed_ikv_attention(q, k, v, groups, max_keys=65536, *, chunks=None):
     """Bound gather memory; recompute each packed chunk during backward."""
     if q.shape != k.shape or q.shape != v.shape or q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("Expected matching Q/K/V shaped [1,S,H,D]")
     if not groups:
         return torch.zeros_like(q)
-    chunks = _pack_group_chunks(groups, q.device, max_keys)
+    if chunks is None:
+        chunks = _pack_group_chunks(groups, q.device, max_keys)
     return _StreamedPackedIKV.apply(q, k, v, chunks)

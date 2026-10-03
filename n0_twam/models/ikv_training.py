@@ -244,7 +244,7 @@ def sample_ikv_capacity(memory, device, retention):
                             action_capacity=budgets[1], tactile_capacity=budgets[2])
 
 
-def build_ikv_support_plan(memory, device):
+def build_ikv_support_plan(memory, device, *, return_groups=False):
     """Replay the detached retention policy from recorded metadata only.
 
     Attention-query usage must be disabled for this path; otherwise the mask
@@ -260,8 +260,10 @@ def build_ikv_support_plan(memory, device):
     if valid_seqs != [0]:
         raise ValueError("Masked IKV currently requires per-rank batch_size=1")
     capacity, retention = sample_ikv_capacity(memory, device, retention)
-    support_clean = torch.zeros(int(phase.max()) + 1, len(seq), dtype=torch.bool, device=device)
-    support_noisy = torch.zeros_like(support_clean)
+    groups = []
+    if not return_groups:
+        support_clean = torch.zeros(int(phase.max()) + 1, len(seq), dtype=torch.bool, device=device)
+        support_noisy = torch.zeros_like(support_clean)
     policy = make_retention_policy(capacity, device, retention)
     occupied = torch.zeros(capacity, dtype=torch.bool, device=device)
     slots = torch.empty(0, dtype=torch.long, device=device)
@@ -270,9 +272,9 @@ def build_ikv_support_plan(memory, device):
         positions = ((seq == 0) & (phase == stage)).nonzero().flatten()
         is_clean = clean[positions]
         source = positions[is_clean]
+        noisy_source = positions[~is_clean]
         incoming = {name: value[source] for name, value in rows.items()}
         if retention.version == 2:
-            noisy_source = positions[~is_clean]
             provisional = {name: value[noisy_source].clone() for name, value in rows.items()}
             provisional["observation_flag"].zero_()
             provisional["dino"].zero_()
@@ -283,12 +285,20 @@ def build_ikv_support_plan(memory, device):
             provisional = dict(incoming,
                                observation_flag=torch.zeros_like(incoming["observation_flag"]))
         new_slots, victims = policy.plan(occupied, len(source), incoming)
-        _, noisy_victims = policy.plan(occupied, int((~is_clean).sum()), provisional)
+        _, noisy_victims = policy.plan(occupied, len(noisy_source), provisional)
         clean_keep = ~torch.isin(slots, victims)
         noisy_keep = ~torch.isin(slots, noisy_victims)
         old_tokens = slot_to_token[slots]
-        support_clean[int(stage), old_tokens[clean_keep]] = True
-        support_noisy[int(stage), old_tokens[noisy_keep]] = True
+        if return_groups:
+            # Every occupied token is clean and belongs to an earlier phase.
+            # Preserve the dense-plan key order exactly, without a [phase, token] table.
+            for query, keep in ((source, clean_keep), (noisy_source, noisy_keep)):
+                if query.numel():
+                    keys = torch.cat((old_tokens[keep], query)).sort().values
+                    groups.append((query, keys))
+        else:
+            support_clean[int(stage), old_tokens[clean_keep]] = True
+            support_noisy[int(stage), old_tokens[noisy_keep]] = True
         kept_slots = slots[clean_keep]
         old_mask = occupied.clone()
         occupied[victims] = False
@@ -303,12 +313,18 @@ def build_ikv_support_plan(memory, device):
                 real_times = incoming["world_time_id"][incoming["kind"] != 1]
                 if len(real_times):
                     last = int(real_times.max())
-                    frame_ids = torch.arange(min(last + 1, dense.shape[1]), device=device)
-                    features = dense[0, frame_ids]
-                    times = frame_ids[:, None].expand(features.shape[:2]).flatten().float()
-                    policy.observe_dense(features.flatten(0, 1), times, torch.ones_like(times))
+                    # History already committed earlier dense frames. Replaying the
+                    # growing prefix only scans duplicates and synchronizes on every
+                    # old timestamp; retain the exact chronological new observations.
+                    first = 0 if policy.history.clock is None else int(policy.history.clock) + 1
+                    stop = min(last + 1, dense.shape[1])
+                    if first < stop:
+                        frame_ids = torch.arange(first, stop, device=device)
+                        features = dense[0, frame_ids]
+                        times = frame_ids[:, None].expand(features.shape[:2]).flatten().float()
+                        policy.observe_dense(features.flatten(0, 1), times, torch.ones_like(times))
         slots = torch.cat((kept_slots, new_slots))
-    return dict(clean=support_clean, noisy=support_noisy)
+    return dict(groups=groups) if return_groups else dict(clean=support_clean, noisy=support_noisy)
 
 
 def _preserve_parent_full_blocks(mask):
@@ -359,10 +375,12 @@ def run_ikv_masked_training(mot, hidden, text, timestep, temb, rope, memory):
     layout = memory["layout"]
     seq, phase, clean = (layout[key] for key in ("seq", "phase", "clean"))
     with torch.no_grad():
-        plan = build_ikv_support_plan(memory, hidden.device)
+        plan = build_ikv_support_plan(
+            memory, hidden.device,
+            return_groups=bool(memory["config"].get("compact_attention", False)))
     mot.last_sampled_ikv_capacity = memory["config"]["sampled_capacity"]
     valid = seq >= 0
-    support_clean, support_noisy = plan["clean"], plan["noisy"]
+    support_clean, support_noisy = plan.get("clean"), plan.get("noisy")
 
     def mask_mod(b, h, q_idx, kv_idx):
         same_sample = valid[q_idx] & valid[kv_idx] & (seq[q_idx] == seq[kv_idx])
@@ -375,10 +393,7 @@ def run_ikv_masked_training(mot, hidden, text, timestep, temb, rope, memory):
         return same_sample & (same_phase | (past_clean & retained))
 
     length = len(seq)
-    compact_groups = None
-    if memory["config"].get("compact_attention", False):
-        from .compact_ikv_attention import build_compact_ikv_groups
-        compact_groups = build_compact_ikv_groups(layout, plan)
+    compact_groups = plan.get("groups")
     dense_mask = None
     block_mask = None
     if compact_groups is None and (hidden.device.type == "cpu" or hidden.shape[-1] < 16):

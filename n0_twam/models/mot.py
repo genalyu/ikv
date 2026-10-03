@@ -34,7 +34,9 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 from .model import WanTransformerBlock, FlexAttnFunc, custom_sdpa, WanTransformer3DModel
-from .compact_ikv_attention import compact_ikv_attention, streamed_packed_ikv_attention
+from .compact_ikv_attention import (
+    compact_ikv_attention, streamed_packed_ikv_attention, _pack_group_chunks,
+)
 from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig, token_rows
 
@@ -55,6 +57,7 @@ class SharedSelfAttention(nn.Module):
         self.flex = FlexAttnFunc(is_cross=False)
         self._dense_mask: Optional[torch.Tensor] = None
         self.compact_groups = None
+        self.compact_chunks = None
         self.compact_max_packed_keys = 65536
         self.attn_caches = {}  # streaming KV-cache pools per cache_name
 
@@ -157,7 +160,8 @@ class SharedSelfAttention(nn.Module):
                 raise ValueError("Compact IKV groups already encode valid tokens")
             if q.is_cuda:
                 return streamed_packed_ikv_attention(
-                    q, k, v, self.compact_groups, self.compact_max_packed_keys)
+                    q, k, v, self.compact_groups, self.compact_max_packed_keys,
+                    chunks=self.compact_chunks)
             return compact_ikv_attention(q, k, v, self.compact_groups)
         if self._dense_mask is not None:
             attn_mask = self._dense_mask.to(q.device)
@@ -869,7 +873,15 @@ class MoTBackbone(nn.Module):
         """Set the shared self-attn mask (all layers) and per-expert cross masks.
         `self_block_mask` (flex, GPU) OR `dense_self_mask` (bool [S,S], CPU);
         `cross_masks` maps expert name -> dense bool (1,1,S_q,S_text)."""
+        # One immutable index pack per trajectory, shared by all layers and
+        # activation-checkpoint recomputation. Replaced on the next forward.
+        compact_chunks = None
+        if compact_self_groups and compact_self_groups[0][0].is_cuda:
+            compact_chunks = _pack_group_chunks(
+                compact_self_groups, compact_self_groups[0][0].device,
+                compact_max_packed_keys)
         for layer in range(self.num_layers):
+            self.shared_attn[layer].compact_chunks = compact_chunks
             self.shared_attn[layer].compact_groups = compact_self_groups
             self.shared_attn[layer].compact_max_packed_keys = compact_max_packed_keys
             if dense_self_mask is not None:

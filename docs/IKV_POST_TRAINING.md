@@ -221,3 +221,35 @@ multi-GPU communication test or a full-size checkpoint memory benchmark.
 ## 可复用真机 / 仿真任务入口
 
 任务数据分析、LeRobot 转换、1/2/8 卡等效 batch、四种消融及完整恢复见 [任务训练指南](TASK_PIPELINE.md)。
+
+
+### Reusing exact compact training metadata
+
+Compact masked training can construct its `(query, retained_keys)` groups during
+retention replay, without materializing the two `[phase, token]` support tables.
+The dense support-plan path remains available as the regression reference. Key
+indices retain their original sorted order; capacity sampling, policy decisions,
+losses and gradients are unchanged. The packed query/key indices and cumulative
+lengths are built once per trajectory and shared across layers and checkpoint
+recomputation. Only metadata is reused; Q/K/V tensors and their gradients remain
+specific to each layer.
+
+For version-2 persistence, replay submits only previously unseen dense DINO
+frames, in chronological order. `ContentHistory.clock` already rejects duplicate
+frames, so repeatedly gathering and scanning the growing historical prefix is
+unnecessary. Greedy prototype matching and observation durations are unchanged.
+
+Training loaders pin host tensors by default (`pin_memory=False` disables this),
+and device transfers use the same CUDA stream with `non_blocking=True`. Worker
+lifetime, sample order and RNG handling are unchanged. Training metric reductions
+use two vector collectives instead of one mean and one maximum per metric. Each
+reduction receives its own copy: a mean reduction must not overwrite the local
+values before computing the maximum. This affects logged maxima, not the loss
+used for optimization.
+
+Validation: CPU tests compare direct groups with the dense plan (including padded
+and nonconsecutive phases), retained history, full outputs/gradients, and two-rank
+metric reduction. `tests/smoke_compact_preparation_cuda.py` compares both compact
+paths on a small checkpointed CUDA model, verifies one shared pack, all parameter
+gradients, and an AdamW update. These checks do not establish a full-size FSDP
+throughput or peak-memory result; measure those before changing a production run.

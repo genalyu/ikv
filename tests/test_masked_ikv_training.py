@@ -231,3 +231,57 @@ def test_compact_matches_masked_output_and_full_gradients(capacity, version, che
             torch.testing.assert_close(
                 right.grad, left.grad, rtol=3e-4, atol=3e-6,
                 msg=lambda m: name + ": " + m)
+
+
+@pytest.mark.parametrize("capacity,version", [(32, 1), (4, 1), (4, 2)])
+@pytest.mark.parametrize("padding", [0, 3])
+def test_direct_retention_groups_equal_dense_plan(capacity, version, padding):
+    from n0_twam.models.compact_ikv_attention import build_compact_ikv_groups
+    *_, memory = prepared_case(capacity, version)
+    # Nonconsecutive phases and invalid trailing tokens must not enter any group.
+    memory["layout"]["phase"] *= 3
+    if padding:
+        for name, tensor in memory["layout"].items():
+            fill = False if tensor.dtype == torch.bool else -1
+            memory["layout"][name] = torch.cat((tensor, tensor.new_full((padding,), fill)))
+        for name, tensor in memory["rows"].items():
+            memory["rows"][name] = torch.cat((tensor, tensor.new_zeros((padding, *tensor.shape[1:]))))
+    state = torch.get_rng_state()
+    dense = build_ikv_support_plan(deepcopy(memory), torch.device("cpu"))
+    expected = build_compact_ikv_groups(memory["layout"], dense)
+    torch.set_rng_state(state)
+    direct = build_ikv_support_plan(deepcopy(memory), torch.device("cpu"), return_groups=True)
+    assert set(direct) == {"groups"}
+    assert len(direct["groups"]) == len(expected)
+    for (q, k), (eq, ek) in zip(direct["groups"], expected):
+        assert torch.equal(q, eq)
+        assert torch.equal(k, ek)
+
+
+def test_dense_history_observes_new_frames_once_with_identical_retention(monkeypatch):
+    from n0_twam.models.multimodal_kv_retention import MultimodalKVRetention
+    *_, memory = prepared_case(4, 2)
+    memory["config"]["retention"].update(persistence_weight=0.5, content_capacity=3)
+    torch.manual_seed(82)
+    dense = torch.randn(1, 2, 4, 3)
+    memory["dense_dino_features"] = dense
+    memory["rows"]["dino"] = torch.randn(16, 3)
+    original = MultimodalKVRetention.observe_dense
+    seen = []
+    def record(self, features, times, durations):
+        seen.extend(torch.unique(times).tolist())
+        return original(self, features, times, durations)
+    monkeypatch.setattr(MultimodalKVRetention, "observe_dense", record)
+    state = torch.get_rng_state()
+    direct = build_ikv_support_plan(deepcopy(memory), torch.device("cpu"))
+    assert seen == [0., 1.]
+    def replay_prefix(self, features, times, durations):
+        stop = int(times.max()) + 1
+        values = dense[0, :stop]
+        all_times = torch.arange(stop)[:, None].expand(values.shape[:2]).flatten().float()
+        return original(self, values.flatten(0, 1), all_times, torch.ones_like(all_times))
+    monkeypatch.setattr(MultimodalKVRetention, "observe_dense", replay_prefix)
+    torch.set_rng_state(state)
+    reference = build_ikv_support_plan(deepcopy(memory), torch.device("cpu"))
+    for key in ("clean", "noisy"):
+        assert torch.equal(direct[key], reference[key])
