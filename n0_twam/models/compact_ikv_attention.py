@@ -121,43 +121,50 @@ def _flash_varlen(q, k, v, chunk):
     packed_q = q[0].index_select(0, qi)
     packed_k = k[0].index_select(0, ki)
     packed_v = v[0].index_select(0, ki)
-    y = torch.ops.aten._flash_attention_forward(
+    y, lse, rng, unused, _ = torch.ops.aten._flash_attention_forward(
         packed_q, packed_k, packed_v, cq, ck,
-        max_q, max_k, 0.0, False, False)[0]
-    return y, (packed_q, packed_k, packed_v)
+        max_q, max_k, 0.0, False, False)
+    return y, lse, rng, unused
 
 
 class _StreamedPackedIKV(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, chunks):
         ctx.chunks = chunks
-        ctx.save_for_backward(q, k, v)
         output = torch.zeros_like(q)
+        lses, rngs, unuseds = [], [], []
         for chunk in chunks:
-            y, _ = _flash_varlen(q, k, v, chunk)
+            y, lse, rng, unused = _flash_varlen(q, k, v, chunk)
             output[0].index_copy_(0, chunk[0], y)
+            lses.append(lse)
+            rngs.append(rng)
+            unuseds.append(unused)
+        # FlashAttention backward accepts these exact forward artifacts. Keep
+        # only the output and small metadata; gather Q/K/V again as before.
+        ctx.save_for_backward(q, k, v, output, *lses, *rngs, *unuseds)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        q, k, v = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        q, k, v, output = saved[:4]
+        count = len(ctx.chunks)
+        lses = saved[4:4 + count]
+        rngs = saved[4 + count:4 + 2 * count]
+        unuseds = saved[4 + 2 * count:4 + 3 * count]
         dq = torch.zeros_like(q)
         dk = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
-        for chunk in ctx.chunks:
+        for index, chunk in enumerate(ctx.chunks):
             qi, ki = chunk[:2]
             packed_q = q[0].index_select(0, qi)
             packed_k = k[0].index_select(0, ki)
             packed_v = v[0].index_select(0, ki)
-            # Recompute the bounded chunk as before, then call the matching
-            # backward directly: no nested autograd graph or retained extra state.
-            y, lse, rng, unused, _ = torch.ops.aten._flash_attention_forward(
-                packed_q, packed_k, packed_v, chunk[2], chunk[3],
-                chunk[4], chunk[5], 0.0, False, False)
             gq, gk, gv = torch.ops.aten._flash_attention_backward(
                 grad_output[0].index_select(0, qi), packed_q, packed_k, packed_v,
-                y, lse, chunk[2], chunk[3], chunk[4], chunk[5],
-                0.0, False, rng, unused)
+                output[0].index_select(0, qi), lses[index],
+                chunk[2], chunk[3], chunk[4], chunk[5],
+                0.0, False, rngs[index], unuseds[index])
             dq[0].index_copy_(0, qi, gq)
             dk[0].index_add_(0, ki, gk.float())
             dv[0].index_add_(0, ki, gv.float())
