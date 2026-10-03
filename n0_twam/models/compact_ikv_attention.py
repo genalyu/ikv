@@ -85,34 +85,41 @@ def packed_compact_ikv_attention(q, k, v, groups):
 
 @torch.no_grad()
 def _pack_group_chunks(groups, device, max_keys):
-    chunks = []
-    current = []
-    key_count = 0
+    if not groups:
+        return []
+    q_lengths = [int(query.numel()) for query, _ in groups]
+    k_lengths = [int(keys.numel()) for _, keys in groups]
+    q_prefix, k_prefix = [0], [0]
+    for q_size, k_size in zip(q_lengths, k_lengths):
+        q_prefix.append(q_prefix[-1] + q_size)
+        k_prefix.append(k_prefix[-1] + k_size)
+    # Concatenate once; each chunk below is a view of these packed indices.
+    all_q = torch.cat([query for query, _ in groups])
+    all_k = torch.cat([keys for _, keys in groups])
 
-    def add_chunk(rows):
-        qi = torch.cat([row[0] for row in rows])
-        ki = torch.cat([row[1] for row in rows])
-        q_lengths = [int(row[0].numel()) for row in rows]
-        k_lengths = [int(row[1].numel()) for row in rows]
+    def make_chunk(first, last):
+        q_base, k_base = q_prefix[first], k_prefix[first]
         q_offsets = torch.tensor(
-            [0] + list(torch.tensor(q_lengths).cumsum(0).tolist()),
+            [q_prefix[index] - q_base for index in range(first, last + 1)],
             device=device, dtype=torch.int32)
         k_offsets = torch.tensor(
-            [0] + list(torch.tensor(k_lengths).cumsum(0).tolist()),
+            [k_prefix[index] - k_base for index in range(first, last + 1)],
             device=device, dtype=torch.int32)
-        chunks.append((qi, ki, q_offsets, k_offsets,
-                       max(q_lengths), max(k_lengths)))
+        return (
+            all_q[q_base:q_prefix[last]],
+            all_k[k_base:k_prefix[last]],
+            q_offsets, k_offsets,
+            max(q_lengths[first:last]), max(k_lengths[first:last]),
+        )
 
-    for row in groups:
-        size = int(row[1].numel())
-        if current and key_count + size > max_keys:
-            add_chunk(current)
-            current = []
-            key_count = 0
-        current.append(row)
-        key_count += size
-    if current:
-        add_chunk(current)
+    chunks = []
+    first, packed_keys = 0, 0
+    for index, size in enumerate(k_lengths):
+        if index > first and packed_keys + size > max_keys:
+            chunks.append(make_chunk(first, index))
+            first, packed_keys = index, 0
+        packed_keys += size
+    chunks.append(make_chunk(first, len(groups)))
     return chunks
 
 

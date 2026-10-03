@@ -1,5 +1,6 @@
 """Versioned multimodal IKV. Content indices contain no spatial coordinates."""
 from __future__ import annotations
+from array import array
 import torch
 import torch.nn.functional as F
 from .global_kv_retention import GlobalKVRetention, _max_cosine
@@ -13,6 +14,8 @@ class ContentHistory:
         self.duration = torch.empty(0, device=device)
         self.last_time = torch.empty(0, device=device)
         self.clock = None
+        self.decision_cache = None
+        self.cache_hits = 0
 
     def snapshot(self):
         return (self.features.clone(), self.duration.clone(), self.last_time.clone(), self.clock)
@@ -39,35 +42,73 @@ class ContentHistory:
             # Greedy deterministic matching is position independent. Prototypes
             # are fixed to avoid chaining distinct objects through centroid drift.
             seen = {}
-            # Decisions are sequential, but durations and slot timestamps need
-            # only one host transfer per frame rather than per feature.
-            last_times = self.last_time.tolist()
-            for feature, span in zip(values, spans.tolist()):
-                similarities = self.features @ feature if self.features.numel() else feature.new_empty(0)
-                # Keep the exact GPU dot products; choose from the same values
-                # on CPU with one transfer instead of two scalar synchronizations.
-                scores = similarities.cpu()
-                best = int(scores.argmax()) if len(scores) else -1
-                if best < 0 or float(scores[best]) < self.config.content_threshold:
-                    if len(self.features) >= self.config.content_capacity:
-                        candidates = [i for i in range(len(self.features)) if i not in seen]
-                        if not candidates:
-                            continue
-                        best = min(candidates, key=last_times.__getitem__)
-                        last_times[best] = t
-                        self.features[best] = feature
-                        self.duration[best] = 0
-                        self.last_time[best] = t
-                    else:
-                        best = len(self.features)
-                        last_times.append(t)
+            cached = (None if self.decision_cache is None
+                      else self.decision_cache.get(float(t)))
+            if cached is not None:
+                if len(cached) != len(values):
+                    raise ValueError("cached content decisions do not match this frame")
+                self.cache_hits += 1
+                for feature, span, code in zip(values, spans.tolist(), cached):
+                    if code < 0:
+                        continue
+                    best, action = code >> 2, code & 3
+                    if action == 1:  # append a new prototype
+                        if best != len(self.features):
+                            raise ValueError("cached prototype append order changed")
                         if not self.features.numel():
                             self.features = feature[None].clone()
                         else:
                             self.features = torch.cat((self.features, feature[None]))
                         self.duration = torch.cat((self.duration, spans.new_zeros(1)))
                         self.last_time = torch.cat((self.last_time, spans.new_tensor([t])))
-                seen[best] = max(seen.get(best, 0.), float(span))
+                    elif action == 2:  # replace an evicted prototype
+                        if best >= len(self.features):
+                            raise ValueError("cached prototype replacement is out of range")
+                        self.features[best] = feature
+                        self.duration[best] = 0
+                        self.last_time[best] = t
+                    elif action != 0 or best >= len(self.features):
+                        raise ValueError("invalid cached content decision")
+                    seen[best] = max(seen.get(best, 0.), float(span))
+            else:
+                # The first visit records the exact greedy decisions. Subsequent
+                # visits to this trajectory replay them without any similarity
+                # kernels or per-feature device synchronizations.
+                decisions = array("i") if self.decision_cache is not None else None
+                last_times = self.last_time.tolist()
+                for feature, span in zip(values, spans.tolist()):
+                    similarities = self.features @ feature if self.features.numel() else feature.new_empty(0)
+                    scores = similarities.cpu()
+                    best = int(scores.argmax()) if len(scores) else -1
+                    action = 0
+                    if best < 0 or float(scores[best]) < self.config.content_threshold:
+                        if len(self.features) >= self.config.content_capacity:
+                            candidates = [i for i in range(len(self.features)) if i not in seen]
+                            if not candidates:
+                                if decisions is not None:
+                                    decisions.append(-1)
+                                continue
+                            best = min(candidates, key=last_times.__getitem__)
+                            last_times[best] = t
+                            self.features[best] = feature
+                            self.duration[best] = 0
+                            self.last_time[best] = t
+                            action = 2
+                        else:
+                            best = len(self.features)
+                            last_times.append(t)
+                            if not self.features.numel():
+                                self.features = feature[None].clone()
+                            else:
+                                self.features = torch.cat((self.features, feature[None]))
+                            self.duration = torch.cat((self.duration, spans.new_zeros(1)))
+                            self.last_time = torch.cat((self.last_time, spans.new_tensor([t])))
+                            action = 1
+                    if decisions is not None:
+                        decisions.append((best << 2) | action)
+                    seen[best] = max(seen.get(best, 0.), float(span))
+                if decisions is not None:
+                    self.decision_cache[float(t)] = decisions
             if len(seen) > 1:
                 # Each slot appears once: batched updates preserve one addition
                 # per duration while avoiding several launches per prototype.

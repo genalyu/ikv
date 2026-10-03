@@ -5,11 +5,15 @@ denoising targets and losses remain owned by the original Trainer/model.
 No persistent inference pool or detached historical K/V is used here.
 """
 from dataclasses import replace
+import os
 
 import torch
 import torch.distributed as dist
 from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig
+
+
+_HISTORY_DECISION_CACHE = {}
 
 
 def training_metadata(grid, layout, splits, latent, action, motion_layout, version=1):
@@ -265,6 +269,15 @@ def build_ikv_support_plan(memory, device, *, return_groups=False):
         support_clean = torch.zeros(int(phase.max()) + 1, len(seq), dtype=torch.bool, device=device)
         support_noisy = torch.zeros_like(support_clean)
     policy = make_retention_policy(capacity, device, retention)
+    history_key = config.get("history_cache_key")
+    if history_key is not None and retention.version == 2:
+        cache_key = (int(history_key), retention.content_capacity,
+                     retention.content_threshold)
+        if cache_key not in _HISTORY_DECISION_CACHE:
+            if len(_HISTORY_DECISION_CACHE) >= 512:
+                _HISTORY_DECISION_CACHE.pop(next(iter(_HISTORY_DECISION_CACHE)))
+            _HISTORY_DECISION_CACHE[cache_key] = {}
+        policy.history.decision_cache = _HISTORY_DECISION_CACHE[cache_key]
     occupied = torch.zeros(capacity, dtype=torch.bool, device=device)
     slots = torch.empty(0, dtype=torch.long, device=device)
     slot_to_token = torch.full((capacity,), -1, dtype=torch.long, device=device)
@@ -324,6 +337,9 @@ def build_ikv_support_plan(memory, device, *, return_groups=False):
                         times = frame_ids[:, None].expand(features.shape[:2]).flatten().float()
                         policy.observe_dense(features.flatten(0, 1), times, torch.ones_like(times))
         slots = torch.cat((kept_slots, new_slots))
+    if history_key is not None and retention.version == 2 and os.getenv("IKV_HISTORY_CACHE_DEBUG") == "1":
+        print(f"IKV_HISTORY_CACHE key={history_key} hits={policy.history.cache_hits} "
+              f"frames={len(policy.history.decision_cache)}", flush=True)
     return dict(groups=groups) if return_groups else dict(clean=support_clean, noisy=support_noisy)
 
 

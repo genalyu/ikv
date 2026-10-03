@@ -109,7 +109,11 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         assert idx < len(self)
         cur_dset = self._datasets[self.item_id_to_dataset_id[idx]]
         local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
-        return cur_dset[local_idx]
+        sample = cur_dset[local_idx]
+        if (bool(getattr(self._datasets[0].config, "use_ikv_training", False))
+                and os.getenv("IKV_HISTORY_PLAN_CACHE", "0") == "1"):
+            sample["_ikv_sample_index"] = torch.tensor(idx, dtype=torch.int64)
+        return sample
 
 class LatentLeRobotDataset(LeRobotDataset):
     def __init__(

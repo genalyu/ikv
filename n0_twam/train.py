@@ -533,6 +533,11 @@ class Trainer:
                 sample_capacity=bool(getattr(self.config, "ikv_train_sample_capacity", False)),
                 min_capacity=int(getattr(self.config, "ikv_train_min_capacity",
                                          (self.config.ikv_train_capacity + 1) // 2)))
+            if os.getenv("IKV_HISTORY_PLAN_CACHE", "0") == "1":
+                if int(getattr(self.config, "max_latent_frames", 0)) > 0:
+                    raise ValueError("IKV history decision cache requires full trajectories")
+                input_dict["ikv_training"]["history_cache_key"] = int(
+                    batch_dict["_ikv_sample_index"].reshape(-1)[0].item())
         return input_dict
 
     def convert_input_format(self, input_dict):
