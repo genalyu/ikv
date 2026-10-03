@@ -1571,7 +1571,8 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
                 from .frame_index import dense_observations
                 content_observations = dense_observations(
                     cache_context.get("index"), cache_context["dense_grid"],
-                    required=bool(update_cache == 2 and policy.config.persistence_weight))
+                    required=bool(update_cache == 2 and (
+                        policy.config.persistence_weight or policy.config.class_recency_weight)))
             if policy_enabled and (semantic_index is not None or (
                     v2 and cache_context.get("selected_indices") is not None)):
                 if cache_context.get("index") is not None:

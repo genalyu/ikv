@@ -166,8 +166,9 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
                 policy.add_usage(measurements)
                 if retention.version == 2:
                     dense = memory.get("dense_dino_features")
-                    if (dense is None or not dense.shape[-1]) and retention.persistence_weight:
-                        raise ValueError("v2 persistence requires full-grid dense_dino_features; disable persistence_weight to omit")
+                    if (dense is None or not dense.shape[-1]) and (
+                            retention.persistence_weight or retention.class_recency_weight):
+                        raise ValueError("v2 content scores require full-grid dense_dino_features")
                     if dense is not None:
                         # Update only after this phase has evaluated. No future
                         # observation can affect its simultaneous noisy branch.
@@ -320,8 +321,9 @@ def build_ikv_support_plan(memory, device, *, return_groups=False):
         slot_to_token[new_slots] = source
         if retention.version == 2:
             dense = memory.get("dense_dino_features")
-            if (dense is None or not dense.shape[-1]) and retention.persistence_weight:
-                raise ValueError("v2 persistence requires full-grid dense DINO")
+            if (dense is None or not dense.shape[-1]) and (
+                    retention.persistence_weight or retention.class_recency_weight):
+                raise ValueError("v2 content scores require full-grid dense DINO")
             if dense is not None:
                 real_times = incoming["world_time_id"][incoming["kind"] != 1]
                 if len(real_times):

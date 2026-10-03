@@ -1113,8 +1113,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         retention = dict(getattr(config, "kv_retention", {}))
         if bool(getattr(config, "use_ikv_training", False)) and retention.get("version", 1) == 2:
             root_name = getattr(config, "ikv_index_root_name", None)
-            if not root_name and retention.get("persistence_weight", 1):
-                raise ValueError("v2 persistence requires ikv_index_root_name full-grid sidecars")
+            if not root_name and (retention.get("persistence_weight", 1)
+                                  or retention.get("class_recency_weight", 0)):
+                raise ValueError("v2 content scores require ikv_index_root_name full-grid sidecars")
             if root_name:
                 from n0_twam.dataset.ikv_index import load_dense_index
                 patch = tuple(getattr(config, "patch_size", (1,2,2)))

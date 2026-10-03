@@ -133,6 +133,21 @@ class ContentHistory:
             result[start:start+256] = support * (similarity >= self.config.content_threshold) * block.ne(0).any(-1)
         return result
 
+    def class_recency(self, features, times):
+        """Age a visual token against its class's last real observation."""
+        result = torch.zeros(len(features), device=features.device, dtype=torch.float32)
+        if not features.shape[-1] or not self.features.numel():
+            return result
+        if features.shape[-1] != self.features.shape[-1] or len(times) != len(features):
+            raise ValueError("class recency requires aligned DINO features and times")
+        for start in range(0, len(features), 256):
+            block = features[start:start+256]
+            similarity, group = (F.normalize(block.float(), dim=-1) @ self.features.T).max(-1)
+            age = (self.last_time[group] - times[start:start+256]).clamp_min(0)
+            value = torch.exp(-age / self.config.class_recency_scale)
+            result[start:start+256] = value * (similarity >= self.config.content_threshold) * block.ne(0).any(-1)
+        return result
+
 
 class MultimodalKVRetention(GlobalKVRetention):
     """Separate modality budgets, shared attention, detached version-2 indices."""
@@ -178,12 +193,25 @@ class MultimodalKVRetention(GlobalKVRetention):
         reference = self.reference_dino if reference is None else reference
         if reference.shape[-1] != d["dino"].shape[-1]:
             reference = self.reference_dino
+        video = d["kind"][slots] == 0
+        real_video = video & d["observation_flag"][slots]
+        class_recency = torch.zeros(len(slots), device=self.device)
+        if c.class_recency_weight and real_video.any():
+            class_recency[real_video] = self.history.class_recency(
+                d["dino"][slots[real_video]], d["world_time_id"][slots[real_video]])
+        visual = torch.zeros(len(slots), device=self.device)
+        persistence = torch.zeros(len(slots), device=self.device)
+        if c.visual_weight and video.any():
+            visual[video] = _max_cosine(d["dino"][slots[video]], reference)
+        if c.persistence_weight and video.any():
+            persistence[video] = self.history.persistence(d["dino"][slots[video]])
         return {
             "time": torch.exp(-age / c.time_scale),
             "query": d["query_mass"][slots] / d["query_exposure"][slots].clamp_min(1),
             "contact": 1 - torch.exp(-d["contact_duration"][slots] / c.contact_scale),
-            "visual": _max_cosine(d["dino"][slots], reference),
-            "persistence": self.history.persistence(d["dino"][slots]),
+            "visual": visual,
+            "persistence": persistence,
+            "class_recency": class_recency,
         }
 
     @torch.no_grad()
@@ -204,7 +232,8 @@ class MultimodalKVRetention(GlobalKVRetention):
                 result[touch] += extra
         return result + (kind == 0) * (
             c.contact_weight * terms["contact"] + c.visual_weight * terms["visual"]
-            + c.persistence_weight * terms["persistence"])
+            + c.persistence_weight * terms["persistence"]
+            + c.class_recency_weight * terms["class_recency"])
 
     def evidence(self, slots, mask, incoming=None):
         d = self.data

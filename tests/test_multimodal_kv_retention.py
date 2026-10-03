@@ -69,6 +69,39 @@ def test_content_support_once_per_time_not_elapsed_gap_or_patch_count():
     assert h.persistence(torch.eye(2))[0] > h.persistence(torch.eye(2))[1]
 
 
+def test_class_recency_uses_last_observed_time_within_each_dino_class():
+    p = policy(video_capacity=3, time_weight=0, class_recency_weight=1,
+               class_recency_scale=2, query_weight=0)
+    mask = torch.zeros(7, dtype=torch.bool)
+    features = torch.tensor([[1., 0.], [0., 1.], [0., 1.]])
+    slots, _ = append(p, mask, rows([1, 1, 10], dino=features))
+    p.observe_dense(features, torch.tensor([1., 1., 10.]), torch.ones(3))
+    scores = p.scores(slots)
+    torch.testing.assert_close(scores[[0, 2]], torch.ones(2))
+    torch.testing.assert_close(scores[1], torch.exp(torch.tensor(-4.5)))
+    assert p.components(slots)["visual"].eq(0).all()
+    assert p.components(slots)["persistence"].eq(0).all()
+    _, victims = p.plan(mask, 1, rows([11], dino=features[2:]))
+    assert victims.tolist() == [int(slots[1])]
+
+
+def test_class_recency_does_not_count_duplicate_patches_or_predictions():
+    p = policy(video_capacity=2, time_weight=0, class_recency_weight=1,
+               class_recency_scale=2, query_weight=0)
+    mask = torch.zeros(6, dtype=torch.bool)
+    slots, _ = append(p, mask, rows([1, 1], dino=torch.tensor([[1., 0.], [0., 1.]])))
+    p.observe_dense(torch.tensor([[1., 0.]] * 20 + [[0., 1.]]),
+                    torch.tensor([1.] * 21), torch.ones(21))
+    p.observe_dense(torch.tensor([[0., 1.]]), torch.tensor([5.]), torch.ones(1))
+    torch.testing.assert_close(p.components(slots)["class_recency"],
+                               torch.tensor([1., torch.exp(torch.tensor(-2.)).item()]))
+    assert p.history.duration.tolist() == [1., 2.]
+    predicted = rows([6], dino=torch.tensor([[0., 1.]]))
+    predicted["observation_flag"][:] = False
+    predicted_slot, _ = append(p, mask, predicted)
+    assert p.components(predicted_slot)["class_recency"].item() == 0.
+
+
 def test_query_softmax_is_over_all_modalities_and_layer_average():
     p = policy(query_samples=2)
     mask = torch.zeros(6, dtype=torch.bool)

@@ -42,7 +42,7 @@ def dense_observations(index, grid, *, required=False):
     """Extract real full-grid DINO rows, independently of sparse selection."""
     if index is None or not index.get("dino", torch.empty(0)).numel():
         if required:
-            raise ValueError("v2 persistence requires full-grid DINO before motion selection; set persistence_weight=0 to disable")
+            raise ValueError("v2 content scores require full-grid DINO before motion selection")
         return None
     features = index["dino"]
     if features.ndim == 3:

@@ -72,7 +72,8 @@ cfg.kv_retention = dict(cfg.kv_retention)
 cfg.kv_retention.update(version=2, video_capacity=_IKV_VIDEO_CAPACITY,
     action_capacity=_IKV_ACTION_CAPACITY, tactile_capacity=_IKV_TACTILE_CAPACITY,
     query_weight=0.0, action_query_weight=0.0, tactile_query_weight=0.0,
-    persistence_weight=1.0, persistence_scale=8.0, contact_scale=8.0,
+    visual_weight=0.0, persistence_weight=0.0, persistence_scale=8.0,
+    class_recency_weight=1.0, class_recency_scale=8.0, contact_scale=8.0,
     content_threshold=0.9, content_capacity=2048)
 cfg.kv_cache_policy = "global" if _USE_IKV else "fifo"
 

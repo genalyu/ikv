@@ -24,6 +24,8 @@ class RetentionConfig:
     tactile_query_weight: float = 1.0
     persistence_weight: float = 1.0
     persistence_scale: float = 8.0
+    class_recency_weight: float = 0.0
+    class_recency_scale: float = 8.0
     contact_scale: float = 8.0
     content_threshold: float = 0.9
     content_capacity: int = 2048
@@ -51,12 +53,14 @@ class RetentionConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        for name in ("time_scale", "action_scale", "persistence_scale", "contact_scale"):
+        for name in ("time_scale", "action_scale", "persistence_scale",
+                     "class_recency_scale", "contact_scale"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         for name in ("contact_weight", "visual_weight", "time_weight",
                      "query_weight", "repetition_weight", "action_query_weight",
-                     "tactile_query_weight", "persistence_weight"):
+                     "tactile_query_weight", "persistence_weight",
+                     "class_recency_weight"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
 
