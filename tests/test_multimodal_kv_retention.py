@@ -184,3 +184,33 @@ def test_v2_evicts_low_score_then_oldest_on_tie(monkeypatch):
         [score_by_slot[int(slot)] for slot in used]))
     _, victims = p.plan(mask, 1, rows([3], kind=0))
     assert victims.tolist() == [int(slots[1])]
+
+
+def test_history_host_decisions_preserve_ties_seen_slots_and_durations():
+    c = RetentionConfig(version=2, video_capacity=2, action_capacity=2,
+                        tactile_capacity=2, content_capacity=2, content_threshold=0.9)
+    h = ContentHistory(c, "cpu")
+    h.observe(torch.tensor([[1., 0.], [1., 0.], [0., 1.]]),
+              torch.zeros(3), torch.tensor([1., 3., 2.]))
+    torch.testing.assert_close(h.duration, torch.tensor([3., 2.]))
+    before = h.snapshot()
+    # Equal oldest timestamps choose the first slot; seen slots cannot be evicted
+    # again in the same frame. A third new prototype therefore cannot be admitted.
+    h.observe(torch.tensor([[-1., 0.], [0., -1.], [1., 0.]]),
+              torch.ones(3), torch.tensor([4., 5., 6.]))
+    torch.testing.assert_close(h.features, torch.tensor([[-1., 0.], [0., -1.]]))
+    torch.testing.assert_close(h.duration, torch.tensor([4., 5.]))
+    torch.testing.assert_close(h.last_time, torch.ones(2))
+    h.restore(before)
+    torch.testing.assert_close(h.features, torch.eye(2))
+    torch.testing.assert_close(h.duration, torch.tensor([3., 2.]))
+    assert h.clock == 0.
+
+
+def test_history_ignores_zero_content_but_advances_clock():
+    c = RetentionConfig(version=2, video_capacity=2, action_capacity=2,
+                        tactile_capacity=2, content_capacity=2)
+    h = ContentHistory(c, "cpu")
+    h.observe(torch.zeros(3, 2), torch.tensor([2., 0., 1.]), torch.ones(3))
+    assert h.features.numel() == 0
+    assert h.clock == 2.

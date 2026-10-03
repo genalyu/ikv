@@ -24,15 +24,14 @@ class ContentHistory:
     def observe(self, features, times, durations):
         if not features.shape[-1]:
             return
-        if not torch.isfinite(features).all() or not torch.isfinite(times).all():
+        if not (torch.isfinite(features).all() & torch.isfinite(times).all()):
             raise ValueError("content observations must be finite")
         if self.features.shape[-1] not in (0, features.shape[-1]):
             raise ValueError("DINO width changed within an episode")
-        for time in torch.unique(times, sorted=True):
-            t = float(time)
+        for t in torch.unique(times, sorted=True).tolist():
             if self.clock is not None and t <= self.clock:
                 continue  # duplicate commit / grounded overlap
-            frame = times == time
+            frame = times == t
             values = F.normalize(features[frame].float(), dim=-1)
             spans = durations[frame].float()
             present = values.abs().sum(-1) > 0
@@ -40,36 +39,46 @@ class ContentHistory:
             # Greedy deterministic matching is position independent. Prototypes
             # are fixed to avoid chaining distinct objects through centroid drift.
             seen = {}
-            for feature, span in zip(values, spans):
+            # Decisions are sequential, but durations and slot timestamps need
+            # only one host transfer per frame rather than per feature.
+            last_times = self.last_time.tolist()
+            for feature, span in zip(values, spans.tolist()):
                 similarities = self.features @ feature if self.features.numel() else feature.new_empty(0)
-                best = int(similarities.argmax()) if len(similarities) else -1
-                if best < 0 or float(similarities[best]) < self.config.content_threshold:
+                # Keep the exact GPU dot products; choose from the same values
+                # on CPU with one transfer instead of two scalar synchronizations.
+                scores = similarities.cpu()
+                best = int(scores.argmax()) if len(scores) else -1
+                if best < 0 or float(scores[best]) < self.config.content_threshold:
                     if len(self.features) >= self.config.content_capacity:
                         candidates = [i for i in range(len(self.features)) if i not in seen]
                         if not candidates:
                             continue
-                        # Candidates retain ascending slot order. argmin selects
-                        # the first minimum, matching Python min's tie rule,
-                        # with one device-to-host scalar read instead of one
-                        # synchronization for every candidate.
-                        candidate_ids = torch.tensor(candidates, device=self.device,
-                                                     dtype=torch.long)
-                        best = candidates[int(self.last_time[candidate_ids].argmin())]
+                        best = min(candidates, key=last_times.__getitem__)
+                        last_times[best] = t
                         self.features[best] = feature
                         self.duration[best] = 0
                         self.last_time[best] = t
                     else:
                         best = len(self.features)
+                        last_times.append(t)
                         if not self.features.numel():
                             self.features = feature[None].clone()
                         else:
                             self.features = torch.cat((self.features, feature[None]))
-                        self.duration = torch.cat((self.duration, span.new_zeros(1)))
-                        self.last_time = torch.cat((self.last_time, span.new_tensor([t])))
+                        self.duration = torch.cat((self.duration, spans.new_zeros(1)))
+                        self.last_time = torch.cat((self.last_time, spans.new_tensor([t])))
                 seen[best] = max(seen.get(best, 0.), float(span))
-            for group, span in seen.items():
-                self.duration[group] += span
-                self.last_time[group] = t
+            if len(seen) > 1:
+                # Each slot appears once: batched updates preserve one addition
+                # per duration while avoiding several launches per prototype.
+                ids = torch.tensor(list(seen), dtype=torch.long, device=self.device)
+                increments = self.duration.new_tensor(list(seen.values()))
+                self.duration.index_add_(0, ids, increments)
+                self.last_time.index_fill_(0, ids, t)
+            else:
+                for group, span in seen.items():
+                    self.duration[group] += span
+                    self.last_time[group] = t
             self.clock = t
 
     def persistence(self, features):

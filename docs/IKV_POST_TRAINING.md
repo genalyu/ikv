@@ -253,3 +253,26 @@ metric reduction. `tests/smoke_compact_preparation_cuda.py` compares both compac
 paths on a small checkpointed CUDA model, verifies one shared pack, all parameter
 gradients, and an AdamW update. These checks do not establish a full-size FSDP
 throughput or peak-memory result; measure those before changing a production run.
+
+
+### Reducing host synchronization and nested backward overhead
+
+Content-history matching retains the original GPU dot products and chronological
+feature order. It transfers each score vector once for the sequential decision,
+instead of separately synchronizing on its argmax and selected score. Frame
+spans and slot timestamps are copied once per frame. A frame-local timestamp
+list preserves oldest-slot eviction, first-index ties, and exclusion of slots
+already seen in that frame; no extra persistent state is introduced. Duration
+and timestamp updates for multiple distinct slots are batched once per frame,
+with exactly one duration addition per slot.
+
+Bounded compact attention recomputes each packed chunk as before, but invokes
+the matching ATen Flash backward directly instead of constructing a nested
+autograd graph and calling `autograd.grad`. Q/K/V gradient paths remain intact,
+and duplicated K/V gradients still accumulate in FP32. This does not retain
+additional full-sequence activations. The CUDA smoke test compares against native
+packed-attention autograd at several chunk budgets, including padded tokens.
+
+Component timings on a shared GPU are diagnostic only. Full-trajectory FSDP
+forward, backward and optimizer-step timing must still be measured before
+claiming a production speedup or changing the running training process.

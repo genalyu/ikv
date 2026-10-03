@@ -146,16 +146,18 @@ class _StreamedPackedIKV(torch.autograd.Function):
         dv = torch.zeros_like(v, dtype=torch.float32)
         for chunk in ctx.chunks:
             qi, ki = chunk[:2]
-            with torch.enable_grad():
-                packed_q = q[0].index_select(0, qi).detach().requires_grad_(True)
-                packed_k = k[0].index_select(0, ki).detach().requires_grad_(True)
-                packed_v = v[0].index_select(0, ki).detach().requires_grad_(True)
-                y = torch.ops.aten._flash_attention_forward(
-                    packed_q, packed_k, packed_v, chunk[2], chunk[3],
-                    chunk[4], chunk[5], 0.0, False, False)[0]
-                gq, gk, gv = torch.autograd.grad(
-                    y, (packed_q, packed_k, packed_v),
-                    grad_output[0].index_select(0, qi))
+            packed_q = q[0].index_select(0, qi)
+            packed_k = k[0].index_select(0, ki)
+            packed_v = v[0].index_select(0, ki)
+            # Recompute the bounded chunk as before, then call the matching
+            # backward directly: no nested autograd graph or retained extra state.
+            y, lse, rng, unused, _ = torch.ops.aten._flash_attention_forward(
+                packed_q, packed_k, packed_v, chunk[2], chunk[3],
+                chunk[4], chunk[5], 0.0, False, False)
+            gq, gk, gv = torch.ops.aten._flash_attention_backward(
+                grad_output[0].index_select(0, qi), packed_q, packed_k, packed_v,
+                y, lse, chunk[2], chunk[3], chunk[4], chunk[5],
+                0.0, False, rng, unused)
             dq[0].index_copy_(0, qi, gq)
             dk[0].index_add_(0, ki, gk.float())
             dv[0].index_add_(0, ki, gv.float())
