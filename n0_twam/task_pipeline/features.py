@@ -175,7 +175,7 @@ def build_features(task, device="cuda"):
                 "use a new task root or remove the stale sidecars and progress file"
             )
     else:
-        if any((root / name).glob("chunk-*/*.pth") for name in ("rgb_motion", "ikv_index")):
+        if any(any((root / name).glob("chunk-*/*.pth")) for name in ("rgb_motion", "ikv_index")):
             raise ValueError(
                 "Existing feature sidecars lack a matching progress manifest; "
                 "remove or migrate them before rebuilding"
