@@ -9,8 +9,7 @@ from urllib.request import Request, urlopen
 import time
 
 
-def fetch(item, root, workers):
-    original_root = Path("/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic")
+def fetch(item, root, workers, original_root):
     path = root / Path(item["path"]).relative_to(original_root)
     if path.is_file() and path.stat().st_size == item["bytes"]:
         with path.open("rb") as stream:
@@ -54,11 +53,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--source", choices=["official", "modelscope", "all"], default="official")
     args = parser.parse_args()
     manifest = json.loads((args.root / "assets-manifest.json").read_text())
+    original_root = Path(os.path.commonpath([item["path"] for item in manifest]))
     for item in manifest:
-        if "dl.fbaipublicfiles.com" in item["source"] and item["bytes"] > 1024**3:
-            fetch(item, args.root, args.workers)
+        official = "dl.fbaipublicfiles.com" in item["source"]
+        selected = args.source == "all" or (official if args.source == "official" else not official)
+        if selected and item["bytes"] > 512 * 1024**2:
+            fetch(item, args.root, args.workers, original_root)
 
 
 if __name__ == "__main__": main()
