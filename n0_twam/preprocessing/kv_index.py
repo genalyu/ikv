@@ -13,7 +13,7 @@ def observed_index(payload, count, device):
     There are intentionally no persisted visual_valid/tactile_valid fields.
     """
     payload = {} if payload is None else payload
-    unsupported = set(payload) - {"dino", "neoforce", "duration", "observation_flag"}
+    unsupported = set(payload) - {"dino", "neoforce", "duration", "observation_flag", "task_relevance"}
     if unsupported:
         raise ValueError(f"unknown kv_index fields: {sorted(unsupported)}")
     result = {}
@@ -24,6 +24,13 @@ def observed_index(payload, count, device):
         if value.ndim != 2 or len(value) != count or not torch.isfinite(value).all():
             raise ValueError(f"observed kv_index.{name} must be finite [N,D] or [1,N,D], N={count}")
         result[name] = value.detach().float()
+    relevance = torch.as_tensor(payload.get("task_relevance", 0.), device=device)
+    if relevance.ndim == 2 and relevance.shape[0] == 1:
+        relevance = relevance[0]
+    relevance = torch.broadcast_to(relevance, (count,))
+    if not torch.isfinite(relevance).all() or ((relevance < 0) | (relevance > 1)).any():
+        raise ValueError("task_relevance must be finite [N] in [0,1]")
+    result["task_relevance"] = relevance.detach().float()
     duration = torch.as_tensor(payload.get("duration", 1.0), device=device).reshape(-1)
     duration = torch.broadcast_to(duration, (count,))
     if not torch.isfinite(duration).all() or (duration < 0).any():
@@ -59,13 +66,15 @@ def prediction_index(count, device, seed=None):
     result = {
         "observation_flag": torch.zeros(count, dtype=torch.bool, device=device),
         "duration": torch.ones(count, device=device),
+        "task_relevance": torch.zeros(count, device=device),
     }
     for name in ("dino", "neoforce"):
         width = 0 if seed is None else seed[name].shape[-1]
         result[name] = torch.zeros(count, width, device=device)
     if seed is not None:
         for name in result:
-            result[name][:seed_count] = seed[name].to(device)
+            if name in seed:
+                result[name][:seed_count] = seed[name].to(device)
     return result
 
 
@@ -144,3 +153,17 @@ def route_contact_index(visual_index, contact_features, response, visual_rows,
         'dino': tactile_dino,
         'neoforce': tactile_neoforce,
     }, paired
+
+
+@torch.no_grad()
+def encode_dense_semantic(videos, anchors, target_size, encoder):
+    features, relevance = [], []
+    for video in videos:
+        rgb = video[:, anchors].permute(1, 0, 2, 3)
+        output = encoder(rgb)
+        features.append(pool_dino_to_grid(output.tokens, target_size))
+        if not hasattr(output, "task_relevance"):
+            raise ValueError("task relevance requires a text-aligned semantic backend")
+        relevance.append(pool_dino_to_grid(output.task_relevance[..., None], target_size))
+    return dict(dino=torch.cat(features, dim=2).flatten(0, 2).detach(),
+                task_relevance=torch.cat(relevance, dim=2).flatten().detach())

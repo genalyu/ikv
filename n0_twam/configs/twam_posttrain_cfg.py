@@ -75,6 +75,10 @@ cfg.kv_retention.update(version=2, video_capacity=_IKV_VIDEO_CAPACITY,
     visual_weight=0.0, persistence_weight=0.0, persistence_scale=8.0,
     class_recency_weight=1.0, class_recency_scale=8.0, contact_scale=8.0,
     content_threshold=0.9, content_capacity=2048)
+# Semantic scoring is enabled by the task overlay after features are built.
+cfg.kv_semantic_encoder = {}
+cfg.kv_semantic_provenance = None
+cfg.kv_retention.setdefault("task_weight", 0.0)
 cfg.kv_cache_policy = "global" if _USE_IKV else "fifo"
 
 # data

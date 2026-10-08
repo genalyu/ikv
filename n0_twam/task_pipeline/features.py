@@ -34,10 +34,13 @@ class RecordingEncoder:
     def __init__(self, encoder):
         self.encoder = encoder
         self.outputs = []
+        self.relevance = []
 
     def __call__(self, rgb):
         result = self.encoder(rgb)
         self.outputs.append(result.tokens.detach().cpu())
+        if hasattr(result, "task_relevance"):
+            self.relevance.append(result.task_relevance.detach().cpu())
         return result
 
 
@@ -68,6 +71,7 @@ def build_payloads(
     start = 0
     parts = []
     dense = []
+    relevance = []
     gh = 256 // (16 * patch_size[1])
     gw = 256 // (16 * patch_size[2])
     for ordinal, end in enumerate(anchors):
@@ -78,6 +82,7 @@ def build_payloads(
                 rgb=torch.from_numpy(np.stack(frames)), num_frames=len(frames)
             )
         recorder.outputs = []
+        recorder.relevance = []
         payload = producer(
             cameras,
             anchor_indices=[end - start],
@@ -89,6 +94,10 @@ def build_payloads(
                 [pool_dino_to_grid(x, (gh, gw)) for x in recorder.outputs], dim=2
             ).reshape(1, gh * gw * len(keys), -1)
         )
+        if recorder.relevance:
+            relevance.append(torch.cat([
+                pool_dino_to_grid(x[..., None], (gh, gw)) for x in recorder.relevance
+            ], dim=2).reshape(1, gh * gw * len(keys)))
         parts.append(payload)
         previous = {k: {"rgb": v.rgb[-1]} for k, v in cameras.items()}
         start = end + 1
@@ -115,6 +124,9 @@ def build_payloads(
         dino_features=torch.cat(dense),
         neoforce_features=torch.empty(len(anchors), gh * gw * len(keys), 0),
     )
+    if relevance:
+        dense_payload["task_relevance"] = torch.cat(relevance)
+        dense_payload["semantic_provenance"] = encoder.provenance()
     return result, dense_payload
 
 
@@ -148,12 +160,14 @@ def build_features(task, device="cuda"):
     root = paths(task)["dataset"]
     keys = list(task["robot"]["cameras"].values())
     model = task["runtime"].get("dino_model")
-    if not model or not Path(model).is_dir():
+    semantic_config = dict(task["runtime"].get("semantic_encoder", {}) or {})
+    semantic_enabled = semantic_config.get("backend", "dinov2") != "dinov2"
+    if not semantic_enabled and (not model or not Path(model).is_dir()):
         raise FileNotFoundError(
             "Set runtime.dino_model to local DINOv2 weights; no implicit downloads"
         )
     progress_path = root / "features.progress.json"
-    progress = dict(task_fingerprint=fingerprint(task), builder_version=1)
+    progress = dict(task_fingerprint=fingerprint(task), builder_version=2 if semantic_enabled else 1)
     if progress_path.exists():
         if json.loads(progress_path.read_text()) != progress:
             raise ValueError(
@@ -167,7 +181,11 @@ def build_features(task, device="cuda"):
                 "remove or migrate them before rebuilding"
             )
         progress_path.write_text(json.dumps(progress, indent=2))
-    encoder = FrozenDinoV2PatchEncoder.from_pretrained(model, device=device)
+    if semantic_enabled:
+        from n0_twam.preprocessing.semantic_patch import load_patch_encoder
+        encoder = load_patch_encoder(semantic_config, device=device, prompt=task["prompt"])
+    else:
+        encoder = FrozenDinoV2PatchEncoder.from_pretrained(model, device=device)
     latent_files = sorted((root / "latents").glob(f"chunk-*/{keys[0]}/episode_*.pth"))
     if not latent_files:
         raise FileNotFoundError("Encode RGB latents first")
@@ -200,7 +218,12 @@ def build_features(task, device="cuda"):
         motion_dest = root / "rgb_motion" / chunk / lp.name
         dense_dest = root / "ikv_index" / chunk / lp.name
         threshold = float(task.get("features", {}).get("motion_threshold", 0.02))
-        if _existing_sidecars_match(
+        semantic_matches = True
+        if semantic_enabled and dense_dest.exists():
+            old = torch.load(dense_dest, map_location="cpu", weights_only=True)
+            semantic_matches = (old.get("semantic_provenance") == encoder.provenance()
+                                and "task_relevance" in old)
+        if semantic_matches and _existing_sidecars_match(
             motion_dest, dense_dest, ids, anchors, keys, threshold
         ):
             print(f"Skipped existing features {lp.name}", flush=True)
@@ -231,6 +254,7 @@ def build_features(task, device="cuda"):
                 task_fingerprint=fingerprint(task),
                 episodes=len(latent_files),
                 dino_model=model,
+                semantic_provenance=encoder.provenance() if semantic_enabled else None,
                 neoforce="unavailable; zero width",
                 threshold=task.get("features", {}).get("motion_threshold", 0.02),
             ),

@@ -1125,8 +1125,12 @@ class LatentLeRobotDataset(LeRobotDataset):
                 dense = load_dense_index(path, camera_keys=self.used_video_keys,
                     patch_size=patch, grid_shape=(h//patch[1], w//patch[2]),
                     latent_frame_ids=latent_frame_ids, full_frames=int(expected_full_frames),
-                    start=truncate_start, end=truncate_end)
+                    start=truncate_start, end=truncate_end,
+                    semantic_expected=getattr(self.config, "kv_semantic_provenance", None),
+                    require_task=bool(dict(getattr(self.config, "kv_retention", {})).get("task_weight", 0)))
                 out_dict["dense_dino_features"] = dense["dino_features"]
+                if "task_relevance" in dense:
+                    out_dict["task_relevance"] = dense["task_relevance"]
                 if "frame_neoforce_features" in dense:
                     out_dict["frame_neoforce_features"] = dense["frame_neoforce_features"]
         if not self.use_rgb_motion_tokens:
@@ -1143,7 +1147,9 @@ class LatentLeRobotDataset(LeRobotDataset):
                 out_dict.update(load_dense_index(path, camera_keys=self.used_video_keys,
                     patch_size=patch, grid_shape=(h//patch[1], w//patch[2]),
                     latent_frame_ids=latent_frame_ids, full_frames=int(expected_full_frames),
-                    start=truncate_start, end=truncate_end))
+                    start=truncate_start, end=truncate_end,
+                    semantic_expected=getattr(self.config, "kv_semantic_provenance", None),
+                    require_task=bool(dict(getattr(self.config, "kv_retention", {})).get("task_weight", 0))))
             return
         if latent_world_time_ids is None:
             raise ValueError(

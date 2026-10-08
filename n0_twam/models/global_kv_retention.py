@@ -26,6 +26,7 @@ class RetentionConfig:
     persistence_scale: float = 8.0
     class_recency_weight: float = 0.0
     class_recency_scale: float = 8.0
+    task_weight: float = 0.0
     contact_scale: float = 8.0
     content_threshold: float = 0.9
     content_capacity: int = 2048
@@ -57,10 +58,12 @@ class RetentionConfig:
                      "class_recency_scale", "contact_scale"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.task_weight and self.version != 2:
+            raise ValueError("task_weight requires retention version 2")
         for name in ("contact_weight", "visual_weight", "time_weight",
                      "query_weight", "repetition_weight", "action_query_weight",
                      "tactile_query_weight", "persistence_weight",
-                     "class_recency_weight"):
+                     "class_recency_weight", "task_weight"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
 
@@ -106,6 +109,7 @@ class GlobalKVRetention:
             "query_mass": torch.zeros(capacity, device=device),
             "query_exposure": torch.zeros(capacity, device=device),
             "action_repetition": torch.zeros(capacity, device=device),
+            "task_relevance": torch.zeros(capacity, device=device),
             "dino": torch.empty(capacity, 0, device=device),
             "neoforce": torch.empty(capacity, 0, device=device),
             "action": torch.empty(capacity, 0, device=device),
@@ -312,7 +316,8 @@ def token_rows(context, *, batch_size, length, main_count, action_mode,
     rows = {"world_time_id": times, "grid_position": grid[0, 1:].T.float(), "kind": kind,
             "observation_flag": torch.full((length,), update_cache == 2,
                                             dtype=torch.bool, device=device),
-            "duration": torch.ones(length, device=device)}
+            "duration": torch.ones(length, device=device),
+            "task_relevance": torch.zeros(length, device=device)}
     indices = [(context.get("index") or {}, 0, main_count),
                (context.get("tail_index") or {}, main_count, length)]
     for name in ("dino", "neoforce"):
@@ -335,7 +340,7 @@ def token_rows(context, *, batch_size, length, main_count, action_mode,
         rows[name] = torch.cat([b if b.shape[-1] else b.new_zeros(len(b), width)
                                 for b in blocks])
     for index, start, end in indices:
-        for name in ("duration", "observation_flag"):
+        for name in ("duration", "observation_flag", "task_relevance"):
             if name not in index:
                 continue
             value = torch.as_tensor(index[name], device=device)
@@ -346,6 +351,8 @@ def token_rows(context, *, batch_size, length, main_count, action_mode,
             value = torch.broadcast_to(value, (end-start,))
             if not torch.isfinite(value).all():
                 raise ValueError(f"kv_index.{name} must be finite")
+            if name == "task_relevance" and ((value < 0) | (value > 1)).any():
+                raise ValueError("task relevance must be in [0,1]")
             if name == "duration" and (value < 0).any():
                 raise ValueError("contact duration must be nonnegative")
             if name == "observation_flag" and not ((value == 0) | (value == 1)).all():
