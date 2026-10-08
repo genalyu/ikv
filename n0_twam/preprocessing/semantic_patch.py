@@ -10,6 +10,8 @@ import hashlib
 import json
 import math
 import subprocess
+import sys
+import importlib
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -53,7 +55,8 @@ class FrozenSemanticPatchEncoder(FrozenDinoV2PatchEncoder):
         device = next(self.model.parameters()).device
         if self.backend == "siglip2":
             inputs = self.tokenizer([prompt], padding="max_length",
-                                    truncation=True, return_tensors="pt")
+                                    truncation=True, return_tensors="pt",
+                                    max_length=self.model.config.text_config.max_position_embeddings)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             text = self.model.get_text_features(**inputs)
             if not isinstance(text, torch.Tensor):
@@ -75,6 +78,7 @@ class FrozenSemanticPatchEncoder(FrozenDinoV2PatchEncoder):
     def provenance(self):
         return dict(schema=1, backend=self.backend, assets=self.identity,
                     image_size=list(self.image_size), patch_size=list(self.patch_size),
+                    model_dtype=str(next(self.model.parameters()).dtype),
                     image_mean=list(self.image_mean.flatten().tolist()),
                     image_std=list(self.image_std.flatten().tolist()),
                     prompt_sha256=hashlib.sha256(self._prompt.encode()).hexdigest(),
@@ -172,10 +176,14 @@ def load_patch_encoder(config, *, device="cpu", prompt=None):
     """
     config = dict(config)
     backend = config.get("backend", "dinov2")
+    dtypes = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    if config.get("dtype", "float32") not in dtypes:
+        raise ValueError("dtype must be float32, float16, or bfloat16")
+    dtype = dtypes[config.get("dtype", "float32")]
     if backend == "dinov2":
         return FrozenDinoV2PatchEncoder.from_pretrained(
             config["model"], local_files_only=True, device=device,
-            image_size=tuple(config.get("image_size", (224, 224))))
+            image_size=tuple(config.get("image_size", (224, 224))), torch_dtype=dtype)
     if backend in ("dinov2_txt", "dinov3_txt"):
         repo = Path(config["repo"]).expanduser().resolve()
         if not (repo / "hubconf.py").is_file():
@@ -184,8 +192,16 @@ def load_patch_encoder(config, *, device="cpu", prompt=None):
         head = _file(config["head_weights"])
         bpe = _file(config["bpe"])
         if backend == "dinov3_txt":
-            model, tokenizer = torch.hub.load(
-                str(repo), "dinov3_vitl16_dinotxt_tet1280d20h24l", source="local",
+            # Import the text entrypoint directly; hubconf also imports unrelated
+            # segmentation/detection code and its optional dependencies.
+            sys.path.insert(0, str(repo))
+            try:
+                module = importlib.import_module("dinov3.hub.dinotxt")
+            finally:
+                sys.path.remove(str(repo))
+            if not Path(module.__file__).resolve().is_relative_to(repo):
+                raise ValueError("DINOv3 module came from a different checkout; use a fresh process")
+            model, tokenizer = module.dinov3_vitl16_dinotxt_tet1280d20h24l(
                 weights=head, backbone_weights=backbone, bpe_path_or_url=bpe)
             patch = 16
         else:
@@ -201,7 +217,8 @@ def load_patch_encoder(config, *, device="cpu", prompt=None):
                                                       weights_only=True), strict=True)
             cfg = DinoTxtConfig(embed_dim=2048, vision_model_use_patch_tokens=True,
                                 vision_model_num_head_blocks=2,
-                                text_model_use_linear_projection=True)
+                                text_model_use_linear_projection=True,
+                                text_model_tokens_pooler_type="argmax")
             text = TextTransformer(context_length=77, vocab_size=49408, dim=1280,
                                    num_heads=20, num_layers=24, ffn_ratio=4,
                                    is_causal=True, ls_init_value=None, dropout_prob=0.)
@@ -232,7 +249,7 @@ def load_patch_encoder(config, *, device="cpu", prompt=None):
         mean, std = tuple(processor.image_mean), tuple(processor.image_std)
     else:
         raise ValueError(f"unknown patch backend: {backend}")
-    model.to(device).eval().requires_grad_(False)
+    model.to(device=device, dtype=dtype).eval().requires_grad_(False)
     return FrozenSemanticPatchEncoder(
         model, tokenizer, backend=backend, prompt=prompt,
         image_size=image_size, patch_size=patch, image_mean=mean, image_std=std,

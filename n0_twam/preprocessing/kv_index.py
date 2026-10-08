@@ -160,10 +160,14 @@ def encode_dense_semantic(videos, anchors, target_size, encoder):
     features, relevance = [], []
     for video in videos:
         rgb = video[:, anchors].permute(1, 0, 2, 3)
-        output = encoder(rgb)
-        features.append(pool_dino_to_grid(output.tokens, target_size))
-        if not hasattr(output, "task_relevance"):
+        # Match the feature builder's per-anchor batch shape. BF16 attention
+        # kernels can otherwise give different scores for B=1 versus B=F.
+        outputs = [encoder(frame[None]) for frame in rgb]
+        if any(not hasattr(output, "task_relevance") for output in outputs):
             raise ValueError("task relevance requires a text-aligned semantic backend")
-        relevance.append(pool_dino_to_grid(output.task_relevance[..., None], target_size))
+        tokens = torch.cat([output.tokens for output in outputs])
+        task = torch.cat([output.task_relevance for output in outputs])
+        features.append(pool_dino_to_grid(tokens, target_size))
+        relevance.append(pool_dino_to_grid(task[..., None], target_size))
     return dict(dino=torch.cat(features, dim=2).flatten(0, 2).detach(),
                 task_relevance=torch.cat(relevance, dim=2).flatten().detach())
