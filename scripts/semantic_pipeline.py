@@ -1,5 +1,8 @@
 """Two-rank pipeline serving with replicated IKV-v2 semantic retention."""
 import argparse
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contextlib import contextmanager
 import os
 
@@ -193,7 +196,9 @@ def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
                     token_valid_mask=token_valid_mask,
                     cache_transaction=cache_entries,
                     cache_plan=cache_plan,
-                    usage_collector=None if policy is None else (policy, measurements),
+                    usage_collector=(None if policy is None or not any((
+                        policy.config.query_weight, policy.config.action_query_weight,
+                        policy.config.tactile_query_weight)) else (policy, measurements)),
                     cache_observation_flags=(None if cache_metadata is None
                                              else cache_metadata["observation_flag"]),
                     manage_semantic_sidecar=(layer == owned[0]),
@@ -283,6 +288,7 @@ def pp_clear_cache(self, cache_name):
         _remote("clear_cache", cache_name)
     for layer in _owned_range(self.mot):
         self.mot.shared_attn[layer].clear_cache(cache_name)
+    self.mot.retention_policies.pop(cache_name, None)
     reserved_before = torch.cuda.memory_reserved()
     torch.cuda.empty_cache()  # Return inactive allocator blocks before NeoSim resets.
     print(f"[pp_reset] rank={dist.get_rank()} released_mib="
@@ -315,13 +321,14 @@ def pp_create_empty_cache(self, cache_name, attn_window,
     if dist.get_rank() == 0:
         _remote("create_cache", cache_name, attn_window,
                 latent_token_per_chunk, action_token_per_chunk,
-                torch.device("cuda:0"), dtype, batch_size)
+                device, dtype, batch_size)
     total_tokens = (attn_window // 2) * latent_token_per_chunk + (
         attn_window // 2) * action_token_per_chunk
     for layer in _owned_range(self.mot):
         self.mot.shared_attn[layer].init_kv_cache(
             cache_name, total_tokens, self.num_attention_heads,
             self.attention_head_dim, device, dtype, batch_size)
+    self.mot.retention_policies.pop(cache_name, None)
 
 
 WanMoTTransformer3DModel.clear_cache = pp_clear_cache

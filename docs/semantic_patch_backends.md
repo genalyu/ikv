@@ -59,18 +59,19 @@ policy output dimensions do not change.
 
 Add one of these objects to `runtime.semantic_encoder` in a new task overlay.
 Keep the task's existing `prompt`, cameras, dataset and checkpoint configuration.
-Paths below are example asset destinations, not preinstalled weights.
+The example paths below are installed assets on .177. The same relative layout is installed on .143 and A100 (see deployment table).
 
 DINOv2 + dino.txt:
 
 ```json
 {
   "backend": "dinov2_txt",
-  "repo": "/home/ubuntu/genalyu/models/dinov2",
-  "backbone_weights": "/home/ubuntu/genalyu/models/dinov2_vitl14_reg4_pretrain.pth",
-  "head_weights": "/home/ubuntu/genalyu/models/dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_vision_head.pth",
-  "text_weights": "/home/ubuntu/genalyu/models/dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_text_encoder.pth",
-  "bpe": "/home/ubuntu/genalyu/models/bpe_simple_vocab_16e6.txt.gz",
+  "repo": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/dinov2",
+  "backbone_weights": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/dinov2_vitl14_reg4_pretrain.pth",
+  "head_weights": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_vision_head.pth",
+  "text_weights": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_text_encoder.pth",
+  "bpe": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/bpe_simple_vocab_16e6.txt.gz",
+  "dtype": "bfloat16",
   "image_size": [224, 224],
   "task_temperature": 0.07,
   "task_bias": 0.0
@@ -82,10 +83,11 @@ DINOv3 + dino.txt:
 ```json
 {
   "backend": "dinov3_txt",
-  "repo": "/home/ubuntu/genalyu/models/dinov3",
-  "backbone_weights": "/home/ubuntu/genalyu/models/dinov3_vitl16_pretrain.pth",
-  "head_weights": "/home/ubuntu/genalyu/models/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth",
-  "bpe": "/home/ubuntu/genalyu/models/bpe_simple_vocab_16e6.txt.gz",
+  "repo": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/dinov3",
+  "backbone_weights": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+  "head_weights": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth",
+  "bpe": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/bpe_simple_vocab_16e6.txt.gz",
+  "dtype": "bfloat16",
   "image_size": [224, 224],
   "task_temperature": 0.07,
   "task_bias": 0.0
@@ -103,7 +105,8 @@ SigLIP2:
 ```json
 {
   "backend": "siglip2",
-  "model": "/home/ubuntu/genalyu/models/siglip2-base-patch16-224",
+  "model": "/home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic/siglip2-base-patch16-224",
+  "dtype": "bfloat16",
   "image_size": [224, 224],
   "task_temperature": 0.07,
   "task_bias": 0.0
@@ -126,14 +129,14 @@ convert/RGB/tactile stages:
 
 ```bash
 cd /home/ubuntu/genalyu/n0twam-dual-deploy/ikv-score-push
-/home/ubuntu/genalyu/n0twam-dual-deploy/venv/bin/python -m n0_twam.task_pipeline.cli prepare --task /absolute/server/task.json --stage features --device cuda
-/home/ubuntu/genalyu/n0twam-dual-deploy/venv/bin/python -m n0_twam.task_pipeline.cli prepare --task /absolute/server/task.json --stage pool
-/home/ubuntu/genalyu/n0twam-dual-deploy/venv/bin/python -m n0_twam.task_pipeline.cli train --task /absolute/server/task.json --mode ikv --gpus 1
+/home/ubuntu/genalyu/n0twam-dual-deploy/semantic-venv/bin/python -m n0_twam.task_pipeline.cli prepare --task /absolute/server/task.json --stage features --device cuda
+/home/ubuntu/genalyu/n0twam-dual-deploy/semantic-venv/bin/python -m n0_twam.task_pipeline.cli prepare --task /absolute/server/task.json --stage pool
+/home/ubuntu/genalyu/n0twam-dual-deploy/semantic-venv/bin/python -m n0_twam.task_pipeline.cli train --task /absolute/server/task.json --mode ikv --gpus 1
 ```
 
-A complete data/training environment requires existing project dependencies
-including lerobot and av. The current .177 inference environment lacks these
-two optional data-processing packages.
+Separate semantic runtimes now include lerobot, av, timm and Transformers 4.57.6.
+They inherit existing torch/torchvision and install their overrides in an
+isolated environment. The active inference/training environments are unchanged.
 
 Feature sidecars store dense `task_relevance[F,spatial]` and
 `semantic_provenance`: backend, asset byte hashes, DINO repo revision,
@@ -148,16 +151,99 @@ Selecting a new backend requires new feature sidecars and corresponding
 training/checkpoint metadata; this does not modify the old 1500-step weights or
 replace a currently running evaluation service.
 
-## Validation limits
+## Validation
 
 Offline tests cover both DINO adapter contracts, a real small Transformers
 SigLIP architecture, camera/token ordering, prompt caching, feature sidecars,
 sparse/dense training gathers, retention eviction, training gradients, and
-future-label isolation. The full pretrained text-adapter assets have not been
-installed or run on this server, so pretrained quality, peak VRAM and latency
-remain unmeasured.
+future-label isolation. All three full pretrained backends passed validation on .177 with actual
+Hidden USB top/wrist RGB: offline/online relevance agreement, prompt changes,
+sidecar reload, class history, score-based eviction, and a tiny recurrent training
+forward/backward. 220 relevant unit/integration tests passed. These checks do not
+measure task success rate or constitute a full policy retraining/rollout.
 
 Official APIs:
 - https://github.com/facebookresearch/dinov2/blob/main/dinov2/hub/dinotxt.py
 - https://github.com/facebookresearch/dinov3/blob/main/dinov3/hub/dinotxt.py
 - https://huggingface.co/google/siglip2-base-patch16-224
+
+## Installed server deployment
+
+| server | code checkout | Python runtime | asset root |
+|---|---|---|---|
+| .177 | /home/ubuntu/genalyu/n0twam-dual-deploy/ikv-score-push | /home/ubuntu/genalyu/n0twam-dual-deploy/semantic-venv/bin/python | /home/ubuntu/genalyu/n0twam-dual-deploy/models/semantic |
+| .143 | /home/user/n0twam-dual-deploy/ikv-semantic | /home/user/n0twam-dual-deploy/semantic-venv/bin/python | /home/user/n0twam-dual-deploy/models/semantic |
+| A100 | /mnt/cfs/9wt59p/genalyu/ikv-semantic-worktree | /mnt/cfs/9wt59p/genalyu/ikv-task-data/runtime/semantic-venv/bin/python | /mnt/cfs/9wt59p/genalyu/ikv-task-data/shared-models/semantic |
+
+New checkouts on .143/A100 preserve the older working checkouts and active runs.
+Original DINOv2-base remains available on all three servers.
+Assets use official DINOv2 downloads and public ModelScope copies for DINOv3/SigLIP2.
+SHA256 hashes and source URLs are recorded in assets-manifest.json.
+Official repository revisions: DINOv2 7764ea0; DINOv3 6876159.
+DINOv3 loads local files directly without copying several GB into TORCH_HOME.
+Provenance uses the Torch release version without the local CUDA build suffix;
+the CUDA build is diagnostic information, rather than a different asset identity.
+
+### Measurements on .177
+
+RTX 4090; BF16; 224x224; batch of two cameras; five warm forwards.
+This times the feature encoder, excluding policy inference and video decoding.
+
+| backend | total parameters (vision + text) | peak allocated VRAM | median forward |
+|---|---:|---:|---:|
+| dinov2_txt | 867.8M | 1693.9 MiB | 5.75 ms |
+| dinov3_txt | 866.6M | 1687.4 MiB | 7.52 ms |
+| siglip2 | 375.2M | 751.8 MiB | 2.59 ms |
+
+Report: /home/ubuntu/genalyu/n0twam-dual-deploy/semantic-validation/results/report.json.
+Class threshold and task score temperature need task-specific quality evaluation.
+These measurements do not establish which backend succeeds more often on robots.
+
+### Ready task overlays on A100
+
+/mnt/cfs/9wt59p/genalyu/ikv-task-data/semantic-tasks/hidden-usb/{dinov2_txt,dinov3_txt,siglip2}/task.json
+
+Each uses a separate work root. Prepare all stages in the selected new task root,
+then train using the unified task CLI. Do not reuse the old feature sidecars.
+
+~~~bash
+cd /mnt/cfs/9wt59p/genalyu/ikv-semantic-worktree
+/mnt/cfs/9wt59p/genalyu/ikv-task-data/runtime/semantic-venv/bin/python -m n0_twam.task_pipeline.cli prepare --task /mnt/cfs/9wt59p/genalyu/ikv-task-data/semantic-tasks/hidden-usb/dinov3_txt/task.json --stage all --device cuda
+/mnt/cfs/9wt59p/genalyu/ikv-task-data/runtime/semantic-venv/bin/python -m n0_twam.task_pipeline.cli check --task /mnt/cfs/9wt59p/genalyu/ikv-task-data/semantic-tasks/hidden-usb/dinov3_txt/task.json --mode ikv
+/mnt/cfs/9wt59p/genalyu/ikv-task-data/runtime/semantic-venv/bin/python -m n0_twam.task_pipeline.cli train --task /mnt/cfs/9wt59p/genalyu/ikv-task-data/semantic-tasks/hidden-usb/dinov3_txt/task.json --mode ikv --gpus 4
+~~~
+
+scripts/create_semantic_tasks.py also creates these three overlays from another
+supported source task. It preserves that task's prompt, robot, cameras and source.
+Data adapter support remains the unified task pipeline's supported formats;
+selecting a semantic backend alone does not add a new RoboDojo data adapter.
+
+### Dual-host PP serving
+
+scripts/semantic_pipeline.py supports IKV-v2 with replicated retention policies,
+class history and task relevance. PP requires a newly trained compatible checkpoint
+and the corresponding exported serve_overrides.json. Move model paths in the
+export to each host's installed asset root; keep byte hashes/provenance intact.
+
+Two-host CPU/Gloo validation on .177/.143 used actual two-layer MoT blocks.
+The test compared outputs, each stage's KV, both retention policies and history
+against a full-model baseline, with observed/predicted/action streams, eviction,
+prediction clearing, transaction rollback/commit and episode reset.
+Report: /home/ubuntu/genalyu/n0twam-dual-deploy/semantic-validation/pp-report.json.
+This is a transport/retention check, not a full-size pretrained PP rollout.
+
+On .177 use rank 0, GLOO_SOCKET_IFNAME=enp4s0, NCCL_SOCKET_IFNAME=enp4s0.
+On .143 use rank 1 and both socket variables set to eno1.
+Set IKV_SERVE_OVERRIDES to the per-host exported serving JSON,
+TWAM_SERVE_OUT to a new log directory, and TWAM_PP_SPLIT (default 15).
+IKV_DINO_DEVICE defaults to cpu; cuda:0 is available when there is VRAM headroom.
+
+~~~bash
+# Run from each host's code checkout and use that host's semantic Python.
+python -m torch.distributed.run --nnodes=2 --nproc_per_node=1 --node_rank=0 --master_addr=192.168.50.177 --master_port=30190 scripts/semantic_pipeline.py
+# Same command on .143 with --node_rank=1.
+~~~
+
+Existing 1500-step policy weights remain the old training setup.
+The new feature/scoring contract must be prepared and trained before claiming
+evaluation results for the new method.

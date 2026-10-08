@@ -12,6 +12,8 @@ import math
 import subprocess
 import sys
 import importlib
+from urllib.parse import urlparse, unquote
+from unittest.mock import patch as mock_patch
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -86,11 +88,17 @@ class FrozenSemanticPatchEncoder(FrozenDinoV2PatchEncoder):
                     task_projection=("singleton_attention_pool" if self.backend == "siglip2"
                                      else "dinotxt_local_half"),
                     resize="full_field_bicubic_antialias",
+                    pixel_layout="contiguous_NCHW",
                     score="sigmoid((cosine-bias)/temperature)")
 
     @torch.no_grad()
     def forward(self, rgb):
-        pixels = self._prepare_pixel_values(rgb)
+        # Fix both preprocessing and convolution layout. Channels-last versus
+        # channels-first kernels differ enough in BF16 to perturb cache scores.
+        canonical = rgb
+        if rgb.ndim == 4 and rgb.shape[-1] == 3 and rgb.shape[1] != 3:
+            canonical = rgb.permute(0, 3, 1, 2)
+        pixels = self._prepare_pixel_values(canonical.contiguous()).contiguous()
         if self.backend == "dinov2_txt":
             visual = self.model.visual_model
             cls, raw, registers = visual.get_backbone_features(pixels)
@@ -132,7 +140,7 @@ def _file(path):
 
 def _identity(config):
     """Hash asset bytes once at load, not once per image."""
-    assets = {"torch_version": str(torch.__version__)}
+    assets = {"torch_version": str(torch.__version__).split("+")[0]}
     if config.get("repo"):
         repo = Path(config["repo"]).expanduser().resolve()
         revision = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -201,8 +209,16 @@ def load_patch_encoder(config, *, device="cpu", prompt=None):
                 sys.path.remove(str(repo))
             if not Path(module.__file__).resolve().is_relative_to(repo):
                 raise ValueError("DINOv3 module came from a different checkout; use a fresh process")
-            model, tokenizer = module.dinov3_vitl16_dinotxt_tet1280d20h24l(
-                weights=head, backbone_weights=backbone, bpe_path_or_url=bpe)
+            # Official hub code copies file:// assets into TORCH_HOME. Load them
+            # directly so CFS assets do not fill a small server root filesystem.
+            def local_weights(url, *args, **kwargs):
+                parsed = urlparse(str(url))
+                if parsed.scheme != "file":
+                    raise ValueError("DINOv3 loader attempted a nonlocal weight URL")
+                return torch.load(unquote(parsed.path), map_location="cpu", weights_only=True)
+            with mock_patch("torch.hub.load_state_dict_from_url", side_effect=local_weights):
+                model, tokenizer = module.dinov3_vitl16_dinotxt_tet1280d20h24l(
+                    weights=head, backbone_weights=backbone, bpe_path_or_url=bpe)
             patch = 16
         else:
             # The official v2 hub text entrypoint downloads weights unconditionally.
