@@ -224,6 +224,9 @@ def convert(task):
             excluded.append(dict(source_id=ep.source_id, reason=str(error)))
             print(f"EXCLUDED {ep.source_id}: {error}", flush=True)
             continue
+        max_usable = task.get("max_usable_episodes")
+        if max_usable is not None and usable_index >= int(max_usable):
+            break
         index = usable_index
         usable_index += 1
         if shard_count > 1 and index % shard_count != shard_index:
