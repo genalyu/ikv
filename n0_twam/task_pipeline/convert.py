@@ -154,9 +154,17 @@ def convert(task):
         return
     # A partial conversion is restartable only for the identical inputs/configuration.
     pending = root / "conversion_pending.json"
-    if pending.exists() and json.loads(pending.read_text())["fingerprint"] != spec:
-        raise ValueError("Partial conversion configuration differs")
-    pending.write_text(json.dumps({"fingerprint": spec}))
+    pending_payload = json.dumps({"fingerprint": spec})
+    if pending.exists():
+        try:
+            pending_data = json.loads(pending.read_text())
+        except (json.JSONDecodeError, OSError):
+            pending_data = {"fingerprint": spec}
+        if pending_data.get("fingerprint") != spec:
+            raise ValueError("Partial conversion configuration differs")
+    pending_tmp = pending.with_name(f".{pending.name}.{os.getpid()}.tmp")
+    pending_tmp.write_text(pending_payload)
+    os.replace(pending_tmp, pending)
     fps = 30
     robot = task["robot"]
     all_eps = []
