@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import numpy as np
@@ -23,8 +24,10 @@ class Episode:
 
 class Collector:
     def __init__(self, path):
-        self.path = Path(path)
-        self.tar = tarfile.open(path) if self.path.is_file() else None
+        original = Path(path)
+        cache = Path(os.environ["N0_COLLECTOR_EXTRACTED_CACHE"]) if os.environ.get("N0_COLLECTOR_EXTRACTED_CACHE") else None
+        self.path = cache if original.is_file() and cache is not None and (cache / ".complete").exists() else original
+        self.tar = tarfile.open(original) if self.path == original and original.is_file() else None
         if self.tar:
             self.members = {m.name: m for m in self.tar.getmembers() if m.isfile()}
             self.episodes = sorted(
