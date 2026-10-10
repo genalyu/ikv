@@ -98,6 +98,13 @@ def encode_aligned_video(source, destination, ids, fps):
                         for frame in container.decode(video=0):
                             yield frame.to_ndarray(format="rgb24")
 
+    count = 0
+    frames_seen = 0
+    sums = np.zeros(3, dtype=np.float64)
+    sums_sq = np.zeros(3, dtype=np.float64)
+    minimum = np.full(3, 255, dtype=np.uint8)
+    maximum = np.zeros(3, dtype=np.uint8)
+    import cv2
     with av.open(str(temp), "w") as out:
         stream = None
         target = 0
@@ -108,6 +115,16 @@ def encode_aligned_video(source, destination, ids, fps):
                 stream.pix_fmt = "yuv420p"
                 stream.options = {"crf": "18", "preset": "fast"}
             while target < len(ids) and ids[target] == index:
+                pixels = rgb.reshape(-1, 3)
+                n = len(pixels)
+                mean, std = cv2.meanStdDev(rgb)
+                mean, std = mean[:, 0], std[:, 0]
+                sums += mean * n
+                sums_sq += (std * std + mean * mean) * n
+                minimum = np.minimum(minimum, pixels.min(axis=0))
+                maximum = np.maximum(maximum, pixels.max(axis=0))
+                count += n
+                frames_seen += 1
                 f = av.VideoFrame.from_ndarray(rgb, format="rgb24")
                 f.pts = target
                 f.time_base = Fraction(1, 1) / Fraction(str(fps))
@@ -123,7 +140,15 @@ def encode_aligned_video(source, destination, ids, fps):
         for packet in stream.encode():
             out.mux(packet)
     temp.replace(destination)
-    return [stream.height, stream.width, 3]
+    mean = sums / count / 255
+    variance = np.maximum(sums_sq / count / (255 * 255) - mean * mean, 0)
+    video_stats = {
+        k: np.asarray(v).reshape(3, 1, 1).tolist()
+        for k, v in {"min": minimum.astype(np.float64) / 255,
+                     "max": maximum.astype(np.float64) / 255,
+                     "mean": mean, "std": np.sqrt(variance)}.items()
+    } | {"count": [frames_seen]}
+    return [stream.height, stream.width, 3], video_stats
 
 
 def convert(task):
@@ -212,6 +237,7 @@ def convert(task):
         marker = root / "conversion_episodes" / (stem + ".json")
         marker_data = json.loads(marker.read_text()) if marker.exists() else None
         encoded = False
+        encoded_video_stats = {}
         alignment = {}
         if task["format"] == "collector_v06":
             # The tar handle is shared; read sources serially, then encode cameras in parallel.
@@ -235,7 +261,7 @@ def convert(task):
                             encode_aligned_video, payload, video, ids, fps
                         )
                 for key, job in jobs.items():
-                    shapes[key] = job.result()
+                    shapes[key], encoded_video_stats[key] = job.result()
         else:
             for key, source in ep.videos.items():
                 ids = camera_indices[key]
@@ -245,7 +271,7 @@ def convert(task):
                     shapes[key] = marker_data["shapes"][key]
                 else:
                     encoded = True
-                    shapes[key] = encode_aligned_video(source, video, ids, fps)
+                    shapes[key], encoded_video_stats[key] = encode_aligned_video(source, video, ids, fps)
         data = dict(
             action=list(a),
             **{"observation.state": list(s)},
@@ -273,16 +299,9 @@ def convert(task):
         if marker_data is not None and not encoded and "video_stats" in marker_data:
             st.update(marker_data["video_stats"])
         else:
-            with ThreadPoolExecutor(max_workers=len(ep.videos)) as pool:
-                stat_jobs = {
-                    key: pool.submit(
-                        image_stats_video,
-                        root / "videos" / chunk / key / (stem + ".mp4"),
-                    )
-                    for key in ep.videos
-                }
-                for key, job in stat_jobs.items():
-                    st[key] = job.result()
+            if set(encoded_video_stats) != set(ep.videos):
+                raise ValueError("Missing in-pass video statistics")
+            st.update(encoded_video_stats)
         all_stats.append(dict(episode_index=index, stats=st))
         provenance.append(
             dict(
