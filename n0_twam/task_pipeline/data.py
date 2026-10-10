@@ -138,6 +138,15 @@ def _iter_collector_source(task, path, source_id_prefix=""):
             state_ids, age = causal_indices(obs["timestamp_ms"].to_numpy(float) / 1000, ts, robot.get("max_alignment_age_s", 0.1))
             a = normalize_grip(act[acols].to_numpy(float), robot["action_gripper"], robot["gripper_stroke_m"])
             s = normalize_grip(obs[scols].to_numpy(float)[state_ids], robot["state_gripper"], robot["gripper_stroke_m"])
+            # ARX5 encoders can report millimetre-scale negative width at the
+            # mechanical stop. Saturate only gripper channels after explicit
+            # width-to-ratio conversion; pose channels remain untouched.
+            meta["gripper_clip_counts"] = {
+                "action": int(sum(((a[:, i] < 0) | (a[:, i] > 1)).sum() for i in range(9, a.shape[1], 10))),
+                "state": int(sum(((s[:, i] < 0) | (s[:, i] > 1)).sum() for i in range(9, s.shape[1], 10))),
+            }
+            a[:, 9::10] = np.clip(a[:, 9::10], 0.0, 1.0)
+            s[:, 9::10] = np.clip(s[:, 9::10], 0.0, 1.0)
             validate_pose(a, "action", arms)
             validate_pose(s, "state", arms)
             times, videos = {}, {}
