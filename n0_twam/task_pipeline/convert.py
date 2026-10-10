@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 import io
 import json
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -165,6 +166,11 @@ def convert(task):
     total = 0
     excluded = []
     source_count = 0
+    shard_count = int(os.environ.get("N0_CONVERT_SHARD_COUNT", "1"))
+    shard_index = int(os.environ.get("N0_CONVERT_SHARD_INDEX", "0"))
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("Invalid conversion shard configuration")
+    usable_index = 0
     width = robot.get("arms", 1) * 10
     for ep in episodes(task):
         source_count += 1
@@ -185,7 +191,10 @@ def convert(task):
             excluded.append(dict(source_id=ep.source_id, reason=str(error)))
             print(f"EXCLUDED {ep.source_id}: {error}", flush=True)
             continue
-        index = len(all_eps)
+        index = usable_index
+        usable_index += 1
+        if shard_count > 1 and index % shard_count != shard_index:
+            continue
         a = np.zeros((len(ts), 20), np.float32)
         s = a.copy()
         a[:, :width] = ep.action[ai]
@@ -199,7 +208,7 @@ def convert(task):
         if task["format"] == "collector_v06":
             # The tar handle is shared; read sources serially, then encode cameras in parallel.
             jobs = {}
-            with ThreadPoolExecutor(max_workers=min(4, len(ep.videos))) as pool:
+            with ThreadPoolExecutor(max_workers=len(ep.videos)) as pool:
                 for key, source in ep.videos.items():
                     ids = camera_indices[key]
                     alignment[key] = time_audit["cameras"][key]
@@ -256,7 +265,7 @@ def convert(task):
         if marker_data is not None and not encoded and "video_stats" in marker_data:
             st.update(marker_data["video_stats"])
         else:
-            with ThreadPoolExecutor(max_workers=min(4, len(ep.videos))) as pool:
+            with ThreadPoolExecutor(max_workers=len(ep.videos)) as pool:
                 stat_jobs = {
                     key: pool.submit(
                         image_stats_video,
@@ -285,6 +294,9 @@ def convert(task):
         marker_tmp.replace(marker)
         total += len(ts)
         print(f"Converted {index}: {ep.source_id} ({len(ts)} frames)", flush=True)
+    if shard_count > 1:
+        print(f"Shard {shard_index}/{shard_count} complete: {len(all_eps)} episodes", flush=True)
+        return
     if not all_eps:
         raise ValueError("Empty input")
     features = {}
