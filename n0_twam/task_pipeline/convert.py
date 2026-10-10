@@ -113,7 +113,7 @@ def encode_aligned_video(source, destination, ids, fps):
                 stream = out.add_stream("libx264", rate=Fraction(str(fps)))
                 stream.width, stream.height = rgb.shape[1], rgb.shape[0]
                 stream.pix_fmt = "yuv420p"
-                stream.options = {"crf": "18", "preset": "fast"}
+                stream.options = {"crf": "18", "preset": "ultrafast"}
             while target < len(ids) and ids[target] == index:
                 pixels = rgb.reshape(-1, 3)
                 n = len(pixels)
