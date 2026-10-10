@@ -112,10 +112,9 @@ def normalize_grip(x, representation, stroke):
 
 def _iter_collector_source(task, path, source_id_prefix=""):
     robot = task["robot"]
-    if robot.get("arms", 1) != 1:
-        raise ValueError(
-            "collector_v06 adapter currently supports the verified single-arm schema"
-        )
+    arms = int(robot.get("arms", 1))
+    if arms not in (1, 2):
+        raise ValueError("collector_v06 adapter supports one or two arms")
     source = Collector(path)
     cameras = {**robot["cameras"], **robot["tactile"]}
     try:
@@ -125,58 +124,34 @@ def _iter_collector_source(task, path, source_id_prefix=""):
                 raise ValueError("Collector adapter only supports verified v0.6 schema")
             if abs(float(meta["fps_config"]) - float(robot["fps"])) > 1e-6:
                 raise ValueError("Robot fps differs from collector metadata")
-            act = pd.read_csv(
-                io.BytesIO(source.read(ep + "/actions.eef_pose/data.csv"))
-            )
-            obs = pd.read_csv(
-                io.BytesIO(source.read(ep + "/observation.state.eef_pose/data.csv"))
-            )
-            acols = (
-                ["tcp.x", "tcp.y", "tcp.z"]
-                + [f"tcp.r{i}" for i in range(1, 7)]
-                + ["gripper.pos"]
-            )
-            scols = ["x", "y", "z"] + [f"r{i}" for i in range(1, 7)] + ["gripper"]
+            act = pd.read_csv(io.BytesIO(source.read(ep + "/actions.eef_pose/data.csv")))
+            obs = pd.read_csv(io.BytesIO(source.read(ep + "/observation.state.eef_pose/data.csv")))
+            if arms == 1:
+                acols = (["tcp.x", "tcp.y", "tcp.z"] + [f"tcp.r{i}" for i in range(1, 7)] + ["gripper.pos"])
+                scols = (["x", "y", "z"] + [f"r{i}" for i in range(1, 7)] + ["gripper"])
+            else:
+                acols, scols = [], []
+                for side in ("left", "right"):
+                    acols += ([f"{side}_tcp.x", f"{side}_tcp.y", f"{side}_tcp.z"] + [f"{side}_tcp.r{i}" for i in range(1, 7)] + [f"{side}_gripper.pos"])
+                    scols += ([f"{side}_x", f"{side}_y", f"{side}_z"] + [f"{side}_r{i}" for i in range(1, 7)] + [f"{side}_gripper"])
             ts = act["timestamp_ms"].to_numpy(float) / 1000
-            state_ids, age = causal_indices(
-                obs["timestamp_ms"].to_numpy(float) / 1000,
-                ts,
-                robot.get("max_alignment_age_s", 0.1),
-            )
-            a = normalize_grip(
-                act[acols].to_numpy(float),
-                robot["action_gripper"],
-                robot["gripper_stroke_m"],
-            )
-            s = normalize_grip(
-                obs[scols].to_numpy(float)[state_ids],
-                robot["state_gripper"],
-                robot["gripper_stroke_m"],
-            )
-            validate_pose(a, "action")
-            validate_pose(s, "state")
+            state_ids, age = causal_indices(obs["timestamp_ms"].to_numpy(float) / 1000, ts, robot.get("max_alignment_age_s", 0.1))
+            a = normalize_grip(act[acols].to_numpy(float), robot["action_gripper"], robot["gripper_stroke_m"])
+            s = normalize_grip(obs[scols].to_numpy(float)[state_ids], robot["state_gripper"], robot["gripper_stroke_m"])
+            validate_pose(a, "action", arms)
+            validate_pose(s, "state", arms)
             times, videos = {}, {}
             for raw, dest in cameras.items():
-                df = pd.read_csv(
-                    io.BytesIO(source.read(ep + "/" + raw + "/timestamps.csv"))
-                )
+                df = pd.read_csv(io.BytesIO(source.read(ep + "/" + raw + "/timestamps.csv")))
                 times[dest] = df["timestamp_ms"].to_numpy(float) / 1000
                 videos[dest] = (source, ep + "/" + raw + "/video.mp4")
-                meta.setdefault("camera_timestamp_audit", {})[dest] = {
-                    "frames": len(df),
-                    "non_new_frames": int((df["is_new"] == 0).sum()),
-                    "non_increasing": int((np.diff(times[dest]) <= 0).sum()),
-                    "max_gap_s": float(np.diff(times[dest]).max()),
-                }
+                meta.setdefault("camera_timestamp_audit", {})[dest] = {"frames": len(df), "non_new_frames": int((df["is_new"] == 0).sum()), "non_increasing": int((np.diff(times[dest]) <= 0).sum()), "max_gap_s": float(np.diff(times[dest]).max())}
             meta["state_alignment_max_s"] = float(age.max())
             meta["duplicate_action_timestamps"] = int((np.diff(ts) == 0).sum())
-            meta["duplicate_timestamp_policy"] = (
-                "causal last at equal time; zero-dt excluded from speed"
-            )
+            meta["duplicate_timestamp_policy"] = "causal last at equal time; zero-dt excluded from speed"
             yield Episode(source_id_prefix + ep, ts, a, s, meta, videos, times)
     finally:
         source.close()
-
 
 def quality_exclusion_reason(ep, task):
     allowed = task.get("allowed_quality_labels")
