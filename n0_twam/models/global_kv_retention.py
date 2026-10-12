@@ -16,7 +16,15 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class RetentionConfig:
+    history_storage: str = "evict"
+    archive_max_bytes: int = 8 * 1024**3
+    archive_overflow: str = "error"
+    archive_directory: str = ""
     version: int = 1
+    score_backend: str = "formula"
+    sys2_endpoint: str = ""
+    sys2_task: str = ""
+    sys2_timeout: float = 300.0
     video_capacity: int = 0
     action_capacity: int = 0
     tactile_capacity: int = 0
@@ -42,6 +50,29 @@ class RetentionConfig:
     seed: int = 0
 
     def __post_init__(self):
+        if self.score_backend not in ("formula", "qwen_sys2"):
+            raise ValueError("score_backend must be formula or qwen_sys2")
+        if self.score_backend == "qwen_sys2":
+            if self.version != 2 or self.history_storage != "cpu_archive":
+                raise ValueError("qwen_sys2 requires v2 CPU history archive")
+            if not self.sys2_endpoint or not self.sys2_task.strip():
+                raise ValueError("qwen_sys2 requires endpoint and task")
+            if not math.isfinite(self.sys2_timeout) or self.sys2_timeout <= 0:
+                raise ValueError("sys2_timeout must be positive")
+        if self.history_storage not in ("evict", "cpu_archive"):
+            raise ValueError("history_storage must be evict or cpu_archive")
+        if self.archive_overflow not in ("error", "disk"):
+            raise ValueError("archive_overflow must be error or disk")
+        if isinstance(self.archive_max_bytes, bool) or not isinstance(self.archive_max_bytes, int) or self.archive_max_bytes < 1:
+            raise ValueError("archive_max_bytes must be a positive integer")
+        if self.history_storage == "cpu_archive":
+            if self.version != 2:
+                raise ValueError("CPU archive requires retention version 2")
+            if any((self.query_weight, self.action_query_weight, self.tactile_query_weight)):
+                raise ValueError("CPU archive requires all query usage weights to be zero")
+            if self.archive_overflow == "disk" and not self.archive_directory:
+                raise ValueError("disk overflow requires archive_directory")
+
         if isinstance(self.version, bool) or self.version not in (1, 2):
             raise ValueError("retention version must be 1 (legacy) or 2 (multimodal)")
         for name in ("video_capacity", "action_capacity", "tactile_capacity", "content_capacity"):
@@ -369,6 +400,24 @@ def token_rows(context, *, batch_size, length, main_count, action_mode,
             if not ((value == 0) | (value == 1)).all():
                 raise ValueError("contact_present must be binary")
             rows["contact_present"][start:end] = torch.broadcast_to(value.bool(), (end-start,))
+    if (context.get("tail_index") or {}).get("sys2_frame") is not None:
+        if "contact_present" not in context["tail_index"]:
+            raise ValueError("Qwen tactile index requires explicit binary contact labels")
+    for name in ("sys2_frame", "sys2_patch", "sys2_height", "sys2_width"):
+        if not any(name in index for index, _, _ in indices):
+            continue
+        rows[name] = torch.full((length,), -1, dtype=torch.long, device=device)
+        for index, start, end in indices:
+            if name not in index:
+                continue
+            value = torch.as_tensor(index[name], device=device)
+            if value.ndim == 2:
+                if value.shape[0] not in (1, batch_size) or not torch.equal(value, value[:1].expand_as(value)):
+                    raise ValueError(f"{name} differs across CFG batch")
+                value = value[0]
+            if value.dtype == torch.bool or value.is_floating_point():
+                raise ValueError(f"{name} must contain integers")
+            rows[name][start:end] = torch.broadcast_to(value, (end-start,))
     actions = context.get("actions")
     rows["action"] = torch.empty(length, 0, device=device)
     if action_mode and actions is not None:

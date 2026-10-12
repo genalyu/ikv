@@ -37,6 +37,7 @@ from .model import WanTransformerBlock, FlexAttnFunc, custom_sdpa, WanTransforme
 from .compact_ikv_attention import (
     compact_ikv_attention, streamed_packed_ikv_attention, _pack_group_chunks,
 )
+from .cpu_kv_archive import archive_prepare, archive_append
 from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig, token_rows
 
@@ -88,6 +89,26 @@ class SharedSelfAttention(nn.Module):
         # (committed past + current) K/V via plain SDPA — temporal causality is
         # encoded by what is committed in the pool (mirrors WanAttention cache path).
         cache = self.attn_caches.get(cache_name) if cache_name is not None else None
+        if cache is not None and cache.get("cpu_archive") and update_cache != 2:
+            # Predictions/current denoising borrow separate GPU tensors. They
+            # never evict grounded history or enter the CPU archive.
+            _, current_valid = self._normalise_semantic_sequence(
+                semantic_index, k.shape[0], k.shape[1], k.device,
+                token_valid_mask=token_valid_mask)
+            positions = (torch.arange(k.shape[1], device=k.device) if current_valid is None
+                         else current_valid[0].nonzero().flatten())
+            current = (k[:, positions], v[:, positions])
+            used = cache["mask"].nonzero().flatten()
+            predicted = cache.get("predicted_kv", ())
+            keys = [cache["k"][:, used]] + [x[0] for x in predicted] + [current[0]]
+            values = [cache["v"][:, used]] + [x[1] for x in predicted] + [current[1]]
+            out = custom_sdpa(q, torch.cat(keys, 1), torch.cat(values, 1))
+            if update_cache == 1:
+                snapshot = self._snapshot_cache_slots(cache, used[:0])
+                cache["predicted_kv"] = predicted + ((current[0].detach(), current[1].detach()),)
+                if cache_transaction is not None:
+                    cache_transaction.append((self, cache_name, snapshot))
+            return self._zero_invalid_queries(out, current_valid)
         if cache is not None:
             temporary = update_cache == 0
             transaction = None
@@ -209,6 +230,7 @@ class SharedSelfAttention(nn.Module):
         c = self.attn_caches.get(cache_name)
         if c is None:
             return
+        c["predicted_kv"] = ()
         pred = c['mask'].clone() if include_observed else c['is_pred'] & c['mask']
         semantic = c.get('semantic')
         if semantic is not None:
@@ -257,6 +279,7 @@ class SharedSelfAttention(nn.Module):
 
         semantic = cache.get("semantic")
         return {
+            "predicted_kv": cache.get("predicted_kv", ()),
             "slots": slots.clone(),
             "k": cache["k"].index_select(1, slots).clone(),
             "v": cache["v"].index_select(1, slots).clone(),
@@ -622,6 +645,7 @@ class SharedSelfAttention(nn.Module):
 
         cache = self.attn_caches[cache_name]
         slots = transaction["slots"]
+        cache["predicted_kv"] = transaction.get("predicted_kv", ())
         cache["k"][:, slots] = transaction["k"]
         cache["v"][:, slots] = transaction["v"]
         cache["id"][slots] = transaction["id"]
@@ -953,6 +977,8 @@ class MoTBackbone(nn.Module):
         cache_transaction = None
         owns_cache_transaction = False
         policy = self.retention_policies.get(cache_name)
+        if policy is not None and getattr(policy, "archive", None) is not None and update_cache != 2:
+            policy = None
         cache_plan = None
         measurements = []
         policy_before = None
@@ -974,7 +1000,29 @@ class MoTBackbone(nn.Module):
             rows = {name: value[positions] for name, value in cache_metadata.items()}
             old_mask = first["mask"].clone()
             policy_before = policy.snapshot() if update_cache else None
-            cache_plan = policy.plan(old_mask, len(positions), rows)
+            if getattr(policy, "archive", None) is not None:
+                cache_transaction = self._active_cache_transactions.get(cache_name)
+                if cache_transaction is None:
+                    cache_transaction = self.begin_cache_transaction(cache_name)
+                    owns_cache_transaction = True
+                prepare_start = len(cache_transaction["entries"])
+                try:
+                    if not rows["observation_flag"].all():
+                        raise ValueError("cpu_archive grounding requires real observation metadata")
+                    if content_observations is not None:
+                        policy.observe_dense(*content_observations)
+                    archive_prepare(self, list(enumerate(self.shared_attn)), cache_name, policy, rows)
+                    old_mask = first["mask"].clone()
+                    cache_plan = policy.plan(old_mask, len(positions), rows)
+                except BaseException:
+                    if owns_cache_transaction:
+                        self.rollback_cache_transaction(cache_transaction)
+                    else:
+                        self._rollback_cache_entries(cache_transaction["entries"], start=prepare_start)
+                        policy.restore(policy_before)
+                    raise
+            else:
+                cache_plan = policy.plan(old_mask, len(positions), rows)
 
         # Preflight above is read-only and must not leave an open transaction
         # when metadata validation fails.
@@ -984,7 +1032,8 @@ class MoTBackbone(nn.Module):
                 cache_transaction = self.begin_cache_transaction(cache_name)
                 owns_cache_transaction = True
         cache_entries = None if cache_transaction is None else cache_transaction["entries"]
-        cache_entry_start = 0 if cache_entries is None else len(cache_entries)
+        cache_entry_start = (prepare_start if policy is not None and getattr(policy, "archive", None) is not None
+                             else 0 if cache_entries is None else len(cache_entries))
 
         def _layer(layer, *streams_in):
             sl_in = {order[i]: streams_in[i] for i in range(len(order))}
@@ -1100,6 +1149,8 @@ class MoTBackbone(nn.Module):
                 policy.add_usage(measurements)
                 if content_observations is not None and policy.config.version == 2:
                     policy.observe_dense(*content_observations)
+                if getattr(policy, "archive", None) is not None:
+                    archive_append(list(enumerate(self.shared_attn)), cache_name, policy, cache_plan[0])
         except BaseException:
             if policy_before is not None:
                 policy.restore(policy_before)
@@ -1387,7 +1438,9 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
     def clear_cache(self, cache_name):
         for sa in self.mot.shared_attn:
             sa.clear_cache(cache_name)
-        getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
+        old_policy = getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
+        if getattr(old_policy, "archive", None) is not None:
+            old_policy.archive.close()
 
     def clear_pred_cache(self, cache_name, *, include_observed=False):
         # Capture every layer BEFORE invalidating the shared semantic sidecar.
@@ -1400,7 +1453,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
                 if cache is not None:
                     selected = cache['mask'] if include_observed else cache['mask'] & cache['is_pred']
                     slots = selected.nonzero().flatten()
-                    if slots.numel():
+                    if slots.numel() or cache.get("predicted_kv"):
                         entries.append((sa, cache_name, sa._snapshot_cache_slots(cache, slots)))
         for sa in self.mot.shared_attn:
             sa.clear_pred_cache(cache_name, include_observed=include_observed)
@@ -1416,6 +1469,8 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
         cfg = RetentionConfig(**config)
         self.mot.retention_policies[cache_name] = make_retention_policy(
             caches[0]["mask"].numel(), caches[0]["mask"].device, cfg)
+        for cache in caches:
+            cache["cpu_archive"] = cfg.history_storage == "cpu_archive"
 
     def get_global_retention(self, cache_name):
         """Detached, token-major diagnostics, shared by every expert/layer."""
@@ -1429,6 +1484,11 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
                 "score": policy.scores(slots).detach().clone(),
                 "components": {k: v.detach().clone()
                                for k, v in policy.components(slots).items()}}
+
+    def get_kv_archive_stats(self, cache_name):
+        policy = self.mot.retention_policies.get(cache_name)
+        archive = getattr(policy, "archive", None)
+        return None if archive is None else dict(archive.stats)
 
     def global_cache_cursor(self, cache_name):
         """Capture before a forward to identify its newly committed tokens."""
@@ -1533,7 +1593,9 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
                 dtype,
                 batch_size,
             )
-        getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
+        old_policy = getattr(self.mot, "retention_policies", {}).pop(cache_name, None)
+        if getattr(old_policy, "archive", None) is not None:
+            old_policy.archive.close()
 
     def _run_main_blocks(
         self,
@@ -1567,7 +1629,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             policy = self.mot.retention_policies.get(cache_name)
             v2 = policy is not None and policy.config.version == 2
             cache_context = dict(cache_context)
-            if v2 and not action_mode:
+            if v2 and not action_mode and policy.config.score_backend == "formula":
                 from .frame_index import dense_observations
                 content_observations = dense_observations(
                     cache_context.get("index"), cache_context["dense_grid"],
@@ -1599,7 +1661,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
                 cache_context, batch_size=hidden_states.shape[0], length=m+t,
                 main_count=m, action_mode=action_mode, update_cache=update_cache,
                 device=hidden_states.device)
-            if v2:
+            if v2 and policy.config.score_backend == "formula":
                 from .frame_index import broadcast_frame_contacts
                 metadata = broadcast_frame_contacts(metadata)
             # Dense indexing has no sparse gather and no nonzero-presence

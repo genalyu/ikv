@@ -52,15 +52,22 @@ def wire(model, namespace):
 
 def state(model, layer):
     cache = model.mot.shared_attn[layer].attn_caches["test"]
-    names = ("k", "v", "id", "mask", "is_pred", "semantic")
+    names = ("k", "v", "id", "mask", "is_pred", "semantic", "predicted_kv")
     policy = model.mot.retention_policies.get("test")
     cache_values = None if cache is None else deepcopy({name: cache.get(name) for name in names})
     if cache_values is not None:
         for name in ("k", "v"):
             cache_values[name] = cache_values[name][:, cache["mask"]]
+    snapshot = None if policy is None else policy.snapshot()
+    if policy is not None and getattr(policy, "archive", None) is not None:
+        # KV byte totals depend on the number of locally owned layers. Compare
+        # immutable token metadata, plus this stage's actual layer KV below.
+        records, stats, files = snapshot[2]
+        snapshot = snapshot[:2] + ([record["metadata"] for record in records],)
+        cache_values["archived_layer_kv"] = [record["kv"][layer] for record in records]
     return {"cache": cache_values,
             "retention": model.get_global_retention("test"),
-            "policy_snapshot": None if policy is None else policy.snapshot()}
+            "policy_snapshot": snapshot}
 
 
 def equal(actual, expected):
@@ -106,7 +113,14 @@ def main():
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--address", required=True)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--cpu-archive", action="store_true")
+    parser.add_argument("--sys2-mock", action="store_true", help="deterministic scoring transport, real PP/cache logic")
     args = parser.parse_args()
+    if args.sys2_mock:
+        from n0_twam.preprocessing.sys2 import Sys2Client
+        Sys2Client.score = lambda self,candidates,current_time: {
+            c["id"]: 100 if int(c["id"]) % 3 == 0 else 10 for c in candidates}
+        args.cpu_archive = True
     torch.set_num_threads(2)
     dist.init_process_group("gloo", init_method=args.address, rank=args.rank,
                             world_size=2, timeout=timedelta(seconds=90))
@@ -123,6 +137,10 @@ def main():
     config = dict(version=2, video_capacity=8, action_capacity=8, tactile_capacity=8,
                   task_weight=1., class_recency_weight=1., visual_weight=0.,
                   persistence_weight=0., query_weight=0., action_query_weight=0., tactile_query_weight=0.)
+    if args.cpu_archive:
+        config.update(history_storage="cpu_archive", archive_max_bytes=1024**2)
+    if args.sys2_mock:
+        config.update(score_backend="qwen_sys2",sys2_endpoint="http://localhost:1",sys2_task="test")
     def initialize(model):
         model.create_empty_cache("test", 2, 16, 8, torch.device("cpu"), torch.float32, 1)
         model.configure_global_retention("test", **config)
@@ -136,6 +154,12 @@ def main():
         if not action:
             data["kv_index"] = dict(dino=torch.tensor([[1.,0.],[0.,1.],[1.,0.],[0.,1.]]),
                 task_relevance=torch.tensor([.9,.1,.8,.2]), observation_flag=int(not prediction))
+        if args.sys2_mock:
+            index = dict(sys2_frame=torch.full((4,),time+1,dtype=torch.long),
+                         sys2_patch=torch.arange(4),sys2_height=torch.full((4,),2,dtype=torch.long),
+                         sys2_width=torch.full((4,),2,dtype=torch.long),observation_flag=int(not prediction))
+            if not action: data["kv_index"] = index
+            data["tactile_kv_index"] = dict(index,contact_present=True)
         mode = 1 if prediction else 2
         with torch.no_grad():
             expected = baseline(deepcopy(data), action_mode=action, update_cache=mode, cache_name="test")
@@ -161,7 +185,8 @@ def main():
     assert not stage.mot.retention_policies
     initialize(baseline); initialize(stage)
     forward(0)
-    report = dict(status="passed", ranks=2, layers=2, backend="gloo", device="cpu",
+    report = dict(status="passed", sys2_mock=args.sys2_mock, ranks=2, layers=2, backend="gloo", device="cpu",
+                  history_storage="cpu_archive" if args.cpu_archive else "evict",
                   checks=["observed video", "score eviction", "predicted video", "clear predictions",
                           "action stream", "transaction rollback", "transaction commit", "episode reset",
                           "per-layer KV and both-rank score/history parity"])

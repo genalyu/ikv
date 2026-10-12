@@ -162,13 +162,25 @@ class MultimodalKVRetention(GlobalKVRetention):
         self.data["contact_present"] = torch.zeros(capacity, dtype=torch.bool, device=self.device)
         self.history = ContentHistory(config, self.device)
         self.tactile_scorer = None
+        self.sys2_scorer = None
+        if config.score_backend == "qwen_sys2":
+            from n0_twam.preprocessing.sys2 import Sys2Client
+            self.sys2_scorer = Sys2Client(config.sys2_endpoint, config.sys2_task, config.sys2_timeout)
+            self.data["sys2_score"] = torch.full((capacity,), -1., device=self.device)
+            for name in ("sys2_frame", "sys2_patch", "sys2_height", "sys2_width"):
+                self.data[name] = torch.full((capacity,), -1, dtype=torch.long, device=self.device)
+        from .cpu_kv_archive import CPUKVArchive
+        self.archive = CPUKVArchive(config) if config.history_storage == "cpu_archive" else None
 
     def snapshot(self):
-        return super().snapshot(), self.history.snapshot()
+        return (super().snapshot(), self.history.snapshot(),
+                None if self.archive is None else self.archive.snapshot())
 
     def restore(self, state):
         super().restore(state[0])
         self.history.restore(state[1])
+        if self.archive is not None:
+            self.archive.restore(state[2])
 
     def video_handle(self, mask, since_uid):
         slots = (mask & (self.data["kind"] == 0) & (self.data["token_uid"] >= since_uid)).nonzero().flatten()
@@ -217,6 +229,8 @@ class MultimodalKVRetention(GlobalKVRetention):
 
     @torch.no_grad()
     def scores(self, slots, **kwargs):
+        if self.config.score_backend == "qwen_sys2":
+            return self.data["sys2_score"][slots]
         terms, c = self.components(slots, **kwargs), self.config
         kind = self.data["kind"][slots]
         qw = torch.where(kind == 0, c.query_weight,
@@ -287,6 +301,23 @@ class MultimodalKVRetention(GlobalKVRetention):
 
     @torch.no_grad()
     def commit(self, slots, rows, old_mask):
+        if self.config.score_backend == "qwen_sys2":
+            scored = getattr(self.sys2_scorer, "last_scores", {})
+            self.data["sys2_score"][slots] = torch.tensor(
+                [scored.get(str(self.next_uid+i), -1) for i in range(len(slots))],
+                dtype=torch.float32, device=self.device)
+            sensory = rows["kind"] != 1
+            for name in ("sys2_frame", "sys2_patch", "sys2_height", "sys2_width"):
+                if name not in rows:
+                    if sensory.any():
+                        raise ValueError(f"Sys2 real sensory rows require {name}")
+                    self.data[name][slots] = -1
+                    continue
+                if (rows[name][sensory] < (1 if name in ("sys2_height", "sys2_width") else 0)).any():
+                    raise ValueError(f"Sys2 real sensory rows require {name}")
+                self.data[name][slots] = rows[name]
+            if "contact_present" not in rows:
+                raise ValueError("Sys2 requires explicit contact labels")
         for name in ("dino", "neoforce"):
             width, old_width = rows[name].shape[-1], self.data[name].shape[-1]
             if width and old_width not in (0, width):
