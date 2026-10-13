@@ -225,6 +225,9 @@ def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
                     usage_collector=(None if policy is None or not any((
                         policy.config.query_weight, policy.config.action_query_weight,
                         policy.config.tactile_query_weight)) else (policy, measurements)),
+                    cache_token_kinds=None if cache_metadata is None else cache_metadata["kind"],
+                    history_token_kinds=self.retention_policies[cache_name].data["kind"] if cache_name in self.retention_policies else None,
+                    history_token_uids=self.retention_policies[cache_name].data["token_uid"] if cache_name in self.retention_policies else None,
                     cache_observation_flags=(None if cache_metadata is None
                                              else cache_metadata["observation_flag"]),
                     manage_semantic_sidecar=(layer == owned[0]),
@@ -405,6 +408,7 @@ def pp_configure_global_retention(self, cache_name, **config):
         caches[0]["mask"].numel(), caches[0]["mask"].device, cfg)
     for cache in caches:
         cache["cpu_archive"] = cfg.history_storage == "cpu_archive"
+        cache["action_fifo_capacity"] = cfg.action_capacity
 
 
 def _pp_retention_mask(self, cache_name):

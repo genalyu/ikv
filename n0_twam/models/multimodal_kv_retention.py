@@ -229,6 +229,12 @@ class MultimodalKVRetention(GlobalKVRetention):
 
     @torch.no_grad()
     def scores(self, slots, **kwargs):
+        sensory = self.data["kind"][slots] != 1
+        if not sensory.all():
+            result = torch.zeros(len(slots), device=self.device)
+            if sensory.any():
+                result[sensory] = self.scores(slots[sensory], **kwargs)
+            return result  # action has no importance score
         if self.config.score_backend == "qwen_sys2":
             return self.data["sys2_score"][slots]
         terms, c = self.components(slots, **kwargs), self.config
@@ -251,6 +257,17 @@ class MultimodalKVRetention(GlobalKVRetention):
             + c.class_recency_weight * terms["class_recency"]
             + c.task_weight * terms["task"])
 
+    def add_usage(self, measurements):
+        sensory_measurements = []
+        for measurement in measurements:
+            if measurement is None:
+                continue
+            slots, mass, count = measurement
+            sensory = self.data["kind"][slots] != 1
+            if sensory.any():
+                sensory_measurements.append((slots[sensory], mass[sensory], count))
+        super().add_usage(sensory_measurements)
+
     def evidence(self, slots, mask, incoming=None):
         d = self.data
         valid = mask & ((d["kind"] == 0) | ((d["kind"] == 2) & d["contact_present"]))
@@ -268,7 +285,7 @@ class MultimodalKVRetention(GlobalKVRetention):
         victims = []
         retained = mask.clone()
         anchor, reference = self.anchor_for(rows)
-        # Determine evidence eviction before ranking actions.
+        # Action uses baseline FIFO by insertion UID, independently of sensory selection.
         for kind in (0, 2, 1):
             incoming = (rows["kind"] == kind).nonzero().flatten()
             n = len(incoming)
@@ -277,14 +294,11 @@ class MultimodalKVRetention(GlobalKVRetention):
             used = (mask & (self.data["kind"] == kind)).nonzero().flatten()
             need = max(0, len(used) + n - self.budgets[kind])
             if need:
-                # Tie order: oldest time, then oldest token. Stable score sort.
                 order = torch.argsort(self.data["token_uid"][used], stable=True)
-                order = order[torch.argsort(self.data["world_time_id"][used[order]], stable=True)]
-                score = self.scores(used, t0=anchor, reference=reference)
-                order = order[torch.argsort(score[order], stable=True)]
-                if kind == 1:
-                    support = self.evidence(used, retained, rows)
-                    order = order[torch.argsort(support[order].long(), stable=True)]
+                if kind != 1:
+                    order = order[torch.argsort(self.data["world_time_id"][used[order]], stable=True)]
+                    score = self.scores(used, t0=anchor, reference=reference)
+                    order = order[torch.argsort(score[order], stable=True)]
                 evict = used[order[:need]]
                 retained[evict] = False
                 victims.append(evict)

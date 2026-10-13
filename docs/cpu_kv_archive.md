@@ -22,16 +22,16 @@ creates a separate override from an exported config and refuses to replace it.
 
 Current real observations always get GPU slots. Before each observed forward,
 CPU history is scored using current policy metadata and content prototypes.
-Select video and tactile first, then actions supported by the selected real
-video/contact tactile or incoming observations. Selection reserves space for
+Select video and tactile independently. Action slots use baseline FIFO and are
+excluded from archival selection. Selection reserves space for
 all incoming modality tokens. IDs prevent duplication. Transfer only missing
 selected KV, preserving already selected GPU slots. All layers use one plan.
 Archived metadata stays on CPU; full archived KV is never copied to GPU for
 ranking. A score change can recall previously displaced history.
 
-Predicted and temporary denoising KV use a separate GPU tensor list, included
-in current attention and cleared at grounding. They never consume historical
-budgets or enter the archive. No DINO backfill is performed for this temporary
+Predicted sensory and temporary denoising KV use a separate GPU tensor list,
+included in current attention and cleared at grounding. They never enter the
+archive. Predicted action writes obey the action FIFO budget. No DINO backfill is performed for this temporary
 prediction list. Actual real grounding continues its usual metadata path.
 
 Each PP rank stores only its owned layers. Archives, statistics, recalled GPU
@@ -59,15 +59,15 @@ Diagnostics: `transformer.get_kv_archive_stats(cache_name)` returns local
 archived_tokens, resident_bytes, spilled_bytes, recalled_tokens, h2d_bytes and
 d2h_bytes. Byte counters cover KV tensors only and exclude transaction copies.
 
-Server paths:
-- .177 code: /home/ubuntu/genalyu/n0twam-dual-deploy/ikv-score-push
-- .177 Python: /home/ubuntu/genalyu/n0twam-dual-deploy/semantic-venv/bin/python
-- .143 code: /home/user/n0twam-dual-deploy/ikv-semantic
-- .143 Python: /home/user/n0twam-dual-deploy/semantic-venv/bin/python
-- A100 code: /mnt/cfs/9wt59p/genalyu/ikv-semantic-worktree
-- A100 Python: /mnt/cfs/9wt59p/genalyu/ikv-task-data/runtime/semantic-venv/bin/python
-
 Validation uses actual tiny two-layer MoT forwards: current observation
 reservation, history retention, prediction isolation, recall of exact archived
 K/V, late request rollback, limit failure, disk spill/recall/cleanup, and
 production two-rank PP parity. Full robot evaluation remains separate.
+
+## Action cache
+
+Only real visual/tactile KV enters the CPU archive. Action KV uses a GPU FIFO
+window of `action_capacity` tokens. It is not scored by IKV or Sys2, is not kept
+because of same-time sensory evidence, and cannot be recalled from CPU. Its
+append, temporary attention, committed-prediction eviction and prediction clear
+semantics are checked against baseline attention at the same action capacity.

@@ -2577,7 +2577,9 @@ class TWAM_Server:
                 input_dict['action_res_lst'][
                     'noisy_latents'][:, :, 0:1] = action_cond[:, :, 0:1]
                 input_dict['action_res_lst']['timesteps'][0:1] *= 0
-                if self._global_index_enabled():
+                if (self._global_index_enabled() and
+                        dict(getattr(self.job_config, "kv_retention", {})).get("version", 1) != 2):
+                    # Legacy v1 only. V2 action follows baseline prediction lifetime.
                     # This is a clean condition, not a predicted action. The
                     # first grounding keeps the observed RGB seed and skips
                     # action frame 0, so its clamped action KV must survive

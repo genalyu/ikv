@@ -22,8 +22,8 @@ def test_no_position_or_action_vectors_in_index():
     assert "action_repetition" not in p.data
 
 
-@pytest.mark.parametrize("kind", [0, 1, 2])
-def test_query_usage_changes_victims_in_every_modality(kind):
+@pytest.mark.parametrize("kind", [0, 2])
+def test_query_usage_changes_victims_in_sensory_modalities(kind):
     p = policy(time_weight=0)
     mask = torch.zeros(6, dtype=torch.bool)
     slots, _ = append(p, mask, rows([0, 1], kind=kind))
@@ -34,7 +34,7 @@ def test_query_usage_changes_victims_in_every_modality(kind):
     assert len(victims) == 1  # cannot borrow another modality's free budget
 
 
-def test_action_evidence_precedes_query_and_is_dynamic():
+def test_action_fifo_is_independent_of_evidence_and_query():
     p = policy(time_weight=0)
     mask = torch.zeros(6, dtype=torch.bool)
     visual, _ = append(p, mask, rows([0]))
@@ -42,7 +42,7 @@ def test_action_evidence_precedes_query_and_is_dynamic():
     p.data["query_mass"][actions] = torch.tensor([0., 1.])
     p.data["query_exposure"][actions] = 1
     _, victims = p.plan(mask, 1, rows([2.25], kind=1))
-    assert victims.tolist() == [int(actions[1])]
+    assert victims.tolist() == [int(actions[0])]
     mask[visual] = False
     _, victims = p.plan(mask, 1, rows([2.25], kind=1))
     assert victims.tolist() == [int(actions[0])]
@@ -112,8 +112,8 @@ def test_query_softmax_is_over_all_modalities_and_layer_average():
     k = torch.zeros(1, 3, 1, 2)
     measurements = [p.measure_usage(q, k, slots) for _ in range(3)]
     p.add_usage(measurements)
-    torch.testing.assert_close(p.components(slots)["query"], torch.full((3,), 1/3))
-    torch.testing.assert_close(p.data["query_exposure"][slots], torch.full((3,), 2.))
+    torch.testing.assert_close(p.components(slots)["query"], torch.tensor([1/3, 0., 1/3]))
+    torch.testing.assert_close(p.data["query_exposure"][slots], torch.tensor([2., 0., 2.]))
 
 
 def test_snapshot_rolls_back_content_history():

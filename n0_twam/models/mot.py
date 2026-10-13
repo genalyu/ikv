@@ -82,6 +82,9 @@ class SharedSelfAttention(nn.Module):
         usage_collector=None,
         cache_observation_flags=None,
         manage_semantic_sidecar=True,
+        cache_token_kinds=None,
+        history_token_kinds=None,
+        history_token_uids=None,
     ) -> torch.Tensor:
         # q/k/v: [B(=1), S, heads, head_dim]
         # Streaming KV-cache path: when a cache pool exists for cache_name,
@@ -99,13 +102,36 @@ class SharedSelfAttention(nn.Module):
                          else current_valid[0].nonzero().flatten())
             current = (k[:, positions], v[:, positions])
             used = cache["mask"].nonzero().flatten()
+            used = used[torch.argsort(history_token_uids[used], stable=True)]
             predicted = cache.get("predicted_kv", ())
+            predicted_kinds = cache.get("predicted_kinds", ())
+            current_kinds = cache_token_kinds[positions]
+            kinds = torch.cat([history_token_kinds[used], *predicted_kinds, current_kinds])
+            action = (kinds == 1).nonzero().flatten()
+            capacity = cache["action_fifo_capacity"]
+            if int((current_kinds == 1).sum()) > capacity:
+                raise ValueError("current action KV exceeds baseline FIFO capacity")
+            keep = torch.ones(len(kinds), dtype=torch.bool, device=k.device)
+            keep[action[:max(0, len(action)-capacity)]] = False
             keys = [cache["k"][:, used]] + [x[0] for x in predicted] + [current[0]]
             values = [cache["v"][:, used]] + [x[1] for x in predicted] + [current[1]]
-            out = custom_sdpa(q, torch.cat(keys, 1), torch.cat(values, 1))
+            out = custom_sdpa(q, torch.cat(keys, 1)[:, keep], torch.cat(values, 1)[:, keep])
             if update_cache == 1:
-                snapshot = self._snapshot_cache_slots(cache, used[:0])
-                cache["predicted_kv"] = predicted + ((current[0].detach(), current[1].detach()),)
+                removed = used[~keep[:len(used)]]
+                snapshot = self._snapshot_cache_slots(cache, removed)
+                cache["mask"][removed] = False
+                cache["id"][removed] = -1
+                cache["is_pred"][removed] = False
+                # Predicted action append is committed like baseline: evicted
+                # real action cannot return when predictions are later cleared.
+                new_kv, new_kinds, offset = [], [], len(used)
+                for pair, kind in zip(predicted + (current,), predicted_kinds + (current_kinds,)):
+                    selected = keep[offset:offset+len(kind)]
+                    new_kv.append(tuple(value[:, selected].detach() for value in pair))
+                    new_kinds.append(kind[selected].detach())
+                    offset += len(kind)
+                cache["predicted_kv"] = tuple(new_kv)
+                cache["predicted_kinds"] = tuple(new_kinds)
                 if cache_transaction is not None:
                     cache_transaction.append((self, cache_name, snapshot))
             return self._zero_invalid_queries(out, current_valid)
@@ -231,6 +257,7 @@ class SharedSelfAttention(nn.Module):
         if c is None:
             return
         c["predicted_kv"] = ()
+        c["predicted_kinds"] = ()
         pred = c['mask'].clone() if include_observed else c['is_pred'] & c['mask']
         semantic = c.get('semantic')
         if semantic is not None:
@@ -280,6 +307,7 @@ class SharedSelfAttention(nn.Module):
         semantic = cache.get("semantic")
         return {
             "predicted_kv": cache.get("predicted_kv", ()),
+            "predicted_kinds": cache.get("predicted_kinds", ()),
             "slots": slots.clone(),
             "k": cache["k"].index_select(1, slots).clone(),
             "v": cache["v"].index_select(1, slots).clone(),
@@ -646,6 +674,7 @@ class SharedSelfAttention(nn.Module):
         cache = self.attn_caches[cache_name]
         slots = transaction["slots"]
         cache["predicted_kv"] = transaction.get("predicted_kv", ())
+        cache["predicted_kinds"] = transaction.get("predicted_kinds", ())
         cache["k"][:, slots] = transaction["k"]
         cache["v"][:, slots] = transaction["v"]
         cache["id"][slots] = transaction["id"]
@@ -1084,6 +1113,9 @@ class MoTBackbone(nn.Module):
                     cache_observation_flags=(None if cache_metadata is None
                                              else cache_metadata["observation_flag"]),
                     manage_semantic_sidecar=(layer == 0),
+                    cache_token_kinds=None if cache_metadata is None else cache_metadata["kind"],
+                    history_token_kinds=(None if cache_name not in self.retention_policies else self.retention_policies[cache_name].data["kind"]),
+                    history_token_uids=(None if cache_name not in self.retention_policies else self.retention_policies[cache_name].data["token_uid"]),
                 )
             if layer == 0 and update_cache != 0 and cache_name is not None:
                 self._share_semantic_sidecar(cache_name)
@@ -1471,6 +1503,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
             caches[0]["mask"].numel(), caches[0]["mask"].device, cfg)
         for cache in caches:
             cache["cpu_archive"] = cfg.history_storage == "cpu_archive"
+            cache["action_fifo_capacity"] = cfg.action_capacity
 
     def get_global_retention(self, cache_name):
         """Detached, token-major diagnostics, shared by every expert/layer."""

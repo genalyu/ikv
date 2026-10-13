@@ -42,7 +42,7 @@ class CPUKVArchive:
         return out.pin_memory() if t.is_cuda else out.clone()
 
     def append(self, policy, attentions, cache_name, slots):
-        slots = slots[policy.data["observation_flag"][slots]]
+        slots = slots[policy.data["observation_flag"][slots] & (policy.data["kind"][slots] != 1)]
         if not len(slots):
             return
         metadata = {name: value[slots].detach().cpu().clone() for name, value in policy.data.items()}
@@ -115,15 +115,12 @@ class CPUKVArchive:
             scores = policy.sys2_scorer(data, rows, policy.next_uid).float()
             if scores.shape != data["kind"].shape or not torch.isfinite(scores).all():
                 raise ValueError("Sys2 archive score shape or values invalid")
-            action = data["kind"] == 1
-            age = (float(anchor) - data["world_time_id"][action]).clamp_min(0)
-            scores[action] = policy.config.time_weight * torch.exp(-age / policy.config.time_scale)
             data["sys2_score"] = scores.clone()
         else:
             scores = scorer.scores(torch.arange(len(data["kind"])), t0=anchor, reference=reference.cpu())
         incoming = {name: value.detach().cpu() for name, value in rows.items()}
         selected = []
-        for kind in (0, 2, 1):
+        for kind in (0, 2):
             available = policy.budgets[kind] - int((incoming["kind"] == kind).sum())
             if available < 0:
                 raise ValueError("incoming modality exceeds GPU budget")
@@ -131,14 +128,6 @@ class CPUKVArchive:
             order = torch.argsort(data["token_uid"][ids], descending=True, stable=True)
             order = order[torch.argsort(data["world_time_id"][ids[order]], descending=True, stable=True)]
             order = order[torch.argsort(scores[ids[order]], descending=True, stable=True)]
-            if kind == 1 and len(ids):
-                evidence = torch.cat(selected) if selected else ids[:0]
-                contact = incoming.get("contact_present", incoming["neoforce"].ne(0).any(-1))
-                valid = (incoming["kind"] == 0) | ((incoming["kind"] == 2) & contact)
-                valid_evidence = (data["kind"][evidence] == 0) | data["contact_present"][evidence]
-                times = torch.cat((data["world_time_id"][evidence[valid_evidence]], incoming["world_time_id"][valid]))
-                support = torch.isin(data["world_time_id"][ids].floor(), times.floor())
-                order = order[torch.argsort(support[order].long(), descending=True, stable=True)]
             selected.append(ids[order[:available]])
         return data, torch.cat(selected)
 
@@ -149,7 +138,7 @@ class CPUKVArchive:
         first = attentions[0][1].attn_caches[cache_name]
         wanted = data["token_uid"][selected].to(policy.device)
         used = first["mask"].nonzero().flatten()
-        keep = used[torch.isin(policy.data["token_uid"][used], wanted)]
+        keep = used[torch.isin(policy.data["token_uid"][used], wanted) | (policy.data["kind"][used] == 1)]
         missing = selected[~torch.isin(data["token_uid"][selected], policy.data["token_uid"][keep].cpu())]
         removed = used[~torch.isin(used, keep)]
         free_mask = ~first["mask"].clone()
@@ -158,8 +147,9 @@ class CPUKVArchive:
         changed = torch.unique(torch.cat((removed, target)))
         if policy.config.score_backend == "qwen_sys2":
             lookup = {int(uid): float(score) for uid, score in zip(data["token_uid"], data["sys2_score"])}
-            policy.data["sys2_score"][keep] = torch.tensor(
-                [lookup[int(uid)] for uid in policy.data["token_uid"][keep]], device=policy.device)
+            sensory_keep = keep[policy.data["kind"][keep] != 1]
+            policy.data["sys2_score"][sensory_keep] = torch.tensor(
+                [lookup[int(uid)] for uid in policy.data["token_uid"][sensory_keep]], device=policy.device)
         if not len(changed):
             return
         for _, attention in attentions:

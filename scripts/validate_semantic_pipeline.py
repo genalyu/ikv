@@ -52,7 +52,7 @@ def wire(model, namespace):
 
 def state(model, layer):
     cache = model.mot.shared_attn[layer].attn_caches["test"]
-    names = ("k", "v", "id", "mask", "is_pred", "semantic", "predicted_kv")
+    names = ("k", "v", "id", "mask", "is_pred", "semantic", "predicted_kv", "predicted_kinds")
     policy = model.mot.retention_policies.get("test")
     cache_values = None if cache is None else deepcopy({name: cache.get(name) for name in names})
     if cache_values is not None:

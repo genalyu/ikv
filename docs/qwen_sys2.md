@@ -29,10 +29,13 @@ Sys1 observation encoding, model weights and action computation are unchanged.
 ## Attention and storage
 
 Current real observation rows go directly to the GPU. Remaining per-modality GPU
-budgets select scored history. All real KV is retained in the CPU archive; only
+budgets select scored history. All real visual/tactile KV is retained in the CPU archive; only
 missing selected tensors transfer back. Predictions are temporary and excluded
-from the archive. Action history prioritizes timestamps with retained visual or
-contact tactile evidence, then uses configured time recency. Visual/tactile scores
+from the archive. Action KV follows baseline FIFO by insertion order in its GPU capacity
+(`action_capacity`). It is neither scored nor archived/ recalled on CPU and has no
+retention dependency on visual/tactile KV. Temporary action forwards borrow the
+window; committed predicted action appends evict old action KV like baseline, and
+clearing predictions does not resurrect evicted actions. Visual/tactile scores
 are independently ranked. Existing formula mode remains the default.
 
 Archived tensors use the CPU/archive overflow settings in `docs/cpu_kv_archive.md`.
