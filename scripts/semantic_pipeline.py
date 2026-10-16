@@ -137,6 +137,8 @@ def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
     # only its local layer caches. Identical metadata produces identical plans.
     ikv_mode = hasattr(self, "retention_policies")
     policy = self.retention_policies.get(cache_name) if ikv_mode else None
+    if policy is not None and getattr(policy, "archive", None) is not None and update_cache != 2:
+        policy = None
     cache_plan = measurements = policy_before = old_mask = rows = None
     cache_transaction = None
     owns_cache_transaction = False
@@ -160,7 +162,30 @@ def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
         rows = {name: value[positions] for name, value in cache_metadata.items()}
         old_mask = first["mask"].clone()
         policy_before = policy.snapshot() if update_cache else None
-        cache_plan = policy.plan(old_mask, len(positions), rows)
+        if getattr(policy, "archive", None) is not None:
+            from n0_twam.models.cpu_kv_archive import archive_prepare
+            cache_transaction = self._active_cache_transactions.get(cache_name)
+            if cache_transaction is None:
+                cache_transaction = self.begin_cache_transaction(cache_name)
+                owns_cache_transaction = True
+            prepare_start = len(cache_transaction["entries"])
+            try:
+                if not rows["observation_flag"].all():
+                    raise ValueError("cpu_archive grounding requires real observation metadata")
+                if content_observations is not None:
+                    policy.observe_dense(*content_observations)
+                archive_prepare(self, [(i, self.shared_attn[i]) for i in owned], cache_name, policy, rows)
+                old_mask = first["mask"].clone()
+                cache_plan = policy.plan(old_mask, len(positions), rows)
+            except BaseException:
+                if owns_cache_transaction:
+                    self.rollback_cache_transaction(cache_transaction)
+                else:
+                    self._rollback_cache_entries(cache_transaction["entries"], start=prepare_start)
+                    policy.restore(policy_before)
+                raise
+        else:
+            cache_plan = policy.plan(old_mask, len(positions), rows)
         measurements = []
     if ikv_mode and update_cache != 0 and cache_name is not None:
         cache_transaction = self._active_cache_transactions.get(cache_name)
@@ -168,7 +193,8 @@ def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
             cache_transaction = self.begin_cache_transaction(cache_name)
             owns_cache_transaction = True
         cache_entries = cache_transaction["entries"]
-        cache_entry_start = len(cache_entries)
+        cache_entry_start = (prepare_start if policy is not None and getattr(policy, "archive", None) is not None
+                             else len(cache_entries))
 
     if rank == 1:
         for idx, name in enumerate(order):
@@ -199,6 +225,9 @@ def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
                     usage_collector=(None if policy is None or not any((
                         policy.config.query_weight, policy.config.action_query_weight,
                         policy.config.tactile_query_weight)) else (policy, measurements)),
+                    cache_token_kinds=None if cache_metadata is None else cache_metadata["kind"],
+                    history_token_kinds=self.retention_policies[cache_name].data["kind"] if cache_name in self.retention_policies else None,
+                    history_token_uids=self.retention_policies[cache_name].data["token_uid"] if cache_name in self.retention_policies else None,
                     cache_observation_flags=(None if cache_metadata is None
                                              else cache_metadata["observation_flag"]),
                     manage_semantic_sidecar=(layer == owned[0]),
@@ -250,6 +279,9 @@ def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
             _sync_retention_usage(policy, measurements)
             if content_observations is not None and policy.config.version == 2:
                 policy.observe_dense(*content_observations)
+            if getattr(policy, "archive", None) is not None:
+                from n0_twam.models.cpu_kv_archive import archive_append
+                archive_append([(i, self.shared_attn[i]) for i in owned], cache_name, policy, cache_plan[0])
         if owns_cache_transaction:
             self.commit_cache_transaction(cache_transaction)
     except BaseException:
@@ -288,7 +320,9 @@ def pp_clear_cache(self, cache_name):
         _remote("clear_cache", cache_name)
     for layer in _owned_range(self.mot):
         self.mot.shared_attn[layer].clear_cache(cache_name)
-    self.mot.retention_policies.pop(cache_name, None)
+    old_policy = self.mot.retention_policies.pop(cache_name, None)
+    if getattr(old_policy, "archive", None) is not None:
+        old_policy.archive.close()
     reserved_before = torch.cuda.memory_reserved()
     torch.cuda.empty_cache()  # Return inactive allocator blocks before NeoSim resets.
     print(f"[pp_reset] rank={dist.get_rank()} released_mib="
@@ -308,7 +342,7 @@ def pp_clear_pred_cache(self, cache_name, *, include_observed=False):
             if cache is not None:
                 selected = cache['mask'] if include_observed else cache['mask'] & cache['is_pred']
                 slots = selected.nonzero().flatten()
-                if slots.numel():
+                if slots.numel() or cache.get("predicted_kv"):
                     entries.append((attention, cache_name,
                                     attention._snapshot_cache_slots(cache, slots)))
     for layer in owned:
@@ -328,7 +362,9 @@ def pp_create_empty_cache(self, cache_name, attn_window,
         self.mot.shared_attn[layer].init_kv_cache(
             cache_name, total_tokens, self.num_attention_heads,
             self.attention_head_dim, device, dtype, batch_size)
-    self.mot.retention_policies.pop(cache_name, None)
+    old_policy = self.mot.retention_policies.pop(cache_name, None)
+    if getattr(old_policy, "archive", None) is not None:
+        old_policy.archive.close()
 
 
 WanMoTTransformer3DModel.clear_cache = pp_clear_cache
@@ -370,6 +406,9 @@ def pp_configure_global_retention(self, cache_name, **config):
     from n0_twam.models.multimodal_kv_retention import make_retention_policy
     self.mot.retention_policies[cache_name] = make_retention_policy(
         caches[0]["mask"].numel(), caches[0]["mask"].device, cfg)
+    for cache in caches:
+        cache["cpu_archive"] = cfg.history_storage == "cpu_archive"
+        cache["action_fifo_capacity"] = cfg.action_capacity
 
 
 def _pp_retention_mask(self, cache_name):

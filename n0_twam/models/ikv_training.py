@@ -88,6 +88,8 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
     if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
         raise ValueError("ikv_train_capacity must be a positive integer")
     retention = RetentionConfig(**config.get("retention", {}))
+    if retention.history_storage != "evict":
+        raise ValueError("cpu_archive is inference-only; training requires history_storage=evict")
     if retention.task_weight and "task_relevance" not in rows:
         raise ValueError("task_weight requires regenerated semantic feature sidecars")
     seq, phase, clean, kind = (layout[k] for k in ("seq", "phase", "clean", "kind"))
@@ -268,6 +270,8 @@ def build_ikv_support_plan(memory, device, *, return_groups=False):
     """
     config, layout, rows = memory["config"], memory["layout"], memory["rows"]
     retention = RetentionConfig(**config.get("retention", {}))
+    if retention.history_storage != "evict":
+        raise ValueError("cpu_archive is inference-only; training requires history_storage=evict")
     if retention.task_weight and "task_relevance" not in rows:
         raise ValueError("task_weight requires regenerated semantic feature sidecars")
     if any(getattr(retention, name) for name in

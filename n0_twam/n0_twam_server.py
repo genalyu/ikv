@@ -703,6 +703,7 @@ class TWAM_Server:
             )
 
         scale = 255.0 if float(tactile_tensor.max()) > 1.5 else 1.0
+        sys2_rgb = tactile_tensor / scale if self._sys2_enabled() else None
         first_frames = self.tactile_first_frames
         prev_frames = self.tactile_prev_frames
         if first_frames is None:
@@ -737,6 +738,18 @@ class TWAM_Server:
         if bool(getattr(self.job_config, 'tactile_global_zero', False)):
             global_latent = torch.zeros_like(global_latent)
 
+        if sys2_rgb is not None:
+            nframes = global_latent.shape[3]
+            raw_frames = sys2_rgb.shape[2]
+            stride = self._rgb_motion_vae_temporal_stride()
+            anchors = [raw_frames - 1 - stride*i for i in reversed(range(nframes))]
+            if not anchors or anchors[0] < 0:
+                raise ValueError("Qwen tactile/WAN temporal mapping mismatch")
+            _, ph, pw = self.job_config.patch_size
+            target = (global_latent.shape[-2]//ph, global_latent.shape[-1]//pw)
+            self._current_tactile_sys2_index = self._get_sys2_client().index(
+                sys2_rgb, anchors, target, tactile=True,
+                contact=obs.get("tactile_contact"), device=self.device)
         sensor_id_map = getattr(self.job_config, 'tactile_sensor_id_map', {}) or {}
         sensor_ids = torch.tensor(
             [int(sensor_id_map.get(key, idx)) for idx, key in enumerate(self.job_config.tactile_keys)],
@@ -943,6 +956,8 @@ class TWAM_Server:
     @torch.no_grad()
     def _backfill_predicted_video_index(self, latents, frame_st_id, handle):
         """Output RGB -> DINO -> existing KV metadata; never another forward."""
+        if dict(getattr(self.job_config, "kv_retention", {})).get("history_storage", "evict") == "cpu_archive":
+            return 0  # Temporary predictions do not participate in IKV scoring.
         from n0_twam.preprocessing.kv_index import encode_dense_dino
         pt, ph, pw = self.job_config.patch_size
         if pt != 1 or latents.shape[-2] % ph or latents.shape[-1] % pw:
@@ -991,6 +1006,14 @@ class TWAM_Server:
             self._kv_dino_encoder = encoder
         return encoder
 
+    def _sys2_enabled(self):
+        return dict(getattr(self.job_config, "kv_retention", {})).get("score_backend") == "qwen_sys2"
+
+    def _get_sys2_client(self):
+        from n0_twam.preprocessing.sys2 import Sys2Client
+        c = dict(self.job_config.kv_retention)
+        return Sys2Client(c["sys2_endpoint"], c["sys2_task"], c.get("sys2_timeout", 300))
+
     def _prepare_dense_observed_index(self, obs, videos):
         from n0_twam.preprocessing.kv_index import observed_index, encode_dense_dino
         anchors = self._rgb_motion_streaming_anchor_indices(videos.shape[2])
@@ -999,6 +1022,10 @@ class TWAM_Server:
             raise ValueError("dense index requires temporal patch_size=1 and spatially divisible camera sizes")
         target = (self.height // (16 * ph), self.width // (16 * pw))
         count = len(anchors) * target[0] * target[1] * len(videos)
+        if self._sys2_enabled():
+            if obs.get("kv_index"):
+                raise ValueError("online Qwen index conflicts with supplied visual index")
+            return self._get_sys2_client().index(videos, anchors, target, device=self.device)
         payload = dict(obs.get('kv_index') or {})
         semantic = dict(getattr(self.job_config, 'kv_semantic_encoder', {}) or {})
         semantic_enabled = semantic.get('backend', 'dinov2') != 'dinov2'
@@ -1029,6 +1056,12 @@ class TWAM_Server:
         return index
 
     def _prepare_online_contacts(self, obs, *, cold=False):
+        if self._sys2_enabled():
+            if any(key in obs for key in ("contact_pairs", "contact_index", "tactile_kv_index")):
+                raise ValueError("Qwen tactile mode requires tactile_contact, not legacy indices")
+            if self.job_config.tactile_keys and "tactile_contact" not in obs:
+                raise ValueError("Qwen tactile index requires reliable tactile_contact labels")
+            return obs
         if not (self._global_index_enabled() and bool(getattr(
                 self.job_config, 'kv_neoforce_online', False))):
             return obs
@@ -1942,6 +1975,7 @@ class TWAM_Server:
             'tactile_prev_frames': getattr(self, 'tactile_prev_frames', None),
             'last_tactile_latents': getattr(self, 'last_tactile_latents', None),
             'init_latent': getattr(self, 'init_latent', None),
+            'current_tactile_sys2_index': getattr(self, '_current_tactile_sys2_index', None),
             'current_observed_kv_index': getattr(self, '_current_observed_kv_index', None),
             'init_kv_index': getattr(self, '_init_kv_index', None),
             'last_observed_video_latent': getattr(
@@ -1969,6 +2003,7 @@ class TWAM_Server:
         self.tactile_prev_frames = snapshot['tactile_prev_frames']
         self.last_tactile_latents = snapshot['last_tactile_latents']
         self.init_latent = snapshot['init_latent']
+        self._current_tactile_sys2_index = snapshot['current_tactile_sys2_index']
         self._current_observed_kv_index = snapshot['current_observed_kv_index']
         self._init_kv_index = snapshot['init_kv_index']
         self._last_observed_video_latent = snapshot[
@@ -2542,7 +2577,9 @@ class TWAM_Server:
                 input_dict['action_res_lst'][
                     'noisy_latents'][:, :, 0:1] = action_cond[:, :, 0:1]
                 input_dict['action_res_lst']['timesteps'][0:1] *= 0
-                if self._global_index_enabled():
+                if (self._global_index_enabled() and
+                        dict(getattr(self.job_config, "kv_retention", {})).get("version", 1) != 2):
+                    # Legacy v1 only. V2 action follows baseline prediction lifetime.
                     # This is a clean condition, not a predicted action. The
                     # first grounding keeps the observed RGB seed and skips
                     # action frame 0, so its clamped action KV must survive
@@ -2602,6 +2639,13 @@ class TWAM_Server:
 
     def _reset(self, prompt=None):
         logger.info('Reset.')
+        if self._sys2_enabled():
+            task = prompt if prompt is not None else getattr(self.job_config, "prompt", None)
+            if not isinstance(task, str) or not task.strip():
+                raise ValueError("Qwen Sys2 requires the current episode task prompt")
+            self.job_config.kv_retention = dict(self.job_config.kv_retention, sys2_task=task)
+            if getattr(self.job_config, "use_rgb_motion_tokens", False):
+                raise ValueError("Qwen Sys2 currently requires dense observation indexing")
         self._validate_rgb_motion_server_config(self.job_config)
         cache_policy = getattr(self.job_config, 'kv_cache_policy', 'fifo')
         if cache_policy not in ('fifo', 'global'):
@@ -3193,6 +3237,10 @@ class TWAM_Server:
             input_dict['latent_res_lst']['kv_index'] = dense_index
             # Optional pre-aligned NeoForce/DINO for the separate tactile tail.
             # They never enter the tactile latent/content projection.
+            if self._sys2_enabled() and tactile_latents is not None:
+                tail = self._current_tactile_sys2_index
+                input_dict['latent_res_lst']['tactile_kv_index'] = tail
+                input_dict['action_res_lst']['tactile_kv_index'] = tail
             if 'tactile_kv_index' in obs:
                 input_dict['latent_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
                 input_dict['action_res_lst']['tactile_kv_index'] = obs['tactile_kv_index']
