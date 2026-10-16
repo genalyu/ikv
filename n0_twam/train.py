@@ -442,7 +442,7 @@ class Trainer:
             'rgb_motion_patch_indices', 'rgb_motion_indices',
             'rgb_motion_valid_mask', 'motion_indices', 'motion_valid_mask',
             'world_time_id', 'dino_features', 'neoforce_features',
-            'dense_dino_features', 'frame_neoforce_features',
+            'dense_dino_features', 'frame_neoforce_features', 'task_relevance',
             'observation_flag', 'visual_valid', 'tactile_valid',
             'motion_scores', 'camera_ids', 'patch_uv',
         ):
@@ -939,6 +939,8 @@ class Trainer:
                     'ikv_train_sample_capacity': bool(getattr(_c, 'ikv_train_sample_capacity', False)),
                     'ikv_train_min_capacity': int(getattr(_c, 'ikv_train_min_capacity', 0)),
                     'kv_retention': dict(getattr(_c, 'kv_retention', {})),
+                    'kv_semantic_encoder': dict(getattr(_c, 'kv_semantic_encoder', {}) or {}),
+                    'kv_semantic_provenance': getattr(_c, 'kv_semantic_provenance', None),
                     'use_rgb_motion_tokens': bool(getattr(
                         _c, 'use_rgb_motion_tokens', False)),
                     'rgb_motion_require_index': bool(getattr(

@@ -297,6 +297,8 @@ def snapshot(task, mode, world_size, destination):
         ikv_train_capacity=cfg.ikv_train_capacity,
         kv_retention=dict(cfg.kv_retention),
         kv_index_dino_online=cfg.use_ikv_training,
+        kv_semantic_encoder=dict(getattr(cfg, "kv_semantic_encoder", {}) or {}),
+        kv_semantic_provenance=getattr(cfg, "kv_semantic_provenance", None),
         kv_index_dino_model_name_or_path=cfg.rgb_motion_dino_model_name_or_path,
         inverse_used_action_channel_ids=cfg.inverse_used_action_channel_ids,
         tactile_sensor_id_map=dict(cfg.tactile_sensor_id_map),

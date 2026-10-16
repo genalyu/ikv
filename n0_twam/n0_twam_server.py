@@ -321,6 +321,10 @@ class TWAM_Server:
                 problems.append("ikv_train_capacity differs from training")
             if RetentionConfig(**dict(getattr(self.job_config, "kv_retention", {}))) != RetentionConfig(**meta["kv_retention"]):
                 problems.append("kv_retention differs from training")
+        trained_semantic = meta.get("kv_semantic_provenance")
+        if trained_semantic is not None:
+            if trained_semantic != getattr(self.job_config, "kv_semantic_provenance", None):
+                problems.append("semantic backend/assets/preprocessing differ from training")
         if problems:
             raise RuntimeError(
                 '[consistency] serve config does not match the training '
@@ -972,12 +976,18 @@ class TWAM_Server:
             device = getattr(self.job_config, 'kv_index_dino_device', 'cpu')
             if str(device) == 'server':
                 device = self.device
-            encoder = FrozenDinoV2PatchEncoder.from_pretrained(
-                getattr(self.job_config, 'kv_index_dino_model_name_or_path',
-                        'facebook/dinov2-base'),
-                local_files_only=True, device=device, torch_dtype=torch.float32,
-                image_size=getattr(self.job_config, 'kv_index_dino_image_size', (224, 224)),
-                float_input_range='0_1', output_dtype=torch.float32)
+            from n0_twam.preprocessing.semantic_patch import load_patch_encoder
+            semantic_config = dict(getattr(self.job_config, 'kv_semantic_encoder', {}) or {})
+            semantic_config.setdefault('model', getattr(self.job_config,
+                'kv_index_dino_model_name_or_path', 'facebook/dinov2-base'))
+            semantic_config.setdefault('image_size', getattr(self.job_config,
+                'kv_index_dino_image_size', (224, 224)))
+            encoder = load_patch_encoder(semantic_config, device=device,
+                prompt=getattr(self, '_semantic_prompt', None))
+            expected = getattr(self.job_config, 'kv_semantic_provenance', None)
+            if expected is not None:
+                if not hasattr(encoder, 'provenance') or encoder.provenance() != expected:
+                    raise ValueError('loaded semantic encoder differs from trained feature provenance')
             self._kv_dino_encoder = encoder
         return encoder
 
@@ -990,12 +1000,32 @@ class TWAM_Server:
         target = (self.height // (16 * ph), self.width // (16 * pw))
         count = len(anchors) * target[0] * target[1] * len(videos)
         payload = dict(obs.get('kv_index') or {})
+        semantic = dict(getattr(self.job_config, 'kv_semantic_encoder', {}) or {})
+        semantic_enabled = semantic.get('backend', 'dinov2') != 'dinov2'
+        task_enabled = bool(dict(getattr(self.job_config, 'kv_retention', {})).get('task_weight', 0))
+        if task_enabled and not semantic_enabled and 'task_relevance' not in payload:
+            raise ValueError('task_weight requires a semantic backend or supplied patch relevance')
         # Validate supplied features before spending time on DINO.
         index = observed_index(payload, count, self.device)
-        if 'dino' not in payload and bool(getattr(self.job_config, 'kv_index_dino_online', True)):
+        if semantic_enabled and ('dino' in payload or 'task_relevance' in payload):
+            if not {'dino', 'task_relevance'} <= set(payload):
+                raise ValueError('semantic observations require both patch features and task relevance')
+            encoder = self._get_kv_dino_encoder()
+            if obs.get('kv_semantic_provenance') != encoder.provenance():
+                raise ValueError('supplied semantic index provenance differs from online encoder')
+        if semantic_enabled and ('dino' not in payload or 'task_relevance' not in payload):
+            from n0_twam.preprocessing.kv_index import encode_dense_semantic
+            generated = encode_dense_semantic(videos, anchors, target, self._get_kv_dino_encoder())
+            for name, value in generated.items():
+                payload.setdefault(name, value)
+            index = observed_index(payload, count, self.device)
+        elif 'dino' not in payload and bool(getattr(self.job_config, 'kv_index_dino_online', True)):
             payload['dino'] = encode_dense_dino(
                 videos, anchors, target, self._get_kv_dino_encoder())
             index = observed_index(payload, count, self.device)
+        if task_enabled and 'task_relevance' not in payload:
+            raise ValueError('task scoring requires observed task relevance')
+
         return index
 
     def _prepare_online_contacts(self, obs, *, cold=False):
@@ -2680,6 +2710,10 @@ class TWAM_Server:
         ##### get prompt (bare reset falls back to the config prompt)
         if prompt is None:
             prompt = getattr(self.job_config, 'prompt', None)
+        self._semantic_prompt = prompt
+        semantic_encoder = getattr(self, '_kv_dino_encoder', None)
+        if hasattr(semantic_encoder, 'set_prompt'):
+            semantic_encoder.set_prompt(prompt)
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:

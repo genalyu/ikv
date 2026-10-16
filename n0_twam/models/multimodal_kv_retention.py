@@ -212,6 +212,7 @@ class MultimodalKVRetention(GlobalKVRetention):
             "visual": visual,
             "persistence": persistence,
             "class_recency": class_recency,
+            "task": d["task_relevance"][slots] * real_video,
         }
 
     @torch.no_grad()
@@ -233,7 +234,8 @@ class MultimodalKVRetention(GlobalKVRetention):
         return result + (kind == 0) * (
             c.contact_weight * terms["contact"] + c.visual_weight * terms["visual"]
             + c.persistence_weight * terms["persistence"]
-            + c.class_recency_weight * terms["class_recency"])
+            + c.class_recency_weight * terms["class_recency"]
+            + c.task_weight * terms["task"])
 
     def evidence(self, slots, mask, incoming=None):
         d = self.data
@@ -291,6 +293,13 @@ class MultimodalKVRetention(GlobalKVRetention):
                 raise ValueError(f"{name} width changed within an episode")
             if width and not old_width:
                 self.data[name] = torch.zeros(self.capacity, width, device=self.device)
+        relevance = torch.as_tensor(rows.get("task_relevance", 0.), device=self.device)
+        relevance = torch.broadcast_to(relevance, (len(slots),))
+        if not torch.isfinite(relevance).all() or ((relevance < 0) | (relevance > 1)).any():
+            raise ValueError("task relevance must be finite in [0,1]")
+        if self.config.task_weight and "task_relevance" not in rows:
+            raise ValueError("task_weight requires task_relevance metadata")
+        self.data["task_relevance"][slots] = relevance
         self.t0, self.reference_dino = self.anchor_for(rows)
         for name in ("world_time_id", "observation_flag", "kind"):
             self.data[name][slots] = rows[name]

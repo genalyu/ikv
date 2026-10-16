@@ -80,6 +80,11 @@ def load_task(path):
             or len(set(task["source"])) != len(task["source"])
         ):
             raise ValueError("Source lists require distinct collector_v06 paths")
+    semantic = task["runtime"].get("semantic_encoder")
+    if semantic:
+        for field in ("repo", "model", "backbone_weights", "head_weights", "text_weights", "bpe"):
+            if field in semantic:
+                semantic[field] = str((path.parent / semantic[field]).resolve())
     allowed = task.get("allowed_quality_labels")
     if allowed is not None and (
         task["format"] != "collector_v06"
@@ -199,6 +204,25 @@ def training_config(task, mode, world_size, *, require_ready=True):
         // (16 * cfg.patch_size[2])
         * len(cfg.obs_cam_keys)
     )
+    cfg.kv_semantic_encoder = dict(runtime.get("semantic_encoder", {}) or {})
+    semantic_enabled = cfg.kv_semantic_encoder.get("backend", "dinov2") != "dinov2"
+    if semantic_enabled and ikv:
+        if cfg.kv_retention.get("version", 1) != 2:
+            raise ValueError("semantic patch scoring requires IKV retention version 2")
+        cfg.kv_retention["task_weight"] = float(task.get("features", {}).get("task_weight", 1.))
+        cfg.kv_retention["content_threshold"] = float(task.get("features", {}).get("content_threshold", .9))
+        manifest_path = paths(task)["dataset"] / "features.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError("Build semantic features before training")
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("task_fingerprint") != fingerprint(task):
+            raise ValueError("Semantic feature manifest differs from task configuration")
+        cfg.kv_semantic_provenance = manifest.get("semantic_provenance")
+        if not cfg.kv_semantic_provenance:
+            raise ValueError("Feature manifest lacks semantic provenance")
+        from n0_twam.preprocessing.semantic_patch import _identity
+        if cfg.kv_semantic_provenance.get("assets") != _identity(cfg.kv_semantic_encoder):
+            raise ValueError("Semantic model assets changed since feature build; regenerate features")
     cfg.rgb_motion_dino_model_name_or_path = runtime.get("dino_model", "")
     cfg.rgb_motion_rgb_threshold = float(
         task.get("features", {}).get("motion_threshold", 0.02)

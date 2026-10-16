@@ -47,6 +47,15 @@ def training_metadata(grid, layout, splits, latent, action, motion_layout, versi
                 raise ValueError("IKV training metadata must be finite")
             rows[name] = torch.zeros(n, features.shape[-1], device=device)
             rows[name][v_start:v_end] = features
+    if version == 2 and "task_relevance" in latent:
+        relevance = latent["task_relevance"].flatten(1, 2)
+        if motion_layout is not None:
+            relevance = relevance.gather(1, motion_layout["indices"])
+        relevance = relevance.reshape(-1).detach().float()
+        if len(relevance) != v_end-v_start or not torch.isfinite(relevance).all() or ((relevance < 0) | (relevance > 1)).any():
+            raise ValueError("training task relevance must align with video patches in [0,1]")
+        rows["task_relevance"] = torch.zeros(n, device=device)
+        rows["task_relevance"][v_start:v_end] = relevance
     values = action["latent"].permute(0, 2, 3, 4, 1).flatten(0, 3).detach().float()
     start = sum(splits[:3])
     rows["action"] = torch.zeros(n, values.shape[-1], device=device)
@@ -79,6 +88,8 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
     if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
         raise ValueError("ikv_train_capacity must be a positive integer")
     retention = RetentionConfig(**config.get("retention", {}))
+    if retention.task_weight and "task_relevance" not in rows:
+        raise ValueError("task_weight requires regenerated semantic feature sidecars")
     seq, phase, clean, kind = (layout[k] for k in ("seq", "phase", "clean", "kind"))
     valid_seqs = torch.unique(seq[seq >= 0]).tolist()
     if not valid_seqs:
@@ -257,6 +268,8 @@ def build_ikv_support_plan(memory, device, *, return_groups=False):
     """
     config, layout, rows = memory["config"], memory["layout"], memory["rows"]
     retention = RetentionConfig(**config.get("retention", {}))
+    if retention.task_weight and "task_relevance" not in rows:
+        raise ValueError("task_weight requires regenerated semantic feature sidecars")
     if any(getattr(retention, name) for name in
            ("query_weight", "action_query_weight", "tactile_query_weight")):
         raise ValueError("Masked IKV requires zero query-usage score weights")
