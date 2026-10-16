@@ -247,3 +247,25 @@ def test_history_ignores_zero_content_but_advances_clock():
     h.observe(torch.zeros(3, 2), torch.tensor([2., 0., 1.]), torch.ones(3))
     assert h.features.numel() == 0
     assert h.clock == 2.
+
+
+def test_rgb_action_retention_without_tactile_budget():
+    p = policy(tactile_capacity=0)
+    mask = torch.zeros(4, dtype=torch.bool)
+    append(p, mask, rows([0, 1], kind=0))
+    append(p, mask, rows([0, 1], kind=1))
+    _, victims = p.plan(mask, 1, rows([2], kind=1))
+    assert len(victims) == 1
+    with pytest.raises(ValueError):
+        policy(tactile_capacity=-1)
+
+
+def test_sampled_rgb_action_capacity_keeps_tactile_disabled():
+    from n0_twam.models.ikv_training import sample_ikv_capacity
+    cfg = RetentionConfig(version=2, video_capacity=8, action_capacity=4, tactile_capacity=0)
+    memory = {"config": {"capacity": 12, "sample_capacity": True, "min_capacity": 6}}
+    for _ in range(20):
+        capacity, sampled = sample_ikv_capacity(memory, "cpu", cfg)
+        assert sampled.tactile_capacity == 0
+        assert sampled.video_capacity + sampled.action_capacity == capacity
+        assert sampled.video_capacity > 0 and sampled.action_capacity > 0

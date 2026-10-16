@@ -233,21 +233,22 @@ def sample_ikv_capacity(memory, device, retention):
         limits = [retention.video_capacity, retention.action_capacity, retention.tactile_capacity]
         if sum(limits) != maximum:
             raise ValueError("v2 modality capacities must sum to IKV capacity")
-        if minimum < 3:
-            raise ValueError("v2 min_capacity must reserve one slot per modality")
+        if minimum < sum(limit > 0 for limit in limits):
+            raise ValueError("v2 min_capacity must reserve one slot per active modality")
     sampled = int(torch.randint(minimum, maximum + 1, (1,), device=device))
     config["sampled_capacity"] = sampled
     if retention.version == 1:
         return sampled, retention
-    # Reserve one slot in each modality, then allocate the remaining sampled
+    # Reserve one slot in each enabled modality, then allocate remaining sampled
     # slots in proportion to configured modality slack. No trajectory metadata
     # enters the budget decision; an oversized current phase fails explicitly.
-    slack = [limit - 1 for limit in limits]
+    reserved = [int(limit > 0) for limit in limits]
+    slack = [limit - base for limit, base in zip(limits, reserved)]
     total_slack = sum(slack)
-    extra = sampled - 3
+    extra = sampled - sum(reserved)
     shares = [divmod(extra * room, total_slack) if total_slack else (0, 0)
               for room in slack]
-    budgets = [1 + share[0] for share in shares]
+    budgets = [base + share[0] for base, share in zip(reserved, shares)]
     leftover = sampled - sum(budgets)
     order = sorted(range(3), key=lambda i: (-shares[i][1], i))
     for i in order:

@@ -77,8 +77,8 @@ class RetentionConfig:
             raise ValueError("retention version must be 1 (legacy) or 2 (multimodal)")
         for name in ("video_capacity", "action_capacity", "tactile_capacity", "content_capacity"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < (1 if self.version == 2 else 0):
-                raise ValueError(f"{name} must be a positive integer for v2")
+            if isinstance(value, bool) or not isinstance(value, int) or value < (1 if self.version == 2 and name != "tactile_capacity" else 0):
+                raise ValueError(f"{name} has invalid capacity for retention v{self.version}")
         if not 0 < self.content_threshold <= 1:
             raise ValueError("content_threshold must be in (0, 1]")
         for name in ("top_k", "query_samples", "seed"):
