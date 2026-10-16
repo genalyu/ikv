@@ -70,6 +70,8 @@ def image_stats_video(path):
     import av
 
     with av.open(str(path)) as video:
+        video.streams.video[0].thread_type = "SLICE"
+        video.streams.video[0].thread_count = 1
         return image_stats_rgb(
             frame.to_ndarray(format="rgb24") for frame in video.decode(video=0)
         )
@@ -107,6 +109,7 @@ def encode_aligned_video(source, destination, ids, fps):
                 stream = out.add_stream("libx264", rate=Fraction(str(fps)))
                 stream.width, stream.height = rgb.shape[1], rgb.shape[0]
                 stream.pix_fmt = "yuv420p"
+                stream.thread_count = 2
                 stream.options = {"crf": "18", "preset": "fast"}
             while target < len(ids) and ids[target] == index:
                 f = av.VideoFrame.from_ndarray(rgb, format="rgb24")
@@ -243,7 +246,9 @@ def convert(task):
         df = pd.DataFrame(data)
         target = root / "data" / chunk / (stem + ".parquet")
         target.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(target, index=False)
+        parquet_tmp = target.with_suffix(".partial.parquet")
+        df.to_parquet(parquet_tmp, index=False)
+        parquet_tmp.replace(target)
         all_eps.append(
             dict(
                 episode_index=index,
