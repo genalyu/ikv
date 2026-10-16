@@ -132,6 +132,8 @@ class CPUKVArchive:
         return data, torch.cat(selected)
 
     def prepare(self, backbone, attentions, cache_name, policy, rows, entries):
+        if not policy.management_due(rows):
+            return  # FIFO on active GPU slots; still archive every real update.
         data, selected = self.select(policy, rows)
         if data is None:
             return

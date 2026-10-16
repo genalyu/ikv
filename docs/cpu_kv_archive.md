@@ -71,3 +71,28 @@ window of `action_capacity` tokens. It is not scored by IKV or Sys2, is not kept
 because of same-time sensory evidence, and cannot be recalled from CPU. Its
 append, temporary attention, committed-prediction eviction and prediction clear
 semantics are checked against baseline attention at the same action capacity.
+
+## Periodic IKV with intermediate FIFO
+
+Set `kv_retention.ikv_interval_frames` to a positive integer (default `1`,
+existing behavior). Values greater than one enable periodic management in v2,
+for both formula and Qwen scoring. For example `4` scores the first real visual
+observation, then after four additional distinct visual latent frames.
+These are model observation frames, not raw camera frames or diffusion steps.
+Repeated timestamps and action/tactile forwards do not advance the counter.
+A multi-frame chunk crossing the interval triggers one management at its boundary;
+the counter then resets. Current observations remain protected.
+
+Between management events each modality appends its incoming tokens and removes
+only the capacity deficit by oldest insertion UID. Thus a full modality cache
+receiving s tokens removes s old tokens; a partially filled cache removes fewer.
+Action remains baseline FIFO at all times. CPU archive mode still stores every
+real sensory update, and does not concatenate, rescore or recall the archive on
+intermediate frames. Archived history can return at the next management event.
+Evict mode cannot recover previously removed tokens. The cadence state rolls back
+with failed transactions and resets with the policy at episode reset.
+
+The config generator accepts `--ikv-interval-frames 4`. Native vision indexing,
+KV generation, attention and CPU archival still run each update; only scoring and
+recall are reduced. Important evidence may leave GPU during intermediate FIFO,
+so a larger interval trades immediate memory access for lower management cost.

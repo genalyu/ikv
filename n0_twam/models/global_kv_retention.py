@@ -25,6 +25,7 @@ class RetentionConfig:
     sys2_endpoint: str = ""
     sys2_task: str = ""
     sys2_timeout: float = 300.0
+    ikv_interval_frames: int = 1
     video_capacity: int = 0
     action_capacity: int = 0
     tactile_capacity: int = 0
@@ -50,6 +51,10 @@ class RetentionConfig:
     seed: int = 0
 
     def __post_init__(self):
+        if type(self.ikv_interval_frames) is not int or self.ikv_interval_frames < 1:
+            raise ValueError("ikv_interval_frames must be a positive integer")
+        if self.ikv_interval_frames != 1 and self.version != 2:
+            raise ValueError("periodic IKV requires retention version 2")
         if self.score_backend not in ("formula", "qwen_sys2"):
             raise ValueError("score_backend must be formula or qwen_sys2")
         if self.score_backend == "qwen_sys2":
