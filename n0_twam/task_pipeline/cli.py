@@ -29,6 +29,8 @@ def check(task, mode="baseline"):
     import torch
     from n0_twam.dataset.ikv_index import load_dense_index
 
+    if task.get("prepared_tasks"):
+        return [f"{path}: {error}" for path in task["prepared_tasks"] for error in check(load_task(path), mode)]
     p = paths(task)
     root = p["dataset"]
     errors = []
@@ -201,6 +203,8 @@ def prepare(task, stage, device, dry_run):
     if task["robot"].get("arms", 1) == 2:
         pool.append("--dual-arm")
     for name in ("convert", "rgb", "tactile", "features", "pool"):
+        if name == "tactile" and task.get("rgb_only", False):
+            continue
         if stage not in (name, "all"):
             continue
         if dry_run:

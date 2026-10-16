@@ -70,7 +70,7 @@ def load_task(path):
             raise ValueError(f"task missing {name}")
     if not task["prompt"].strip():
         raise ValueError("An explicit generic task prompt is required")
-    if task["format"] not in ("collector_v06", "lerobot_v21", "neosim_hdf5"):
+    if task["format"] not in ("collector_v06", "lerobot_v21", "neosim_hdf5", "robodojo_hdf5"):
         raise ValueError("Unsupported format; define an explicit adapter")
     if isinstance(task["source"], list):
         if (
@@ -123,7 +123,7 @@ def load_task(path):
         )
     if robot.get("arms", 1) not in (1, 2):
         raise ValueError("arms must be 1 or 2")
-    if not robot.get("cameras") or not robot.get("tactile"):
+    if not robot.get("cameras") or (not robot.get("tactile") and not task.get("rgb_only", False)):
         raise ValueError("Official recipe requires RGB and real tactile image streams")
     destinations = list(robot["cameras"].values()) + list(robot["tactile"].values())
     if len(set(destinations)) != len(destinations):
@@ -151,6 +151,22 @@ def accumulation(world_size):
 def training_config(task, mode, world_size, *, require_ready=True):
     from n0_twam.configs.twam_posttrain_cfg import twam_posttrain_cfg
 
+    if task.get("prepared_tasks"):
+        children = [load_task(path) for path in task["prepared_tasks"]]
+        configs = [training_config(child, mode, world_size, require_ready=require_ready) for child in children]
+        cfg = deepcopy(configs[0])
+        p = paths(task)
+        cfg.dataset_path = str(p["pool"] / "train")
+        cfg.val_dataset_path = str(p["pool"] / "val")
+        cfg.val_dataset_path = None
+        cfg.val_interval = 1000000000
+        cfg.save_root = str(p["runs"] / mode)
+        cfg.per_repo_norm_stat = {child["name"]: item.norm_stat for child, item in zip(children, configs)}
+        cfg.per_repo_semantic_provenance = {child["name"]: item.kv_semantic_provenance for child, item in zip(children, configs)}
+        cfg.expected_dataset_count = len(children)
+        cfg.task_fingerprint = fingerprint(task)
+        cfg.update(task.get("training", {}))
+        return cfg
     cfg = deepcopy(twam_posttrain_cfg)
     cfg.update(RECIPE)
     cfg.gradient_accumulation_steps = accumulation(world_size)
@@ -162,6 +178,12 @@ def training_config(task, mode, world_size, *, require_ready=True):
     cfg.val_interval = 9999
     cfg.obs_cam_keys = list(robot["cameras"].values())
     cfg.tactile_keys = list(robot["tactile"].values())
+    if task.get("rgb_only", False):
+        if cfg.tactile_keys:
+            raise ValueError("rgb_only requires empty tactile mapping")
+        cfg.use_local_tactile = False
+        cfg.tactile_optional = True
+        cfg.tactile_global_zero = True
     cfg.tactile_sensor_id_map = {k: i for i, k in enumerate(cfg.tactile_keys)}
     cfg.used_action_channel_ids = list(range(10 * robot.get("arms", 1)))
     cfg.inverse_used_action_channel_ids = [len(cfg.used_action_channel_ids)] * 20
@@ -251,6 +273,16 @@ def training_config(task, mode, world_size, *, require_ready=True):
     cfg.task_mode = mode
     cfg.enable_wandb = bool(task.get("monitoring", {}).get("wandb", False))
     cfg.official_revision = OFFICIAL_REVISION
+    allowed = {"num_steps", "save_interval", "learning_rate", "warmup_steps", "gradient_accumulation_steps", "max_latent_frames", "load_worker"}
+    overrides = task.get("training", {})
+    if set(overrides) - allowed:
+        raise ValueError("Unsupported training overrides")
+    cfg.update(overrides)
+    if task.get("rgb_only", False) and ikv:
+        cfg.kv_retention.update(video_capacity=3584, action_capacity=512, tactile_capacity=0,
+            score_backend="formula", persistence_weight=1.0, contact_weight=0.0,
+            class_recency_weight=1.0, time_weight=0.0, visual_weight=0.0,
+            query_weight=0.0, task_weight=1.0 if semantic_enabled else 0.0)
     return cfg
 
 

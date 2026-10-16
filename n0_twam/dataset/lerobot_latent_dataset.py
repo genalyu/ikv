@@ -70,6 +70,8 @@ def construct_lerobot_multi_processor(config,
     skipped = sum(1 for d in datasets_out_lst if d is None)
     if skipped:
         logging.warning("construct_lerobot: skipped %d unusable repos", skipped)
+    if getattr(config, "expected_dataset_count", None) is not None and (skipped or len(datasets_out_lst) != config.expected_dataset_count):
+        raise RuntimeError("Required multi-task corpus is incomplete; refusing partial training")
     return [d for d in datasets_out_lst if d is not None]
 
 class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
@@ -1126,7 +1128,7 @@ class LatentLeRobotDataset(LeRobotDataset):
                     patch_size=patch, grid_shape=(h//patch[1], w//patch[2]),
                     latent_frame_ids=latent_frame_ids, full_frames=int(expected_full_frames),
                     start=truncate_start, end=truncate_end,
-                    semantic_expected=getattr(self.config, "kv_semantic_provenance", None),
+                    semantic_expected=(getattr(self.config, "per_repo_semantic_provenance", {}) or {}).get(self.repo_name, getattr(self.config, "kv_semantic_provenance", None)),
                     require_task=bool(dict(getattr(self.config, "kv_retention", {})).get("task_weight", 0)))
                 out_dict["dense_dino_features"] = dense["dino_features"]
                 if "task_relevance" in dense:
@@ -1148,7 +1150,7 @@ class LatentLeRobotDataset(LeRobotDataset):
                     patch_size=patch, grid_shape=(h//patch[1], w//patch[2]),
                     latent_frame_ids=latent_frame_ids, full_frames=int(expected_full_frames),
                     start=truncate_start, end=truncate_end,
-                    semantic_expected=getattr(self.config, "kv_semantic_provenance", None),
+                    semantic_expected=(getattr(self.config, "per_repo_semantic_provenance", {}) or {}).get(self.repo_name, getattr(self.config, "kv_semantic_provenance", None)),
                     require_task=bool(dict(getattr(self.config, "kv_retention", {})).get("task_weight", 0))))
             return
         if latent_world_time_ids is None:

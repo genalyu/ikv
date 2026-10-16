@@ -229,6 +229,9 @@ def iter_lerobot(task):
 def episodes(task):
     if task["format"] == "collector_v06":
         yield from iter_collector(task)
+    elif task["format"] == "robodojo_hdf5":
+        from .robodojo import iter_robodojo
+        yield from iter_robodojo(task)
     elif task["format"] == "lerobot_v21":
         yield from iter_lerobot(task)
     else:

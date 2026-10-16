@@ -83,8 +83,10 @@ def encode_aligned_video(source, destination, ids, fps):
 
     def frames():
         if isinstance(source, dict) and source.get("hdf5"):
-            from .neosim import image_frames
-
+            if source.get("format") == "robodojo":
+                from .robodojo import image_frames
+            else:
+                from .neosim import image_frames
             yield from image_frames(source)
         else:
             if isinstance(source, bytes):
