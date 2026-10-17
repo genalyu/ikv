@@ -63,7 +63,7 @@ def state(model, layer):
         # KV byte totals depend on the number of locally owned layers. Compare
         # immutable token metadata, plus this stage's actual layer KV below.
         records, stats, files = snapshot[2]
-        snapshot = snapshot[:2] + ([record["metadata"] for record in records],)
+        snapshot = snapshot[:2] + ([record["metadata"] for record in records],) + snapshot[3:]
         cache_values["archived_layer_kv"] = [record["kv"][layer] for record in records]
     return {"cache": cache_values,
             "retention": model.get_global_retention("test"),
@@ -115,6 +115,7 @@ def main():
     parser.add_argument("--out", type=Path)
     parser.add_argument("--cpu-archive", action="store_true")
     parser.add_argument("--sys2-mock", action="store_true", help="deterministic scoring transport, real PP/cache logic")
+    parser.add_argument("--ikv-interval-frames", type=int, default=1)
     args = parser.parse_args()
     if args.sys2_mock:
         from n0_twam.preprocessing.sys2 import Sys2Client
@@ -134,7 +135,7 @@ def main():
         worker(stage, namespace)
         dist.destroy_process_group()
         return
-    config = dict(version=2, video_capacity=8, action_capacity=8, tactile_capacity=8,
+    config = dict(version=2, ikv_interval_frames=args.ikv_interval_frames, video_capacity=8, action_capacity=8, tactile_capacity=8,
                   task_weight=1., class_recency_weight=1., visual_weight=0.,
                   persistence_weight=0., query_weight=0., action_query_weight=0., tactile_query_weight=0.)
     if args.cpu_archive:

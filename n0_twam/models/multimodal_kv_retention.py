@@ -161,6 +161,9 @@ class MultimodalKVRetention(GlobalKVRetention):
             del self.data[name]
         self.data["contact_present"] = torch.zeros(capacity, dtype=torch.bool, device=self.device)
         self.history = ContentHistory(config, self.device)
+        self._frame_clock = float("-inf")
+        self._frames_since_management = 0
+        self._managed_once = False
         self.tactile_scorer = None
         self.sys2_scorer = None
         if config.score_backend == "qwen_sys2":
@@ -174,13 +177,39 @@ class MultimodalKVRetention(GlobalKVRetention):
 
     def snapshot(self):
         return (super().snapshot(), self.history.snapshot(),
-                None if self.archive is None else self.archive.snapshot())
+                None if self.archive is None else self.archive.snapshot(),
+                (self._frame_clock, self._frames_since_management, self._managed_once))
 
     def restore(self, state):
         super().restore(state[0])
         self.history.restore(state[1])
         if self.archive is not None:
             self.archive.restore(state[2])
+        self._frame_clock, self._frames_since_management, self._managed_once = state[3]
+
+    def _new_observation_frames(self, rows):
+        # Only real visual latent frames advance cadence. Action/tactile forwards
+        # at the same time and diffusion predictions must not advance it.
+        real_video = rows["observation_flag"] & (rows["kind"] == 0)
+        times = torch.unique(rows["world_time_id"][real_video])
+        return times[times > self._frame_clock]
+
+    def management_due(self, rows):
+        if self.config.ikv_interval_frames == 1:
+            return True  # preserve existing behavior by default
+        times = self._new_observation_frames(rows)
+        return bool(len(times) and (not self._managed_once or
+            self._frames_since_management + len(times) >= self.config.ikv_interval_frames))
+
+    def _commit_cadence(self, rows):
+        due = self.management_due(rows)
+        times = self._new_observation_frames(rows)
+        if len(times):
+            self._frame_clock = float(times.max())
+            self._frames_since_management += len(times)
+        if due:
+            self._frames_since_management = 0
+            self._managed_once = True
 
     def video_handle(self, mask, since_uid):
         slots = (mask & (self.data["kind"] == 0) & (self.data["token_uid"] >= since_uid)).nonzero().flatten()
@@ -295,7 +324,7 @@ class MultimodalKVRetention(GlobalKVRetention):
             need = max(0, len(used) + n - self.budgets[kind])
             if need:
                 order = torch.argsort(self.data["token_uid"][used], stable=True)
-                if kind != 1:
+                if kind != 1 and self.management_due(rows):
                     order = order[torch.argsort(self.data["world_time_id"][used[order]], stable=True)]
                     score = self.scores(used, t0=anchor, reference=reference)
                     order = order[torch.argsort(score[order], stable=True)]
@@ -361,6 +390,7 @@ class MultimodalKVRetention(GlobalKVRetention):
         self.data["token_uid"][slots] = torch.arange(self.next_uid, self.next_uid+len(slots), device=self.device)
         self.next_uid += len(slots)
         self.revision += 1
+        self._commit_cadence(rows)
 
 
 def make_retention_policy(capacity, device, config):

@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--directory", default="")
     parser.add_argument("--sys2-endpoint")
     parser.add_argument("--sys2-task")
+    parser.add_argument("--ikv-interval-frames", type=int)
     args = parser.parse_args()
     if args.source.resolve() == args.output.resolve():
         raise ValueError("output must differ from source")
@@ -24,6 +25,8 @@ def main():
     retention.update(history_storage="cpu_archive", archive_max_bytes=int(args.max_gib * 1024**3),
                      archive_overflow=args.overflow, archive_directory=args.directory,
                      query_weight=0., action_query_weight=0., tactile_query_weight=0.)
+    if args.ikv_interval_frames is not None:
+        retention["ikv_interval_frames"] = args.ikv_interval_frames
     if args.sys2_endpoint:
         if not args.sys2_task:
             raise ValueError("--sys2-endpoint requires --sys2-task")

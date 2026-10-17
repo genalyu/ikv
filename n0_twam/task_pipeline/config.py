@@ -216,7 +216,7 @@ def training_config(task, mode, world_size, *, require_ready=True):
         cfg.kv_retention = dict(cfg.kv_retention)
         cfg.kv_retention.update(query_weight=0.0, action_query_weight=0.0,
                                 tactile_query_weight=0.0)
-        for field in ("history_storage", "archive_max_bytes", "archive_overflow", "archive_directory", "score_backend", "sys2_endpoint", "sys2_task", "sys2_timeout"):
+        for field in ("history_storage", "archive_max_bytes", "archive_overflow", "archive_directory", "score_backend", "sys2_endpoint", "sys2_task", "sys2_timeout", "ikv_interval_frames"):
             if field in task.get("features", {}):
                 cfg.kv_retention[field] = task["features"][field]
     cfg.ikv_index_root_name = "ikv_index" if ikv else None
