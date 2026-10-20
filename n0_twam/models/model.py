@@ -2427,97 +2427,110 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # (legacy) -> [video | gt_clean]. action path is UNCHANGED (single return) so
         # existing action inference is untouched.
         main_token_count = latent_hidden_states.shape[1]
-        global_tactile_latent = self._require_tactile_entry(
-            input_dict, 'tactile_global_latent', 'input_dict',
-        )
-        tactile_sensor_ids = self._require_tactile_entry(
-            input_dict, 'tactile_sensor_ids', 'input_dict',
-        )
-        if global_tactile_latent.dtype != latent_hidden_states.dtype:
-            global_tactile_latent = global_tactile_latent.to(latent_hidden_states.dtype)
-
-        tactile_noisy_latent = input_dict.get('tactile_noisy_latent', None)
-        denoise_tactile = (not action_mode) and (tactile_noisy_latent is not None)
-        gt_noisy_tokens = None
-        gt_noisy_token_count = 0
-        gt_tokens = None
-        tactile_clean_token_count = 0
-        if denoise_tactile:
-            # only the noisy tactile block is in the sequence -> skip encoding the
-            # (unused) clean tokens entirely.
-            if tactile_noisy_latent.dtype != latent_hidden_states.dtype:
-                tactile_noisy_latent = tactile_noisy_latent.to(latent_hidden_states.dtype)
-            gt_noisy_tokens = self._encode_tactile_condition(
-                tactile_noisy_latent, sensor_ids=tactile_sensor_ids,
-            )
-            gt_noisy_token_count = gt_noisy_tokens.shape[1]
-            if gt_noisy_token_count <= 0:
-                raise ValueError(
-                    "forward requires positive tactile_token_count in tactile cond branch."
-                )
+        rgb_only = input_dict.get('rgb_only', False)
+        if rgb_only:
+            if self.use_local_tactile or self.use_contact_gate:
+                raise ValueError("RGB-only inference requires tactile heads disabled")
+            if any(k.startswith('tactile_') for k in input_dict):
+                raise ValueError("RGB-only inference cannot carry tactile inputs")
+            tactile_token_count = 0
+            gt_noisy_token_count = 0
+            denoise_tactile = False
+            local_tactile_tokens = None
+            full_grid_id = self._gather_rgb_motion_grid(
+                input_dict['grid_id'], motion_layout)
         else:
-            gt_tokens = self._encode_tactile_condition(
-                global_tactile_latent, sensor_ids=tactile_sensor_ids,
+            global_tactile_latent = self._require_tactile_entry(
+                input_dict, 'tactile_global_latent', 'input_dict',
             )
-            tactile_clean_token_count = gt_tokens.shape[1]
-            if tactile_clean_token_count <= 0:
-                raise ValueError(
-                    "forward requires positive tactile_token_count in tactile cond branch."
+            tactile_sensor_ids = self._require_tactile_entry(
+                input_dict, 'tactile_sensor_ids', 'input_dict',
+            )
+            if global_tactile_latent.dtype != latent_hidden_states.dtype:
+                global_tactile_latent = global_tactile_latent.to(latent_hidden_states.dtype)
+
+            tactile_noisy_latent = input_dict.get('tactile_noisy_latent', None)
+            denoise_tactile = (not action_mode) and (tactile_noisy_latent is not None)
+            gt_noisy_tokens = None
+            gt_noisy_token_count = 0
+            gt_tokens = None
+            tactile_clean_token_count = 0
+            if denoise_tactile:
+                # only the noisy tactile block is in the sequence -> skip encoding the
+                # (unused) clean tokens entirely.
+                if tactile_noisy_latent.dtype != latent_hidden_states.dtype:
+                    tactile_noisy_latent = tactile_noisy_latent.to(latent_hidden_states.dtype)
+                gt_noisy_tokens = self._encode_tactile_condition(
+                    tactile_noisy_latent, sensor_ids=tactile_sensor_ids,
                 )
-        # total tactile tokens appended after the main (video/action) block.
-        # DENOISE (video pass): sequence = [video_noisy | gt_noisy] ONLY — do NOT
-        # append the SAME-FRAME clean tactile. Training's mask gives tactile_noisy
-        # `noise2clean ∧ block_causal_EXCLUDE_self` (model.py mask_list): it may
-        # condition on PAST clean tactile (which here lives in the KV-cache from prior
-        # chunks' compute_kv_cache real observations), but NEVER the same-frame clean.
-        # Appending same-frame gt_clean here (the observed tactile) let the mask-less
-        # streaming attention copy the answer -> defeats "predict tactile". Same-frame
-        # coupling that IS wanted (video_noisy ↔ tactile_noisy) is already present via
-        # the video_noisy block in the sequence. Non-denoise path keeps the legacy
-        # clean-condition behaviour unchanged.
-        if denoise_tactile:
-            tactile_token_count = gt_noisy_token_count          # [video | gt_noisy]
-            latent_hidden_states = torch.cat(
-                [latent_hidden_states, gt_noisy_tokens], dim=1,
-            )
-        else:
-            tactile_token_count = tactile_clean_token_count
-            latent_hidden_states = torch.cat(
-                [latent_hidden_states, gt_tokens], dim=1,
-            )
+                gt_noisy_token_count = gt_noisy_tokens.shape[1]
+                if gt_noisy_token_count <= 0:
+                    raise ValueError(
+                        "forward requires positive tactile_token_count in tactile cond branch."
+                    )
+            else:
+                gt_tokens = self._encode_tactile_condition(
+                    global_tactile_latent, sensor_ids=tactile_sensor_ids,
+                )
+                tactile_clean_token_count = gt_tokens.shape[1]
+                if tactile_clean_token_count <= 0:
+                    raise ValueError(
+                        "forward requires positive tactile_token_count in tactile cond branch."
+                    )
+            # total tactile tokens appended after the main (video/action) block.
+            # DENOISE (video pass): sequence = [video_noisy | gt_noisy] ONLY — do NOT
+            # append the SAME-FRAME clean tactile. Training's mask gives tactile_noisy
+            # `noise2clean ∧ block_causal_EXCLUDE_self` (model.py mask_list): it may
+            # condition on PAST clean tactile (which here lives in the KV-cache from prior
+            # chunks' compute_kv_cache real observations), but NEVER the same-frame clean.
+            # Appending same-frame gt_clean here (the observed tactile) let the mask-less
+            # streaming attention copy the answer -> defeats "predict tactile". Same-frame
+            # coupling that IS wanted (video_noisy ↔ tactile_noisy) is already present via
+            # the video_noisy block in the sequence. Non-denoise path keeps the legacy
+            # clean-condition behaviour unchanged.
+            if denoise_tactile:
+                tactile_token_count = gt_noisy_token_count          # [video | gt_noisy]
+                latent_hidden_states = torch.cat(
+                    [latent_hidden_states, gt_noisy_tokens], dim=1,
+                )
+            else:
+                tactile_token_count = tactile_clean_token_count
+                latent_hidden_states = torch.cat(
+                    [latent_hidden_states, gt_tokens], dim=1,
+                )
 
-        local_tactile_tokens = None
-        if action_mode and self.use_local_tactile:
-            local_tactile_latent = self._require_tactile_entry(
-                input_dict, 'tactile_local_latent', 'input_dict',
-            )
-            if local_tactile_latent.dtype != latent_hidden_states.dtype:
-                local_tactile_latent = local_tactile_latent.to(latent_hidden_states.dtype)
-            local_tactile_tokens = self._encode_local_tactile(
-                local_tactile_latent, sensor_ids=tactile_sensor_ids,
-            )
+            local_tactile_tokens = None
+            if action_mode and self.use_local_tactile:
+                local_tactile_latent = self._require_tactile_entry(
+                    input_dict, 'tactile_local_latent', 'input_dict',
+                )
+                if local_tactile_latent.dtype != latent_hidden_states.dtype:
+                    local_tactile_latent = local_tactile_latent.to(latent_hidden_states.dtype)
+                local_tactile_tokens = self._encode_local_tactile(
+                    local_tactile_latent, sensor_ids=tactile_sensor_ids,
+                )
 
-        # Symdiff tactile: tactile tokens carry REAL spatial/temporal RoPE
-        # positions (matching forward_train), so the model localises which sensor
-        # / frame / spatial patch each tactile token belongs to.
-        latent_grid_id = self._gather_rgb_motion_grid(
-            input_dict['grid_id'], motion_layout)
-        _, S_t, Fp_t, Hp_t, Wp_t = self._tactile_patch_grid_shape(global_tactile_latent)
-        B_g = latent_grid_id.shape[0]
-        # Derive the tactile frame_start FROM the video grid so tactile RoPE
-        # frames advance with the video's on every path (a pinned 0 here
-        # collapses all cached tactile history onto t=0).
-        _vid_frame_start = self._inference_video_frame_start(
-            input_dict['grid_id'], latent_grid_id, motion_layout)
-        tactile_grid_id = self._build_tactile_grid_id(
-            B_g, S_t, Fp_t, Hp_t, Wp_t,
-            device=latent_grid_id.device, dtype=latent_grid_id.dtype,
-            frame_start=_vid_frame_start,
-        )                                                 # (B, 4, S*Fp*Hp*Wp)
-        # one tactile block in the sequence either way: denoise -> [video | gt_noisy];
-        # non-denoise -> [video | gt_clean]. Both use the same tactile_grid_id (single
-        # copy) since there is exactly one tactile token block now.
-        full_grid_id = torch.cat([latent_grid_id, tactile_grid_id], dim=2)
+            # Symdiff tactile: tactile tokens carry REAL spatial/temporal RoPE
+            # positions (matching forward_train), so the model localises which sensor
+            # / frame / spatial patch each tactile token belongs to.
+            latent_grid_id = self._gather_rgb_motion_grid(
+                input_dict['grid_id'], motion_layout)
+            _, S_t, Fp_t, Hp_t, Wp_t = self._tactile_patch_grid_shape(global_tactile_latent)
+            B_g = latent_grid_id.shape[0]
+            # Derive the tactile frame_start FROM the video grid so tactile RoPE
+            # frames advance with the video's on every path (a pinned 0 here
+            # collapses all cached tactile history onto t=0).
+            _vid_frame_start = self._inference_video_frame_start(
+                input_dict['grid_id'], latent_grid_id, motion_layout)
+            tactile_grid_id = self._build_tactile_grid_id(
+                B_g, S_t, Fp_t, Hp_t, Wp_t,
+                device=latent_grid_id.device, dtype=latent_grid_id.dtype,
+                frame_start=_vid_frame_start,
+            )                                                 # (B, 4, S*Fp*Hp*Wp)
+            # one tactile block in the sequence either way: denoise -> [video | gt_noisy];
+            # non-denoise -> [video | gt_clean]. Both use the same tactile_grid_id (single
+            # copy) since there is exactly one tactile token block now.
+            full_grid_id = torch.cat([latent_grid_id, tactile_grid_id], dim=2)
         rotary_emb = self.rope(full_grid_id)[:, :, None]  # 1 L 1 C
         pach_scale_h, pach_scale_w = (1, 1) if action_mode else (
             self.patch_size[1], self.patch_size[2])
@@ -2544,31 +2557,32 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             timestep_proj = self._gather_rgb_motion_tokens(
                 timestep_proj, motion_layout)
 
-        p_h, p_w = self.patch_size[1], self.patch_size[2]
-        if denoise_tactile:
-            # tactile block = gt_noisy: per-frame DIFFUSION timestep (mirrors training's
-            # tactile_global_timesteps noisy half). server passes 'tactile_timesteps'
-            # as (B,F) (or S*F) at the current denoise step.
-            t_noisy = input_dict.get('tactile_timesteps', None)
-            if t_noisy is None:
-                t_noisy = input_dict['timesteps'].reshape(-1)[:1].expand(B_g, S_t * Fp_t)
+        if not rgb_only:
+            p_h, p_w = self.patch_size[1], self.patch_size[2]
+            if denoise_tactile:
+                # tactile block = gt_noisy: per-frame DIFFUSION timestep (mirrors training's
+                # tactile_global_timesteps noisy half). server passes 'tactile_timesteps'
+                # as (B,F) (or S*F) at the current denoise step.
+                t_noisy = input_dict.get('tactile_timesteps', None)
+                if t_noisy is None:
+                    t_noisy = input_dict['timesteps'].reshape(-1)[:1].expand(B_g, S_t * Fp_t)
+                else:
+                    t_noisy = t_noisy.to(temb.device).reshape(B_g, -1)
+                    if t_noisy.shape[1] != S_t * Fp_t:
+                        t_noisy = t_noisy[:, None, :].expand(B_g, S_t, Fp_t).reshape(B_g, S_t * Fp_t)
+                tactile_noisy_temb, tactile_noisy_ts_proj = self._time_embed(
+                    t_noisy, Hp_t * p_h, Wp_t * p_w,
+                    dtype=latent_hidden_states.dtype, action_mode=False)
+                temb = torch.cat([temb, tactile_noisy_temb], dim=1)          # [video | gt_noisy]
+                timestep_proj = torch.cat([timestep_proj, tactile_noisy_ts_proj], dim=1)
             else:
-                t_noisy = t_noisy.to(temb.device).reshape(B_g, -1)
-                if t_noisy.shape[1] != S_t * Fp_t:
-                    t_noisy = t_noisy[:, None, :].expand(B_g, S_t, Fp_t).reshape(B_g, S_t * Fp_t)
-            tactile_noisy_temb, tactile_noisy_ts_proj = self._time_embed(
-                t_noisy, Hp_t * p_h, Wp_t * p_w,
-                dtype=latent_hidden_states.dtype, action_mode=False)
-            temb = torch.cat([temb, tactile_noisy_temb], dim=1)          # [video | gt_noisy]
-            timestep_proj = torch.cat([timestep_proj, tactile_noisy_ts_proj], dim=1)
-        else:
-            # tactile block = gt_clean condition -> timestep 0 (legacy behaviour).
-            tactile_clean_ts = torch.zeros(B_g, S_t * Fp_t, device=temb.device)
-            tactile_temb, tactile_ts_proj = self._time_embed(
-                tactile_clean_ts, Hp_t * p_h, Wp_t * p_w,
-                dtype=latent_hidden_states.dtype, action_mode=False)
-            temb = torch.cat([temb, tactile_temb], dim=1)
-            timestep_proj = torch.cat([timestep_proj, tactile_ts_proj], dim=1)
+                # tactile block = gt_clean condition -> timestep 0 (legacy behaviour).
+                tactile_clean_ts = torch.zeros(B_g, S_t * Fp_t, device=temb.device)
+                tactile_temb, tactile_ts_proj = self._time_embed(
+                    tactile_clean_ts, Hp_t * p_h, Wp_t * p_w,
+                    dtype=latent_hidden_states.dtype, action_mode=False)
+                temb = torch.cat([temb, tactile_temb], dim=1)
+                timestep_proj = torch.cat([timestep_proj, tactile_ts_proj], dim=1)
 
         latent_hidden_states = self._run_main_blocks(
             latent_hidden_states, text_hidden_states, timestep_proj, temb,

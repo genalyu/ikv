@@ -2594,6 +2594,12 @@ class TWAM_Server:
                         'observation_flag': flags}
             input_dict['action_res_lst']['noisy_latents'][:, ~self.
                                                           action_mask] *= 0
+        if hasattr(self.job_config, 'tactile_keys') and not self.job_config.tactile_keys:
+            for branch in input_dict.values():
+                if isinstance(branch, dict):
+                    if any(k.startswith('tactile_') for k in branch):
+                        raise ValueError("RGB-only configuration contains tactile inputs")
+                    branch['rgb_only'] = True
         return input_dict
 
     def _encode_obs(self, obs):
