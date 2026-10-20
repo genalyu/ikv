@@ -24,9 +24,15 @@ def test_including_observed_clear_rolls_back_all_layers(global_policy):
     assert_cache_equal(before,cache_snapshot(model))
     if policy is not None: assert_snapshot_equal(state,policy.snapshot())
 
-def test_dense_cold_rebuilds_seed_at_zero_then_preserves_history():
+@pytest.mark.parametrize("rgb_only", [False, True])
+def test_dense_cold_rebuilds_seed_at_zero_then_preserves_history(rgb_only):
     server,captured=_kv_lifecycle_server(sparse=False)
     server.job_config.kv_cache_policy="global"
+    if rgb_only:
+        server.job_config.tactile_keys=[]
+        def forbidden_tactile(obs):
+            raise AssertionError("RGB-only grounding invoked tactile encoder")
+        server._encode_tactile_obs=forbidden_tactile
     calls=[]
     server.transformer.clear_pred_cache=lambda name,**kw: calls.append(kw)
     server._init_kv_index=None

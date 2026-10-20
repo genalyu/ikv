@@ -3210,7 +3210,11 @@ class TWAM_Server:
                     "action frame after the seed")
             action_model_input = action_model_input[:, :, 1:]
         action_model_input = action_model_input.to(latent_model_input)
-        tactile_latents = self._encode_tactile_obs(obs)
+        tactile_latents = (
+            self._encode_tactile_obs(obs)
+            if (not hasattr(self.job_config, 'tactile_keys') or self.job_config.tactile_keys)
+            else None
+        )
 
         # Diagnostic only: compare the last generated tactile chunk with the
         # newly observed tactile, without changing the grounding inputs.
