@@ -983,6 +983,12 @@ class MoTBackbone(nn.Module):
                 f"slice order {names} must equal expert order {self.expert_names}"
             )
 
+        # Empty inference streams have no tokens or cache entries. Do not execute
+        # disabled experts (which may deliberately remain on CPU). Training keeps
+        # its existing zero-token parameter participation.
+        if not self.training:
+            slices = [(name, s, e) for name, s, e in slices if e > s]
+
         # 1. split + per-expert narrow projection / modulation / text / rope
         streams, mod, text, rope_e, seg_len = {}, {}, {}, {}, {}
         for name, s, e in slices:

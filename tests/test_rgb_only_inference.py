@@ -13,7 +13,7 @@ def test_rgb_only_video_and_action(action_mode):
     inp = dict(noisy_latents=x, timesteps=torch.zeros(1,1),
                grid_id=torch.zeros(1,4,4,dtype=torch.long),
                text_emb=torch.randn(1,3,8), rgb_only=True)
-    with patch.object(model, "_encode_tactile_condition", side_effect=AssertionError("tactile invoked")):
+    with patch.object(model.mot.experts["tactile"], "embed_in", side_effect=AssertionError("inactive expert invoked")), patch.object(model, "_encode_tactile_condition", side_effect=AssertionError("tactile invoked")):
         with torch.no_grad():
             out = model(inp, action_mode=action_mode, cache_name=None)
     assert torch.isfinite(out).all()
