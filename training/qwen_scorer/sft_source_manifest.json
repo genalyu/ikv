@@ -1,0 +1,29 @@
+{
+  "description": "Snapshot of existing running SFT source; portable train marker and quality-filter CLI are documented changes.",
+  "source_sha256": {
+    "activation_offload.py": "9eaa2a096fd224ef26171ae9c683f96fa095d3b6bd35787b70a1be96741bd574",
+    "autotune_buckets.py": "4f7ac6c4389667e4cdce5b30ef543e743fb47cc961fbecc5c5ed0334385ea2d1",
+    "autotune_memory.py": "77c4e02f4e223d82991e19885b9725271c23393d68e3eabae6b2174993699a42",
+    "balanced_sampler_candidate.py": "b82635f94dd7ffc8510a555f21d8b0e6d31f5aec8f55a6d4199d8b107490cac3",
+    "bounded_delta.py": "15019d46b7f29f74a6a14904bab1dd3169aaa09c961130445fa813311af8e7f3",
+    "common.py": "96120e7006a90951fc68f03dddb96c90335c119c12e5f6b571befe48bf50c19c",
+    "context_config.py": "2db2f89b002fc6fbd1d8c01c7ce5a47fa11be06cbbf2a5ffb5a6024cac061bf7",
+    "data.py": "d62ed32465f19243c1dffee3ef91736fbf7f9bc45697a2fb6e03c0627569d207",
+    "export_dataset.py": "6f5cad07534af69062bc616e6363f6800e3b6a9ee2dbd03adaf372353657414e",
+    "filter_quality.py": "1a5cb36a0e3558a6fb11c273ae361154ab7589c6986a872b1571262eefae6f41",
+    "full_history_sampler.py": "7bc7811de1bebfa41677e4ae37deed9cd3a567b825116acb05a4a88eea87e442",
+    "gradient_sync.py": "0ff7a0e976f0e6d5ce68d4fac581f2d8d0d7f9e9806ec5a538ae795851137174",
+    "grouped_checkpoint.py": "11f9fc50b2135d3aec1a24f70405e3fb8e29e31f19165146e7a8cc4a8f1b1507",
+    "infer.py": "196699294fbdf1778d2d23002fe6cf36a67394dc21b302460280eee982d75836",
+    "mlp_chunking.py": "002d8bf334cd5a31d4755d5595564080eb59ad0b67ddda0b980a20e2c13285b9",
+    "mlp_remat_candidate.py": "aadbca0ce1dba066046b784014cea7162c8fb5471fe5ef375d881fedba853cd8",
+    "numerics.py": "98a1a4b2bcd791b0fe7bd3422dd388ed4c42cb17bd063a6534e7fd56ceed842a",
+    "prepare_rgb.py": "3dee137281d2fdd717437c9b3b85513daf36f4cb08fd54eb43781699f2679f2e",
+    "resume_position.py": "98da66af6f44f4471708f4a523ab9dc873615d742b51c50ba0d556c8d3955062",
+    "segmented_delta.py": "73a6c5504a2dc33f09abd4e893bd4f4e981d12b4f70587ec05f523040c338a54",
+    "train.py": "14980d80c241c492084fd7685dd33526bdd69f8969a97000a9f19611807fd9bd",
+    "vision_chunking.py": "1ca458f6bd09433bc77cab5af4debf2f5c10082450fbee6133b969a9de006561",
+    "vision_patch_linear.py": "3a60c5a6a2be1a57630577c217d0430d3ba6c999aa2f8c2601d624cc0fac08de",
+    "audit_lengths.py": "b42409d06abc5de133782a7c0d7d374d567081a92d7723fac5b166c3b1d5568e"
+  }
+}

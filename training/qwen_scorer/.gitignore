@@ -1,0 +1,6 @@
+outputs/
+dataset/
+logs/
+*.safetensors
+*.npy
+*.npz

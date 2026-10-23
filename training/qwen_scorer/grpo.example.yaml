@@ -1,0 +1,30 @@
+# Copy outside the repository and fill checkpoint/config/manifest paths.
+qwen_model: /path/to/qwen35-base
+sft_checkpoint: /path/to/completed-sft-checkpoint
+n0_checkpoint: /path/to/sparse-checkpoint/transformer
+# Python module exposing the ORIGINAL task Trainer config, including norms.
+n0_config: task_config:cfg
+manifest: /path/to/aligned-grpo-train.jsonl
+output: /path/to/new-grpo-run
+qwen_device: cuda:0
+n0_device: cuda:1
+qwen_attention: sdpa
+group_size: 4
+gradient_accumulation_frames: 4
+budget_choices:
+  - [2816, 512, 768]
+# Order: video, action, tactile. Replace scales with fixed calibration statistics.
+reward_weights: [1.0, 1.0, 1.0]
+reward_scales: [1.0, 1.0, 1.0]
+reward_std_floor: 0.0001
+invalid_margin: 1.0
+beta: 0.01
+clip: 0.2
+learning_rate: 0.000001
+max_grad_norm: 1.0
+max_new_tokens: 4096
+max_length: 524288
+epochs: 1
+max_updates: 2
+save_every: 10
+seed: 42
