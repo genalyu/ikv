@@ -316,3 +316,5 @@ cross-entropy loss; their absolute values are not directly comparable even
 when both are kept in the same project. Compare equivalent downstream quality
 and costs. `WANDB_STATUS.json` and `wandb-bridge/state.json` record upload state;
 the CPU uploader needs monitoring independently of the GPU queue.
+
+The CPU W&B bridge retries transient shared-filesystem pipeline snapshot reads. Missing or partially written snapshots defer that poll without resetting upload cursors or interrupting GPU jobs. Persistent permission errors remain fatal. Resume with the same state directory and run IDs.

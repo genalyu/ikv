@@ -1,10 +1,22 @@
 """CPU-side live W&B uploader for parallel scorer experiments.
 Reads durable JSON logs; does not import models or modify training processes.
 """
-import argparse,fcntl,hashlib,json,os,signal,socket,time
+import argparse,errno,fcntl,hashlib,json,os,signal,socket,time
 from pathlib import Path
 
 SPECS=[("0.8B","small"),("0.8B","medium"),("2B","small"),("2B","medium")]
+def read_pipeline_snapshot(path, attempts=5):
+    """Retry transient shared-filesystem visibility and partial JSON writes."""
+    for attempt in range(attempts):
+        try:
+            return json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            if isinstance(error, OSError) and error.errno not in (errno.ENOENT, errno.ESTALE, errno.EIO):
+                raise
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+
 def rows(path):
     if not Path(path).exists():return []
     result=[]
@@ -110,7 +122,14 @@ def main():
     save();print(json.dumps(dict(event="online",project=a.project,group=group)),flush=True)
     try:
         while not stop[0]:
-            pipeline=json.loads((root/"PIPELINE_STATUS.json").read_text())
+            try:
+                pipeline=read_pipeline_snapshot(root/"PIPELINE_STATUS.json")
+            except (OSError, json.JSONDecodeError) as error:
+                if isinstance(error, OSError) and error.errno not in (errno.ENOENT, errno.ESTALE, errno.EIO):
+                    raise
+                print(json.dumps(dict(event="pipeline_snapshot_unavailable",error=str(error),time=time.time())),flush=True)
+                time.sleep(a.poll)
+                continue
             for size,preset in SPECS:
                 key="qwen"+size+"-"+preset;run=runs[key];s=state["runs"][key];folder=root/"runs"/key
                 history=rows(folder/"metrics.jsonl")
