@@ -1,0 +1,19 @@
+# Replace all placeholders; feature packets must have explicit native-KV maps.
+checkpoint: RUN/scorer-0.pt
+manifest: DATA/rl-aligned.jsonl
+output: RUN/parallel-rl-new
+device: cuda:0
+n0_device: cuda:1
+n0_config: n0_twam.configs.twam_posttrain_cfg:twam_posttrain_cfg
+n0_checkpoint: WEIGHTS/n0-twam-sparse
+reward_weights: [1.0, 1.0, 1.0]
+# Calibrate on held-out FM losses; these are placeholders, not calibrated values.
+reward_scales: [1.0, 1.0, 1.0]
+budget_choices: [[1024, 256, 512], [2048, 256, 1024]]
+group_size: 4
+gradient_accumulation_frames: 4
+learning_rate: 0.00001
+reference_logit_weight: 0.01
+epochs: 1
+max_updates: 1000
+seed: 42

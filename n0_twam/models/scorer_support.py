@@ -26,11 +26,17 @@ def apply_scorer_support(plan, memory, spec):
         raise ValueError("History budgets must sum to the fixed group capacity")
     rank_scores = memory["rows"]["world_time_id"].float().clone()
     rank_scores[video] = scores
+    if "tactile_scores" in spec:
+        tactile = ((seq == 0) & clean & (kind == 2)).nonzero().flatten()
+        values = torch.as_tensor(spec["tactile_scores"], device=seq.device, dtype=torch.float32)
+        if values.shape != tactile.shape or not torch.isfinite(values).all():
+            raise ValueError("Scores must cover the exact clean-tactile token layout")
+        rank_scores[tactile] = values
     selected = torch.zeros_like(clean)
     for modality, budget in enumerate(budgets):
         eligible = (historical & (kind == modality)).nonzero().flatten()
-        # Stable sequence-address tie breaking. Action/tactile remain recency
-        # controls until the scorer's schema includes these modalities.
+        # Stable sequence-address tie breaking. Action stays recency; tactile
+        # stays recency unless explicit aligned tactile scores are supplied.
         order = torch.argsort(rank_scores[eligible], descending=True, stable=True)
         selected[eligible[order[:budget]]] = True
     result = dict(plan, noisy=plan["noisy"].clone())

@@ -85,7 +85,7 @@ class FMReward:
         return prepared
 
     @torch.no_grad()
-    def evaluate(self, prepared, video_scores, budgets):
+    def evaluate(self, prepared, video_scores, budgets, tactile_scores=None):
         case = deepcopy(prepared)
         frames = case["latent_dict"]["targets"].shape[2]
         config = case["ikv_training"]
@@ -95,6 +95,8 @@ class FMReward:
                 ("video_capacity","action_capacity","tactile_capacity"), budgets))
         config["scorer_query"] = dict(target_phase=2*(frames-1),
                                      video_scores=video_scores, budgets=list(budgets))
+        if tactile_scores is not None:
+            config["scorer_query"]["tactile_scores"] = tactile_scores
         # Capacity belongs to the historical pool; simultaneous noisy tokens are
         # required inputs and are not counted as historical retained slots.
         with torch.autocast(device_type=self.trainer.device.type,
