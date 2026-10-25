@@ -289,3 +289,30 @@ python -m training.parallel_scorer.profile_encoders --model MODEL \
 Choose models using downstream quality, latency by history length, encoding
 cost, training GPU hours, peak memory and cache size together. Teacher MAE alone
 does not establish that a larger encoder or interaction network is preferable.
+
+
+## Live W&B comparison
+
+`wandb_bridge.py` uploads durable logs from a CPU-only authenticated host into a
+single project. It creates four named model runs in one comparison group and a
+separate shared-preencoding/hardware run. It backfills existing metrics, follows
+new rows every five seconds, and resumes deterministic run IDs after restarting.
+It does not modify or restart the GPU training processes.
+
+```bash
+python -m training.parallel_scorer.wandb_bridge --root RUN_ROOT \
+  --entity ENTITY --project PROJECT --poll 5
+```
+
+Model runs expose encoder size, interaction preset, parameter count and common
+training settings. Metrics include score loss, held-out teacher MAE, update/data
+time, cumulative training GPU hours and peak VRAM. Inference profiling produces
+p50/p95 curves against history token count and a latency table. Encoder costs
+and final quality are uploaded when their reports become available. Shared
+preencoding is accounted once in the infrastructure run.
+
+The score-regression/ranking loss differs from the original full-Qwen JSON
+cross-entropy loss; their absolute values are not directly comparable even
+when both are kept in the same project. Compare equivalent downstream quality
+and costs. `WANDB_STATUS.json` and `wandb-bridge/state.json` record upload state;
+the CPU uploader needs monitoring independently of the GPU queue.
