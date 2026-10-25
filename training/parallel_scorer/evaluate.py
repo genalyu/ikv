@@ -2,7 +2,7 @@
 import argparse,json,time
 from pathlib import Path
 import torch
-from .data import records,load_packet,arguments
+from .data import records,load_record,arguments
 from .model import load_scorer
 
 def metrics(pred,target,k):
@@ -28,7 +28,7 @@ def main():
     rows=[]
     with torch.inference_mode():
         for r in records(a.manifest):
-            packet=load_packet(r["feature_path"],info["encoder_revision"])
+            packet=load_record(r,info["encoder_revision"])
             args=arguments(packet,a.device)
             if a.device.startswith("cuda"):torch.cuda.synchronize()
             start=time.perf_counter()

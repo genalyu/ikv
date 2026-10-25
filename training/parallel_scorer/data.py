@@ -55,3 +55,10 @@ def regression_loss(logits,y,mask=None,rank_weight=.1,pairs=4096):
 def check_disjoint(train,validation):
     a={r["episode_id"] for r in train};b={r["episode_id"] for r in validation}
     if a & b:raise ValueError("Episode leakage between train and validation")
+
+
+def load_record(record,revision=None):
+    if "episode_features" in record:
+        from .episode_cache import episode_packet
+        return episode_packet(record,revision)
+    return load_packet(record["feature_path"],revision)

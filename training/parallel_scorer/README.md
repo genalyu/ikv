@@ -122,9 +122,9 @@ Repeat with `--preset medium`. For end-to-end encoder tuning, pass original raw
 manifests, `--raw-model MODEL --train-vision`, optionally `--train-text`.
 Do not feed cached features to a trainable encoder. Encoder parameters have a
 separate learning rate. SFT writes scorer, changed encoder components and optimizer
-states each epoch; automatic resume is not implemented. For an updated encoder,
+states at checkpoints and epoch boundaries; resume is supported. For an updated encoder,
 export features using `--encoder-state RUN/encoders-0.pt` and revision
-`BASE_HASH:epoch-0`, matching that epoch's scorer checkpoint. Pin the original base.
+`BASE_HASH:update-N`, matching that epoch's scorer checkpoint. Pin the original base.
 
 The historical teacher data is RGB-only. It supplies no tactile labels.
 The feature-packet/model/runtime interfaces support tactile features, but actual
@@ -227,3 +227,65 @@ Report success by task, failure modes, scorer p50/p95, feature encoding, KV gath
 and complete action-loop latency separately. Record encoder/scorer/Sys1 revisions
 and simulator/deployment adapter versions. Unit tests and random-weight speed
 measurements do not establish task performance.
+
+
+## Full-dataset experiment support
+
+For frozen encoders, `episode_cache.py` writes each episode's observed RGB
+features once, in exact BF16 bit storage, and constructs query views by slicing
+only the causal prefix. Train and validation retain the original episode split;
+test data is not required for preparation or tuning. This avoids repeatedly
+encoding and storing overlapping prefixes. Interrupted preparation resumes at
+episode boundaries with `--resume`; it never truncates long queries.
+
+```bash
+python -m training.parallel_scorer.episode_cache \
+  --manifests DATA/train.ready.jsonl DATA/validation.ready.jsonl \
+  --model MODEL --revision WEIGHT_HASH:linear-patch-v1 \
+  --output DATA/episode-features --image-batch 96
+python -m training.parallel_scorer.train \
+  --manifest DATA/episode-features/train.ready.features.jsonl \
+  --validation DATA/episode-features/validation.ready.features.jsonl \
+  --revision WEIGHT_HASH:linear-patch-v1 --preset small \
+  --output RUN/small --checkpoint-steps 25
+# Same command with --resume restores model, optimizer, cursor and RNG state.
+```
+
+The encoder reuses the existing algebraically equivalent full-patch linear
+projection optimization from the Qwen SFT implementation. Original weight names
+and shapes remain unchanged. BF16 convolution/GEMM rounding can differ; record
+the implementation in the encoder revision and rebuild features when switching.
+Do not mix old feature files produced by a different pipeline. CPU FP32 tests
+verify projection output and gradient equivalence; BF16 is not claimed bit-exact.
+
+Training now saves atomic last-state checkpoints and handles SIGTERM at the next
+optimizer boundary. Configuration and manifest hashes are checked on resume.
+`last-state.pt` restores training; `last-scorer.pt`, `best-scorer.pt` and epoch
+scorer checkpoints serve inference. Changed encoder states are saved alongside
+their matching scorer. A trainable encoder revision includes the update number.
+
+Metrics record data preparation time, optimizer-update elapsed time, token count,
+gradient norm, cumulative training wall time, GPU allocation hours and peak
+allocated GPU memory. Validation records elapsed time over the full validation
+manifest. GPU hours include CPU/data waits within the training phase and are not
+a measure of active CUDA-kernel time. Checkpoint/process overhead and full-stage
+wall time should additionally be captured by the experiment launcher.
+
+`profile.py` measures real-feature inference across history-length quantiles:
+first packet I/O, H2D transfer, scorer, modality selection and selected-index
+return. It reports p50/p95 over repeats. `profile_encoders.py` separately measures
+new three-camera RGB encoding and cached/uncached task encoding. Neither measures
+Sys1 KV fetch or closed-loop control. Report those separately before deployment.
+
+```bash
+python -m training.parallel_scorer.profile --checkpoint RUN/small/best-scorer.pt \
+  --manifest DATA/episode-features/validation.ready.features.jsonl \
+  --output RUN/small/latency.json
+python -m training.parallel_scorer.profile_encoders --model MODEL \
+  --revision WEIGHT_HASH:linear-patch-v1 --manifest DATA/validation.ready.jsonl \
+  --output RUN/encoder-latency.json
+```
+
+Choose models using downstream quality, latency by history length, encoding
+cost, training GPU hours, peak memory and cache size together. Teacher MAE alone
+does not establish that a larger encoder or interaction network is preferable.

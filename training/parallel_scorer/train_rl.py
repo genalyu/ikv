@@ -9,7 +9,7 @@ from pathlib import Path
 from copy import deepcopy
 import torch
 from .model import load_scorer,save_scorer
-from .data import load_packet,arguments
+from .data import load_record,arguments
 from .rl import sample_modalities,path_logprob,group_loss
 from training.qwen_scorer.grpo.train import build_reward
 
@@ -84,7 +84,7 @@ def main():
         for begin in range(0,len(rows),accumulation):
             group=rows[begin:begin+accumulation];optimizer.zero_grad(set_to_none=True)
             for r in group:
-                packet=load_packet(r["feature_path"],info["encoder_revision"])
+                packet=load_record(r,info["encoder_revision"])
                 args=arguments(packet,device)
                 budgets=list(rng.choice(cfg["budget_choices"])) # video, action, tactile
                 raw=torch.load(r["n0_batch"],map_location="cpu",weights_only=True)

@@ -11,7 +11,7 @@ from .data import targets,validate_packet
 
 class QwenEncoders(nn.Module):
     def __init__(self,path,revision,device="cuda:0",train_vision=False,train_text=False,
-                 image_batch=8):
+                 image_batch=8,linear_patch=True):
         super().__init__()
         from transformers import AutoProcessor,Qwen3_5ForConditionalGeneration
         if not revision:raise ValueError("Pinned encoder revision required")
@@ -19,6 +19,9 @@ class QwenEncoders(nn.Module):
         base=Qwen3_5ForConditionalGeneration.from_pretrained(path,local_files_only=True,
                dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32)
         self.core=base.model.to(device)  # drop output vocabulary head
+        if linear_patch:
+            from training.qwen_scorer.vision_patch_linear import enable_linear_patch_embed
+            enable_linear_patch_embed(self.core.visual)
         self.core.requires_grad_(False)
         self.core.visual.requires_grad_(train_vision)
         self.core.language_model.requires_grad_(train_text)
