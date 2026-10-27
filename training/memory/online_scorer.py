@@ -10,7 +10,7 @@ from PIL import Image
 import torch
 from .selection import VERSION, scorer_to_native
 from .sidecar import verify_binding, sha256
-from .feature_cache import CANONICAL_IMAGE_BATCH
+from .feature_cache import CANONICAL_IMAGE_BATCH,encoder_environment
 
 
 class ObservedPrefix:
@@ -72,6 +72,7 @@ def main():
     args=p.parse_args()
     binding=verify_binding(dict(binding=args.binding))
     if binding.get("encoder_image_batch")!=CANONICAL_IMAGE_BATCH:raise ValueError("Online scorer requires canonical one-image encoder plans")
+    if binding.get("encoder_environment")!=encoder_environment():raise ValueError("Encoder runtime differs from native plans; validate a runtime migration first")
     if binding["chunk_size"]!=2:raise ValueError("Only native two-frame Memory serving is supported")
     for name,digest in binding["encoder_sha256"].items():
         if sha256(Path(binding["encoder"])/name)!=digest:raise ValueError("Encoder changed after binding")

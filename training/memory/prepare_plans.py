@@ -11,7 +11,7 @@ import time
 import torch
 from .selection import VERSION, replay, scorer_to_native
 from .sidecar import sha256, verify_encoder
-from .feature_cache import episode_features, extract, CANONICAL_IMAGE_BATCH
+from .feature_cache import episode_features, extract, CANONICAL_IMAGE_BATCH,encoder_environment
 from training.parallel_scorer.encoders import QwenEncoders
 from training.parallel_scorer.runtime import RuntimeScorer
 
@@ -40,7 +40,7 @@ def main():
         input_hashes[task]=sha256(Path(campaign["task_config_root"])/f"{task}.json")
     binding=dict(version=VERSION,chunk_size=2,encoder_sha256=encoder_hashes,inputs_sha256=input_hashes,checkpoint=str(Path(a.checkpoint).absolute()),
         scorer_sha256=sha256(a.checkpoint),encoder=str(Path(a.encoder).absolute()),
-        encoder_revision=revision,encoder_image_batch=CANONICAL_IMAGE_BATCH,budgets=[3584,512],plan_root=str(out.absolute()),
+        encoder_revision=revision,encoder_image_batch=CANONICAL_IMAGE_BATCH,encoder_environment=encoder_environment(),budgets=[3584,512],plan_root=str(out.absolute()),
         campaign_sha256=sha256(a.campaign),prefix_sampling="native-VAE-anchor-RGB",
         rgb_contract="canonical-RGB-torch-bilinear-u8-round-v1")
     bp=out/"binding.json"

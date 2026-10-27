@@ -12,6 +12,12 @@ from .sidecar import sha256
 
 CANONICAL_IMAGE_BATCH = 1
 
+def encoder_environment():
+    from importlib.metadata import version
+    return dict(packages={name:version(name) for name in ["torch","transformers","numpy","pillow","av"]},
+        cuda=str(torch.version.cuda),capability=list(torch.cuda.get_device_capability()))
+
+
 def extract(video, anchors):
     wanted=set(map(int,anchors));images={}
     with av.open(str(video)) as reader:
@@ -47,7 +53,7 @@ def episode_features(root,episode,length,cameras,prompt,revision,encoder_hashes,
     from training.parallel_scorer import encoders
     from training.qwen_scorer import vision_patch_linear
     fps=float(json.loads((root/"meta/info.json").read_text())["fps"])
-    identity=dict(version="frozen-qwen-native-anchor-features-v1",encoder_revision=revision,
+    identity=dict(version="frozen-qwen-native-anchor-features-v1",encoder_revision=revision,encoder_environment=encoder_environment(),
         encoder_sha256=encoder_hashes,feature_code_sha256=sha256(__file__),encoder_code_sha256=sha256(encoders.__file__),
         patch_code_sha256=sha256(vision_patch_linear.__file__),dtype="bfloat16",image_batch=CANONICAL_IMAGE_BATCH,
         cameras=list(cameras),frame_ids=anchors.tolist(),prompt=prompt,source_fps=fps,
