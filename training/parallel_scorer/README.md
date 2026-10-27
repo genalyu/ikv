@@ -328,3 +328,14 @@ Frozen encoders are excluded. Existing small/medium presets are unchanged.
 Full histories, task cross-attention, loss and head dimension 64 are preserved.
 Compare using identical manifests, seed, learning rate, epochs and accumulation.
 These presets vary width and depth, not parameter count in isolation.
+
+## User-recorded visual formula baseline
+`recorded_formula.recorded_visual_formula` computes global recency +
+exp(-contact_duration/8) + observed/matched class recency, with threshold 0.9.
+Inputs are explicitly world-time steps, never implicitly seconds. Missing
+contact data may be evaluated as a declared no-contact assumption (duration 0,
+constant contribution 1). DINO cosine only assigns/gates a class; it is not a
+positive score term. Persistence support is not added. This standalone offline
+baseline does not alter the serving retention policy or any training model.
+An offline raw-frame expansion must declare its mapping and distinguish it from
+an exact native KV replay. The separate alpha/beta/gamma mixture is not applied.
