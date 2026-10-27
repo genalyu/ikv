@@ -318,3 +318,13 @@ and costs. `WANDB_STATUS.json` and `wandb-bridge/state.json` record upload state
 the CPU uploader needs monitoring independently of the GPU queue.
 
 The CPU W&B bridge retries transient shared-filesystem pipeline snapshot reads. Missing or partially written snapshots defer that poll without resetting upload cursors or interrupting GPU jobs. Persistent permission errors remain fatal. Resume with the same state directory and run IDs.
+
+
+## Smaller interaction ablations
+Presets p1m/p5m/p8m/p13m use (width,layers,heads):
+(256,1,4), (384,2,6), (512,2,8), (512,3,8).
+Names refer to interaction blocks; projections and heads add trainable parameters.
+Frozen encoders are excluded. Existing small/medium presets are unchanged.
+Full histories, task cross-attention, loss and head dimension 64 are preserved.
+Compare using identical manifests, seed, learning rate, epochs and accumulation.
+These presets vary width and depth, not parameter count in isolation.

@@ -21,10 +21,18 @@ class ScorerConfig:
 
     @classmethod
     def preset(cls, name, **kwargs):
-        if name not in ("small", "medium"):
-            raise ValueError("preset must be small or medium")
-        return cls(**dict(dict(width=512, layers=4, heads=8) if name=="small"
-                          else dict(width=768, layers=6, heads=12), **kwargs))
+        presets = {
+            "p1m": dict(width=256, layers=1, heads=4),
+            "p5m": dict(width=384, layers=2, heads=6),
+            "p8m": dict(width=512, layers=2, heads=8),
+            "p13m": dict(width=512, layers=3, heads=8),
+            "small": dict(width=512, layers=4, heads=8),
+            "medium": dict(width=768, layers=6, heads=12),
+        }
+        if name not in presets:
+            raise ValueError("Unknown scorer preset: " + name)
+        return cls(**dict(presets[name], **kwargs))
+
 
 class Attention(nn.Module):
     def __init__(self, c):

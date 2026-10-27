@@ -132,3 +132,15 @@ def test_explicit_tactile_selection_preserves_action_and_early_phases():
     assert result["noisy"][2].nonzero().flatten().tolist()==[0,3,4]
     assert not result["noisy"][:2].any()
     assert torch.equal(result["clean"],plan["clean"])
+
+@pytest.mark.parametrize('name,low,high', [('p1m',1,2),('p5m',4,5),('p8m',7,9),('p13m',11,13)])
+def test_smaller_presets_budget_and_backward(name,low,high):
+    c=ScorerConfig.preset(name,vision_dim=12,text_dim=10,query_chunk=4)
+    m=ParallelScorer(c)
+    assert low*1e6 <= m.counts()['interaction'] <= high*1e6
+    assert c.width//c.heads == 64
+    _,args=setup(7)
+    loss=regression_loss(m(**args),torch.linspace(0,100,7))
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())
