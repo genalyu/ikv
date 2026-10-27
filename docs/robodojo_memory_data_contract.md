@@ -83,3 +83,47 @@ while grounding RGB arrives at floor(m*25/10). Test the actual deployed adapters
 as well as these arithmetic helpers; synthetic/instrumented adapters do not
 establish simulator success. Online scorer integration and measured cache
 selection parity remain separate from offline-plan validation.
+
+
+## Native frozen-scorer serving
+
+The optional Memory serving entry is training.memory.serve. It accepts an
+external JSON naming model, complete checkpoint directory, base_model, bundle,
+save_root, and (for LingBot) source_root. A scorer checkpoint also requires its
+binding and scorer_endpoint. The training memory_manifest.json owns camera
+order, action dimensions, normalization and scorer hash; incompatible or partial
+checkpoints fail before model loading. The bundle links the trained transformer
+and the recorded base VAE/tokenizer/text encoder.
+
+Run training.memory.online_scorer in the Qwen-compatible environment with
+--binding and --port; it binds localhost by default. Policy inference uses
+ScorerClient in its own environment. Only measured RGB VAE anchors enter the
+feature bank. Both clients pin the checkpoint hash and protocol. Prefix queries
+exclude current/future target frames, even if the feature bank has already
+received a later observed frame. Contextual scores are recalculated per prefix.
+
+FrozenMemoryRetention maps actual RoPE coordinates to native RGB/action IDs,
+then uses the same eviction function as offline plans. N0 attaches it to the
+existing shared MoT cache. LingBotCache overrides only slot allocation and keeps
+upstream attention arithmetic; temporary diffusion passes and failed model
+forwards restore every layer. A failed policy request requires episode reset,
+because the upstream LingBot VAE does not expose a transaction API.
+
+LingBot's websocket state payload is raw joint14, matching its original
+preprocess_action. That function expands it once into the model's thirty
+channels. Sending a pre-expanded thirty-channel state would map the controls
+twice and corrupt grounding. N0 receives observed EEF20 in its native contract.
+
+Configuration validation, CPU attention checks, full-model recorded-observation
+replay, XPolicyLab encoded-client debug, and simulator evaluation are distinct
+evidence. Record which passed. A replay must exercise actual budget overflow,
+compare native selected IDs to the offline plan, check streaming VAE parity,
+and check finite native actions. It does not measure task success.
+
+
+The Memory serving recipe records cold_seed_mode=free for both controls.
+The first action frame is denoised toward its measured-state training target
+and skipped by execution. The pinned LingBot server has a separate optional
+serving patch for this mode; its legacy zero-clamp default is unchanged.
+This shared boundary choice needs matched-control closed-loop evaluation and
+must not be attributed to scorer retention gains.
