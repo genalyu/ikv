@@ -1497,7 +1497,8 @@ class LatentLeRobotDataset(LeRobotDataset):
         pp = root / "data" / "chunk-000"
         npq = sum(1 for _ in pp.glob("*.parquet")) if pp.is_dir() else 0
         return {
-            "v": 3,
+            "v": 4,
+            "episode_selection": (root / "episode_selection.json").read_text() if (root / "episode_selection.json").exists() else None,
             "parquet": npq,
             "video_latents": nvid,
             "tactile_latents": ntac,
@@ -1549,11 +1550,24 @@ class LatentLeRobotDataset(LeRobotDataset):
         # and all ranks repeat it. Cache the validated valid-segment set keyed by
         # a data signature so subsequent launches/resumes skip the torch.load
         # pass. Build it once up front.
+        selection_file = Path(self.root) / "episode_selection.json"
+        selected_episodes = None
+        if selection_file.exists():
+            selected_episodes = json.loads(selection_file.read_text())["episode_indices"]
+            if (not selected_episodes or len(set(selected_episodes)) != len(selected_episodes)
+                    or any(type(v) is not int or v < 0 for v in selected_episodes)):
+                raise ValueError("Invalid explicit episode selection")
+            known = {int(v["episode_index"]) for v in self.meta.episodes.values()}
+            if not set(selected_episodes) <= known:
+                raise ValueError("Episode selection references missing episodes")
+            selected_episodes = set(selected_episodes)
         cached_valid = self._load_valid_seg_cache()
         out = []
         total = 0
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
+            if selected_episodes is not None and episode_index not in selected_episodes:
+                continue
             tasks = value["tasks"]
             action_config = value["action_config"]
             for acfg in action_config:

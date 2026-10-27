@@ -74,3 +74,28 @@ def test_encode_video_returns_provenance_from_the_actual_latent_count() -> None:
     assert (latent_frames, latent_height, latent_width) == (3, 1, 1)
     assert provenance["latent_anchor_indices"] == [0, 4, 8]
     assert provenance["latent_anchor_frame_ids"] == [0, 12, 24]
+
+
+def test_extracted_pixels_match_recorded_source_frame_ids(tmp_path):
+    import subprocess
+    # Lossless video, each frame encodes its source index in every pixel.
+    frames = np.stack([np.full((16, 16, 3), i * 7, dtype=np.uint8) for i in range(30)])
+    video = tmp_path / "indexed.mkv"
+    subprocess.run([ENCODER.ffmpeg.get_ffmpeg_exe(), "-v", "error", "-f", "rawvideo",
+                    "-pix_fmt", "rgb24", "-s", "16x16", "-r", "30", "-i", "pipe:0",
+                    "-c:v", "ffv1", str(video)], input=frames.tobytes(), check=True)
+    request = ENCODER.EpisodeRequest(0, 30, "test", video, tmp_path / "x.pth", 0., 1.)
+    for mode in ("area", "torch_bilinear"):
+        actual, ids = ENCODER.extract_episode_frames(request, 16, 16, 10, 30, resize_mode=mode)
+        assert ids == [0, 3, 6, 9, 12, 15, 18, 21, 24]
+        np.testing.assert_array_equal(np.stack(actual), frames[ids])
+    actual, ids = ENCODER.extract_episode_frames(request, 8, 8, 10, 30, resize_mode="torch_bilinear")
+    expected = torch.nn.functional.interpolate(torch.from_numpy(frames[ids]).float().permute(0,3,1,2),
+        size=(8,8), mode="bilinear", align_corners=False).permute(0,2,3,1).numpy()
+    np.testing.assert_array_equal(np.stack(actual), expected)
+
+
+def test_sampler_rejects_ambiguous_noninteger_ratio(tmp_path):
+    request = ENCODER.EpisodeRequest(0, 25, "test", tmp_path / "unused", tmp_path / "out", 0., 1.)
+    with pytest.raises(ValueError, match="integer"):
+        ENCODER.extract_episode_frames(request, 16, 16, 10, 25)

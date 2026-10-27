@@ -166,6 +166,7 @@ def prepare(task, stage, device, dry_run):
         "--video-keys",
         *task["robot"]["cameras"].values(),
     ]
+    rgb += ["--resize-mode", task.get("preprocessing", {}).get("rgb_resize_mode", "area")]
     tactile = [
         sys.executable,
         "script/encode_tactile_latent.py",

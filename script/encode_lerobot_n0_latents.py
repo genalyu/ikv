@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--target-fps", type=int, default=10)
+    parser.add_argument("--resize-mode", choices=["area", "torch_bilinear"], default="area")
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--max-sequence-length", type=int, default=512)
@@ -272,7 +273,36 @@ def extract_episode_frames(
     height: int,
     target_fps: int,
     ori_fps: int,
+    resize_mode: str = "area",
 ) -> tuple[list[np.ndarray], list[int]]:
+    if ori_fps < target_fps or target_fps <= 0 or ori_fps % target_fps:
+        raise ValueError("Exact causal sampling requires an integer source/target FPS ratio")
+    stride = ori_fps // target_fps
+    start_frame = request.start_timestamp * ori_fps
+    if abs(start_frame - round(start_frame)) > 1e-4:
+        raise ValueError("Episode start timestamp is not on the source frame grid")
+    if resize_mode == "torch_bilinear":
+        import av
+        import torch.nn.functional as F
+        ids = list(range(0, request.length, stride))
+        while len(ids) > 1 and len(ids) % 4 != 1:
+            ids.pop()
+        desired = {int(round(start_frame)) + i: i for i in ids}
+        frames = []
+        with av.open(str(request.source_video)) as container:
+            container.streams.video[0].thread_count = 2
+            for index, frame in enumerate(container.decode(video=0)):
+                if index in desired:
+                    rgb = torch.from_numpy(frame.to_ndarray(format="rgb24")).float().permute(2,0,1)[None]
+                    resized = F.interpolate(rgb, size=(height,width), mode="bilinear", align_corners=False)
+                    frames.append(resized[0].permute(1,2,0).numpy())
+                if len(frames) == len(ids):
+                    break
+        if len(frames) != len(ids):
+            raise RuntimeError("Video is shorter than declared episode frame grid")
+        return frames, ids
+    if resize_mode != "area":
+        raise ValueError("Unsupported RGB resize mode")
     ffmpeg_bin = ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_bin,
@@ -285,7 +315,8 @@ def extract_episode_frames(
         "-i",
         str(request.source_video),
         "-vf",
-        f"fps={target_fps},scale={width}:{height}:flags=area",
+        f"select=not(mod(n\\,{stride})),scale={width}:{height}:flags=area",
+        "-vsync", "0",
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -304,10 +335,12 @@ def extract_episode_frames(
         raise RuntimeError(f"No frames decoded for {request.source_video}")
 
     frames = np.frombuffer(raw, dtype=np.uint8).reshape(num_frames, height, width, 3).copy()
-    local_frame_ids = [
-        min(request.length - 1, int(round(i * ori_fps / target_fps)))
-        for i in range(num_frames)
-    ]
+    local_frame_ids = list(range(0, request.length, stride))
+    if len(local_frame_ids) != num_frames:
+        raise RuntimeError(
+            f"Decoded frame count {num_frames} differs from declared episode grid "
+            f"{len(local_frame_ids)}; refusing fabricated frame IDs"
+        )
 
     while len(frames) > 1 and len(frames) % 4 != 1:
         frames = frames[:-1]
@@ -493,6 +526,7 @@ def main() -> None:
                 height=args.height,
                 target_fps=args.target_fps,
                 ori_fps=ori_fps,
+                resize_mode=args.resize_mode,
             )
             (
                 flat_latent,
@@ -528,6 +562,8 @@ def main() -> None:
                 "text": request.prompt,
                 "frame_ids": list(local_frame_ids),
                 "temporal_provenance": temporal_provenance,
+                "frame_sampling_contract": "explicit-source-stride-v1",
+                "rgb_resize_mode": args.resize_mode,
                 "start_frame": 0,
                 "end_frame": int(request.length),
                 "fps": int(args.target_fps),

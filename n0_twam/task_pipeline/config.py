@@ -97,7 +97,7 @@ def load_task(path):
         )
     for owner, names in (
         (task, ("source",)),
-        (task["runtime"], ("work_root", "base_checkpoint", "model_path", "dino_model")),
+        (task["runtime"], ("work_root", "base_checkpoint", "model_path", "dino_model", "xpolicylab_root")),
     ):
         for key in names:
             if key in owner:
@@ -158,8 +158,9 @@ def training_config(task, mode, world_size, *, require_ready=True):
         p = paths(task)
         cfg.dataset_path = str(p["pool"] / "train")
         cfg.val_dataset_path = str(p["pool"] / "val")
-        cfg.val_dataset_path = None
-        cfg.val_interval = 1000000000
+        if not task.get("validation", {}).get("enabled", False):
+            cfg.val_dataset_path = None
+        cfg.val_interval = int(task.get("validation", {}).get("interval", 1000000000))
         cfg.save_root = str(p["runs"] / mode)
         cfg.per_repo_norm_stat = {child["name"]: item.norm_stat for child, item in zip(children, configs)}
         cfg.per_repo_semantic_provenance = {child["name"]: item.kv_semantic_provenance for child, item in zip(children, configs)}
@@ -280,7 +281,8 @@ def training_config(task, mode, world_size, *, require_ready=True):
     cfg.update(overrides)
     if task.get("rgb_only", False) and ikv:
         cfg.kv_retention.update(video_capacity=3584, action_capacity=512, tactile_capacity=0,
-            score_backend="formula", persistence_weight=1.0, contact_weight=0.0,
+            score_backend=task.get("features", {}).get("score_backend", "formula"),
+            persistence_weight=1.0, contact_weight=0.0,
             class_recency_weight=1.0, time_weight=0.0, visual_weight=0.0,
             query_weight=0.0, task_weight=1.0 if semantic_enabled else 0.0)
     return cfg
@@ -326,5 +328,9 @@ def conversion_identity(task):
             "allowed_quality_labels",
         )
     }
+    if task.get("format") == "robodojo_hdf5":
+        codec = Path(task["runtime"]["xpolicylab_root"]) / "utils/process_data.py"
+        fields["image_decode_contract"] = "xpolicylab-marker-aware-rgb-v1"
+        fields["image_decoder_sha256"] = hashlib.sha256(codec.read_bytes()).hexdigest()
     fields["source_inventory"] = source_inventory(task["source"])
     return fields
