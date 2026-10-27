@@ -35,6 +35,16 @@ class ObservedPrefix:
             self.frames.append(values.reshape(3,8,8,-1))
             self.digests.append(digest)
 
+    def score_history(self,history_prefix,observed_prefix):
+        """Condition on real observations; return only strictly historical candidates.
+
+        Prefixes are exclusive frame counts, not original RGB frame numbers.
+        Never append imagined/teacher-forced future targets as observations.
+        """
+        if not 0 <= history_prefix < observed_prefix <= len(self.frames):
+            raise ValueError("History must precede available observed context")
+        return self.score(observed_prefix)[:history_prefix*192]
+
     def score(self,n):
         if n<1 or n>len(self.frames):
             raise ValueError("Scorer cannot read unavailable observations")
@@ -86,6 +96,9 @@ def main():
                     data=base64.b64decode(req["images"],validate=True)
                     images=np.load(io.BytesIO(data),allow_pickle=False)
                     sessions[sid].append(int(req["start"]),images);out=dict(frames=len(sessions[sid].frames))
+                elif op=="score_history":
+                    out=dict(scores=sessions[sid].score_history(
+                        int(req["history_prefix"]),int(req["observed_prefix"])).tolist())
                 elif op=="score":out=dict(scores=sessions[sid].score(int(req["prefix"])).tolist())
                 else:raise ValueError("Unknown operation")
                 payload=json.dumps(out,allow_nan=False).encode();code=200

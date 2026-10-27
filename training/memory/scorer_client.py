@@ -45,3 +45,10 @@ class ScorerClient:
 
     def score(self,prefix):
         return torch.tensor(self.call("score",prefix=prefix)["scores"],dtype=torch.float32)
+
+    def score_history(self,history_prefix,observed_prefix):
+        """Explicit real-observation conditioning; legacy score remains causal-prefix only."""
+        if not 0 <= history_prefix < observed_prefix <= self.next_frame:
+            raise ValueError("History must precede available observed context")
+        return torch.tensor(self.call("score_history",history_prefix=history_prefix,
+            observed_prefix=observed_prefix)["scores"],dtype=torch.float32)

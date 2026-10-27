@@ -1,0 +1,11 @@
+# Historical scoring conditioned on the current observation
+
+Protocol: `history-given-current-v1`. Prompt: `training/memory/prompts/history_given_current_v1.txt`.
+
+The full real current observation is guaranteed to the policy. The teacher scores only historical incremental value, not the value of retaining current pixels. Requests must describe candidates as `[0,current_frame)` while supplying context `[0,current_frame]`; do not reuse the legacy request text that calls every frame a candidate. A new label tensor has `current_frame` historical frames. Current features stay in attention context but have no target, ranking loss, or Top-k eligibility. Legacy labels must not be relabelled as this protocol, and padding current scores with zero must not create supervised targets.
+
+`ObservedPrefix.score_history(history_prefix, observed_prefix)` and the matching client/HTTP operation provide an opt-in boundary. Prefixes count native observed anchors exclusively, not original RGB frames. All cached features through `observed_prefix` condition the interaction scorer; only the first `history_prefix * 192` native-ordered scores are returned. Callers must map these to currently live historical KV IDs before selection. `history_prefix < observed_prefix`; unavailable context fails closed. Existing `score(prefix)`, training plans and deployed retention bindings are unchanged.
+
+The Qwen image encoder runs once per newly appended real RGB triplet. Subsequent scoring reuses these frozen features; interaction scores are recomputed for the chosen context. This is NOT reuse of N0/LingBot VAE latents, which have a different feature space. An adapter/new training would be required for that. No scorer parameter shapes change.
+
+This patch supplies the prompt and explicit scoring interface, not a migrated dataset, retrained checkpoint, or switched production policy. Grounding real observations may use the new interface only after plans/serving bindings are aligned. Speculative video/action prediction must not receive unobserved target frames. The existing checkpoint can execute this interface, but improved memory decisions require validation; architecture compatibility is not evidence of learned use of current context.
