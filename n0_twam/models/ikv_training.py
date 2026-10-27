@@ -269,6 +269,13 @@ def build_ikv_support_plan(memory, device, *, return_groups=False):
     Attention-query usage must be disabled for this path; otherwise the mask
     would depend on a model pass and could not be prepared before training.
     """
+    if "causal_memory_plan" in memory["config"]:
+        if return_groups:
+            raise ValueError("Memory plans currently require compact_attention=False")
+        from training.memory.selection import support_from_plan
+        config = memory["config"]
+        config["sampled_capacity"] = config["capacity"]
+        return support_from_plan(memory["layout"], config["causal_memory_plan"], config["capacity"])
     if "scorer_query" in memory["config"]:
         if return_groups:
             raise ValueError("Scorer reward path requires compact_attention=False")

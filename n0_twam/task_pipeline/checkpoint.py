@@ -11,11 +11,20 @@ from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_di
 
 
 class TrainingState:
-    def __init__(self, trainer):
+    def __init__(self, trainer, optimizer_keys=None):
         self.trainer = trainer
+        self.optimizer_keys = optimizer_keys
 
     def state_dict(self):
         model, optim = get_state_dict(self.trainer.transformer, self.trainer.optimizer)
+        if self.optimizer_keys is not None:
+            # PyTorch initializes Adam slots for every parameter on a fresh
+            # optimizer, whereas save after backward omits never-used branches.
+            # Preserve those as genuinely uninitialized states (not step=1 zero
+            # moments). Partial fields of an active state still fail DCP load.
+            for name in optim["state"]:
+                if name not in self.optimizer_keys:
+                    optim["state"][name] = {}
         return {"model": model, "optimizer": optim}
 
     def load_state_dict(self, state):
@@ -99,8 +108,14 @@ def load_training_state(trainer, directory):
             raise ValueError(
                 f"Resume {k} mismatch; exact resume requires same task, mode, GPU count and IKV training settings"
             )
+    reader = dcp.FileSystemReader(directory / "distributed")
+    metadata = reader.read_metadata()
+    optimizer_keys = {
+        path[3] for path in metadata.planner_data.values()
+        if len(path) >= 5 and tuple(path[:3]) == ("training", "optimizer", "state")
+    }
     dcp.load(
-        {"training": TrainingState(trainer)}, checkpoint_id=directory / "distributed"
+        {"training": TrainingState(trainer, optimizer_keys)}, storage_reader=reader
     )
     state = torch.load(
         directory / f"rank_{trainer.config.rank}.pt",

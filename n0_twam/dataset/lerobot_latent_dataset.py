@@ -223,7 +223,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.q99 = np.array(_norm_stat['q99'], dtype='float')[None]
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
-                columns=['action'],
+                columns=['action', 'observation.state'] if getattr(config, 'memory_seed_observation', False) else ['action'],
                 output_all_columns=False
             )
         self._hf_tactile_view = None
@@ -1591,6 +1591,10 @@ class LatentLeRobotDataset(LeRobotDataset):
 
                 if check_statu:
                     out.append(cur_meta)
+        if selected_episodes is not None and getattr(getattr(self, "config", None), "require_selected_episodes", False):
+            present = {int(m["episode_index"]) for m in out}
+            if present != selected_episodes or len(out) != total:
+                raise ValueError("Selected Memory episodes/segments are incomplete; refusing partial training")
         self.new_metas = out
         if cached_valid is None:
             self._save_valid_seg_cache({
@@ -1808,11 +1812,17 @@ class LatentLeRobotDataset(LeRobotDataset):
             )
         return grids
     
-    def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
+    def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action, initial_state=None):
         act_shift = int(latent_frame_ids[0] - local_start_frame)
         frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
         action = action[act_shift:]
-        action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='edge')
+        if initial_state is None:
+            action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='edge')
+        else:
+            seed = np.asarray(initial_state, dtype=np.asarray(action).dtype)
+            if seed.shape != (action.shape[1],) or not np.isfinite(seed).all():
+                raise ValueError("Memory cold seed requires finite measured state")
+            action = np.concatenate([np.repeat(seed[None], frame_stride * 4, axis=0), action])
 
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
         required_action_num = latent_frame_num * frame_stride * 4
@@ -2043,8 +2053,20 @@ class LatentLeRobotDataset(LeRobotDataset):
             # explicit drop flag so the model takes the zero-anchor path.
             out_dict['tactile_cond_drop'] = torch.tensor(True, dtype=torch.bool)
 
-        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+        initial_state = None
+        if getattr(self.config, "memory_seed_observation", False):
+            if local_start_frame != 0 or start_lat is not None:
+                raise ValueError("Measured cold seed requires a complete episode from frame zero")
+            initial_state = ori_data_dict['observation.state'][0]
+        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'], initial_state)
 
+        if getattr(self.config, "memory_plan_root", None):
+            from training.memory.sidecar import load_plan
+            if start_lat is not None:
+                raise ValueError("Causal Memory plans require complete trajectories")
+            out_dict["memory_plan"] = load_plan(
+                self.config, self.repo_name, episode_index, local_start_frame,
+                local_end_frame, ori_data_dict, self.used_video_keys, self.root)
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         return out_dict
 

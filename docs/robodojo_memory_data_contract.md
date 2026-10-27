@@ -34,3 +34,52 @@ four-GPU updates, full optimizer/scheduler/RNG checkpoint restore, physical acti
 train/serve observation parity, and closed-loop development evaluation with original rewards.
 The swap_blocks button release issue is an evaluation environment confound and must not be
 fixed by lowering the success threshold or imputing wins.
+
+
+## Frozen scorer integration
+
+`training.memory.prepare_plans` binds a checkpoint hash and pinned Qwen encoder,
+encodes corrected RGB at actual VAE anchors, and replays a causal eviction policy.
+Scorer frame/camera/row/column scores are explicitly permuted into native
+frame/row/camera/column KV order. For a native two-frame group starting at f, both video and action phases use
+only scorer inputs from frames before f. The group drives toward future video
+frames f and f+1, whose real RGB is not yet available to the scorer. Evicted native KV cannot re-enter. Budgets count
+current plus history (3584 RGB, 512 action); no tactile tokens are admitted.
+
+`training.memory.train` loads these plans with B=1, complete trajectories and
+fixed native chunk size 2. N0 uses its existing masked IKV path. The LingBot adapter imports an
+explicit upstream source directory, keeps its architecture/denoising loss, uses
+the audited episode-filtered data loader, and adds durable DCP state and held-out
+validation. The original baseline remains a separately named control. Scorer
+failure or a missing/stale plan raises; there is no formula fallback.
+
+The offline scorer sees VAE-anchor RGB, which is temporally sparser than its SFT
+corpus. Calibration on this exact representation and streaming serving parity
+remain required acceptance gates. Integration smoke tests using an older head
+are not evidence of the final scorer's performance, task success or SOTA.
+
+The DCP loader now respects uninitialized Adam state for unused branches. It
+uses checkpoint metadata to omit only entirely absent parameter states; missing
+fields of an active state still error. This avoids silently advancing Adam's
+bias-correction step for a branch before its first actual gradient.
+
+
+The first twelve action tokens are seeded from measured initial
+observation.state, matching real-observation grounding, rather than repeating
+the first future command/pose target. This is opt-in for both Memory controls.
+The complete action suffix is unchanged. CPU loaders run with zero workers in
+the audited recipe so an exact resume does not depend on opaque worker RNG.
+
+Both trainers reject nonfinite losses collectively before backward and reject
+nonfinite gradient norms before an optimizer update. Rank-zero metrics retain
+full floating-point precision for save/resume comparison. LingBot exports
+inference weights one parameter at a time into bounded safetensors shards,
+avoiding a full-model host-memory gather under container memory limits.
+Checkpoint completion is invalidated before rewriting any part of a checkpoint.
+
+training.memory.timebase defines the exact 25 Hz control / 30 Hz action /
+10 Hz RGB mapping. Control actions select ceil(k*30/25) from native predictions,
+while grounding RGB arrives at floor(m*25/10). Test the actual deployed adapters
+as well as these arithmetic helpers; synthetic/instrumented adapters do not
+establish simulator success. Online scorer integration and measured cache
+selection parity remain separate from offline-plan validation.

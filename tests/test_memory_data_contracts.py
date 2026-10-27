@@ -50,3 +50,17 @@ def test_rgb_configuration_does_not_silently_replace_requested_scorer(tmp_path):
     t["features"] = {"score_backend":"qwen_sys2"}
     c = training_config(t, "ikv", 4, require_ready=False)
     assert c.kv_retention["score_backend"] == "qwen_sys2"
+
+
+def test_memory_cold_seed_is_measured_pose_not_first_future_target():
+    from n0_twam.dataset.lerobot_latent_dataset import LatentLeRobotDataset
+    d=LatentLeRobotDataset.__new__(LatentLeRobotDataset)
+    d.inverse_used_action_channel_ids=np.array([0,1])
+    d.q01=np.array([[-1.,-1.]])
+    d.q99=np.array([[1.,1.]])
+    actions=np.full((24,2),.7,dtype=np.float32)
+    seed=np.array([.1,.2],dtype=np.float32)
+    out,mask=d._action_post_process(0,24,np.arange(0,15,3),actions,seed)
+    np.testing.assert_allclose(out[:,0,:,0].numpy(),np.repeat(seed[:,None],12,axis=1),atol=1e-6)
+    np.testing.assert_allclose(out[:,1,:,0].numpy(),.7,atol=1e-6)
+    assert mask.all()
