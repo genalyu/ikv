@@ -10,10 +10,12 @@ from PIL import Image
 import torch
 from .selection import VERSION, scorer_to_native
 from .sidecar import verify_binding, sha256
+from .feature_cache import CANONICAL_IMAGE_BATCH
 
 
 class ObservedPrefix:
     def __init__(self,encoder,scorer,prompt):
+        if getattr(encoder,"image_batch",CANONICAL_IMAGE_BATCH)!=CANONICAL_IMAGE_BATCH:raise ValueError("Streaming encoder batch differs from native plans")
         self.encoder,self.scorer=encoder,scorer
         self.text=encoder.task(prompt).detach().cpu()
         self.frames=[];self.digests=[];self.last_scores=None
@@ -69,15 +71,16 @@ def main():
     p.add_argument("--host",default="127.0.0.1");p.add_argument("--device",default="cuda:0")
     args=p.parse_args()
     binding=verify_binding(dict(binding=args.binding))
+    if binding.get("encoder_image_batch")!=CANONICAL_IMAGE_BATCH:raise ValueError("Online scorer requires canonical one-image encoder plans")
     if binding["chunk_size"]!=2:raise ValueError("Only native two-frame Memory serving is supported")
     for name,digest in binding["encoder_sha256"].items():
         if sha256(Path(binding["encoder"])/name)!=digest:raise ValueError("Encoder changed after binding")
     from training.parallel_scorer.encoders import QwenEncoders
     from training.parallel_scorer.runtime import RuntimeScorer
     scorer=RuntimeScorer(binding["checkpoint"],args.device)
-    encoder=QwenEncoders(binding["encoder"],binding["encoder_revision"],args.device,image_batch=8).eval()
+    encoder=QwenEncoders(binding["encoder"],binding["encoder_revision"],args.device,image_batch=CANONICAL_IMAGE_BATCH).eval()
     sessions={}
-    identity=dict(version=VERSION,scorer_sha256=binding["scorer_sha256"],chunk_size=2)
+    identity=dict(version=VERSION,encoder_image_batch=CANONICAL_IMAGE_BATCH,scorer_sha256=binding["scorer_sha256"],chunk_size=2)
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             try:

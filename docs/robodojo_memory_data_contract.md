@@ -127,3 +127,29 @@ and skipped by execution. The pinned LingBot server has a separate optional
 serving patch for this mode; its legacy zero-clamp default is unchanged.
 This shared boundary choice needs matched-control closed-loop evaluation and
 must not be attributed to scorer retention gains.
+
+
+## Preparing features before the scorer is chosen
+
+training.memory.prepare_features writes only context-independent Qwen image
+features and task-only language features. It never caches contextual scorer
+outputs. It uses the corrected native VAE anchors and excludes internal test
+episodes. Different frozen scorer sizes can share these exact features.
+
+The content key pins encoder bytes, encoder/patch/cache code, prompt, camera
+order, frame IDs, source FPS, latent bytes, video bytes and RGB/resize/dtype
+contracts. New inputs receive a new key; a mismatched stored identity errors.
+Atomic unique temporary files make concurrent identical preparations safe.
+prepare_plans --feature-root consumes the cache and loads Qwen lazily only for a
+missing entry. The audited plan builder requires CUDA BF16 scoring and the
+frozen linear-patch-v1 encoder. Trainable encoder revisions need a separate
+campaign with their actual encoder weights.
+
+
+Native Memory uses a fixed one-image Qwen visual execution batch in offline
+preparation and streaming inference. Variable image batch sizes can introduce
+small BF16 differences that swap tied candidates at the budget boundary.
+Bindings and feature markers record encoder_image_batch=1, and the online
+service rejects legacy unrecorded execution. This does not alter policy VAE
+encoding or scorer weights. New runs record the execution choice in their
+experiment manifest.

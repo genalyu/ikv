@@ -15,7 +15,7 @@ class ScorerClient:
         self.endpoint=endpoint;self.sha=scorer_sha256;self.timeout=timeout
         self.session=str(uuid.uuid4())
         identity=self.call("status")
-        if identity["version"]!=VERSION or identity["chunk_size"]!=2:
+        if identity["version"]!=VERSION or identity["chunk_size"]!=2 or identity.get("encoder_image_batch")!=1:
             raise ValueError("Online scorer protocol differs from training")
 
     def call(self,op,**kwargs):

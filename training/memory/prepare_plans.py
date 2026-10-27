@@ -8,13 +8,10 @@ import argparse
 import json
 from pathlib import Path
 import time
-import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image
-import av
 from .selection import VERSION, replay, scorer_to_native
 from .sidecar import sha256, verify_encoder
+from .feature_cache import episode_features, extract, CANONICAL_IMAGE_BATCH
 from training.parallel_scorer.encoders import QwenEncoders
 from training.parallel_scorer.runtime import RuntimeScorer
 
@@ -24,43 +21,37 @@ def write_json(path, data):
     tmp.write_text(json.dumps(data,indent=2));tmp.replace(path)
 
 
-def extract(video, anchors):
-    wanted=set(map(int,anchors));images={}
-    with av.open(str(video)) as reader:
-        for i,frame in enumerate(reader.decode(video=0)):
-            if i in wanted:
-                x=torch.from_numpy(frame.to_ndarray(format="rgb24").copy()).permute(2,0,1)[None].float()
-                x=F.interpolate(x,size=(256,256),mode="bilinear",align_corners=False)
-                images[i]=Image.fromarray(x[0].permute(1,2,0).round().clamp(0,255).byte().numpy())
-            if len(images)==len(wanted):break
-    if set(images)!=wanted:
-        raise ValueError("Video does not contain all actual VAE frame anchors")
-    return [images[int(i)] for i in anchors]
-
 
 def main():
     p=argparse.ArgumentParser();p.add_argument("--campaign",required=True)
     p.add_argument("--checkpoint",required=True);p.add_argument("--encoder",required=True)
     p.add_argument("--encoder-manifest",required=True)
     p.add_argument("--output",required=True);p.add_argument("--device",default="cuda:0")
+    p.add_argument("--feature-root",default=None)
     a=p.parse_args();campaign=json.loads(Path(a.campaign).read_text())
     out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     scorer=RuntimeScorer(a.checkpoint,a.device)
     revision=scorer.info["encoder_revision"]
+    if not a.device.startswith("cuda"):raise ValueError("Audited native plans require CUDA BF16 scoring")
+    if revision.split(":")[1:]!=["linear-patch-v1"]:raise ValueError("Only the frozen linear-patch-v1 encoder is supported")
     encoder_hashes=verify_encoder(a.encoder,revision,a.encoder_manifest)
     input_hashes={"splits":sha256(campaign["splits"])}
     for task in json.loads(Path(campaign["splits"]).read_text())["per_task"]:
         input_hashes[task]=sha256(Path(campaign["task_config_root"])/f"{task}.json")
     binding=dict(version=VERSION,chunk_size=2,encoder_sha256=encoder_hashes,inputs_sha256=input_hashes,checkpoint=str(Path(a.checkpoint).absolute()),
         scorer_sha256=sha256(a.checkpoint),encoder=str(Path(a.encoder).absolute()),
-        encoder_revision=revision,budgets=[3584,512],plan_root=str(out.absolute()),
+        encoder_revision=revision,encoder_image_batch=CANONICAL_IMAGE_BATCH,budgets=[3584,512],plan_root=str(out.absolute()),
         campaign_sha256=sha256(a.campaign),prefix_sampling="native-VAE-anchor-RGB",
         rgb_contract="canonical-RGB-torch-bilinear-u8-round-v1")
     bp=out/"binding.json"
     if bp.exists() and json.loads(bp.read_text())!=binding:
         raise ValueError("Plan output belongs to a different scorer/campaign; choose a new directory")
     write_json(bp,binding)
-    encoder=QwenEncoders(a.encoder,revision,a.device,image_batch=8).eval()
+    encoder=None
+    def get_encoder():
+        nonlocal encoder
+        if encoder is None:encoder=QwenEncoders(a.encoder,revision,a.device,image_batch=CANONICAL_IMAGE_BATCH).eval()
+        return encoder
     split=json.loads(Path(campaign["splits"]).read_text())["per_task"]
     cameras=campaign["cameras"]
     done=[]
@@ -79,28 +70,9 @@ def main():
                 old=torch.load(target,map_location="cpu",weights_only=True)
                 if old["binding_sha256"]!=sha256(bp):raise ValueError("Stale completed plan")
                 done.append(str(target));continue
-            payloads=[];features=[];sources={}
-            for cam in cameras:
-                matches=list((root/"latents").glob(f"chunk-*/{cam}/{name[:-3]}.pth"))
-                if len(matches)!=1:raise ValueError(f"Expected one corrected latent: {task}/{episode}/{cam}")
-                payload=torch.load(matches[0],map_location="cpu",weights_only=True)
-                if payload.get("frame_sampling_contract")!="explicit-source-stride-v1" or payload.get("rgb_resize_mode")!="torch_bilinear":
-                    raise ValueError("Legacy image/time latents forbidden")
-                anchors=torch.tensor(payload["frame_ids"])[::4]
-                if payloads and not torch.equal(anchors,torch.tensor(payloads[0]["frame_ids"])[::4]):
-                    raise ValueError("Camera temporal mismatch")
-                videos=list((root/"videos").glob(f"chunk-*/{cam}/episode_{episode:06d}.mp4"))
-                if len(videos)!=1:raise ValueError("Missing corrected video")
-                with torch.inference_mode():
-                    images=extract(videos[0],anchors)
-                    f=encoder.images(images).detach().cpu().reshape(len(anchors),8,8,-1)
-                features.append(f);payloads.append(payload)
-                sources[cam]=sha256(matches[0])
-            # Keep scorer order [frame,camera,row,col], then explicitly map scores.
-            features=torch.stack(features,dim=1).contiguous()
-            frames=len(features);text=encoder.task(prompt).detach().cpu()
-            fps=float(json.loads((root/"meta/info.json").read_text())["fps"])
-            times=anchors.float()/fps
+            features,text,times,anchors,sources,feature_key=episode_features(
+                root,episode,length,cameras,prompt,revision,encoder_hashes,get_encoder,a.feature_root)
+            frames=len(features)
             xy=torch.stack(torch.meshgrid(torch.arange(8),torch.arange(8),indexing="ij"),-1).reshape(-1,2)/7.
             def score_prefix(n):
                 packet=dict(features=features[:n].reshape(n*192,-1),text=text,
@@ -113,7 +85,7 @@ def main():
             selected=replay(frames,score_prefix)
             data=dict(version=VERSION,chunk_size=2,selected=selected,frame_ids=anchors,cameras=cameras,
                 budgets=binding["budgets"],scorer_sha256=binding["scorer_sha256"],
-                binding_sha256=sha256(bp),latent_sha256=sources)
+                binding_sha256=sha256(bp),latent_sha256=sources,feature_cache_key=feature_key)
             tmp=target.with_suffix(".tmp");torch.save(data,tmp);tmp.replace(target)
             done.append(str(target))
             print(json.dumps(dict(task=task,episode=episode,frames=frames,completed=len(done))),flush=True)

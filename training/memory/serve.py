@@ -53,13 +53,16 @@ def prepare(spec):
         obs_cam_keys=manifest["cameras"],norm_stat=manifest["normalization"],
         tactile_keys=[],use_local_tactile=False,tactile_global_zero=True,use_rgb_motion_tokens=False,
         attn_mode="torch",cold_seed_mode="free",infer_mode="server",host=spec.get("host","127.0.0.1"),
-        port=int(spec.get("port",29611)),enable_offload=True)
+        port=int(spec.get("port",29611)),enable_offload=spec.get("enable_offload",True))
+    if type(cfg.enable_offload) is not bool:raise ValueError("enable_offload must be a JSON boolean")
     inference=spec.get("inference",{})
     allowed={"guidance_scale","action_guidance_scale","num_inference_steps",
-        "action_num_inference_steps","video_exec_step","snr_shift","action_snr_shift","attn_window"}
+        "action_num_inference_steps","video_exec_step","snr_shift","action_snr_shift","attn_window","cold_seed_mode"}
     if set(inference)-allowed:raise ValueError("Unsupported inference override")
     for key,value in inference.items():
-        if key in {"num_inference_steps","action_num_inference_steps","attn_window"}:
+        if key=="cold_seed_mode":
+            if value not in {"free","zeros"}:raise ValueError("Cold seed mode must be explicit free or zeros")
+        elif key in {"num_inference_steps","action_num_inference_steps","attn_window"}:
             if type(value) is not int or value<1:raise ValueError("Positive integer inference setting required")
         elif key=="video_exec_step":
             if type(value) is not int or value==0 or value < -1:raise ValueError("Invalid video execution steps")
@@ -69,8 +72,21 @@ def prepare(spec):
     inverse=[len(cfg.used_action_channel_ids)]*cfg.action_dim
     for i,j in enumerate(cfg.used_action_channel_ids):inverse[j]=i
     cfg.inverse_used_action_channel_ids=inverse
+    Server=type("MemoryNativeServer",(Server,),{})
+    original_infer=Server.infer
+    def seeded_infer(self,obs):
+        if obs.get("reset") and obs.get("seed") is not None:
+            import numpy as np
+            import torch
+            seed=int(obs["seed"])&0x7fffffff
+            np.random.seed(seed);torch.manual_seed(seed);torch.cuda.manual_seed_all(seed)
+        return original_infer(self,obs)
+    Server.infer=seeded_infer
     if manifest["mode"]=="scorer":
         binding=verify_binding(dict(binding=spec["binding"]))
+        if binding.get("encoder_image_batch")!=1:raise ValueError("Regenerate plans using canonical one-image encoder execution")
+        trained_batch=manifest["experiment"].get("memory_encoder_image_batch")
+        if trained_batch is not None and trained_batch!=binding["encoder_image_batch"]:raise ValueError("Encoder execution differs from training")
         if binding["scorer_sha256"]!=manifest["scorer_sha256"]:
             raise ValueError("Serving scorer differs from the one used in training")
         cfg.memory_scorer_sha256=binding["scorer_sha256"]
@@ -83,14 +99,13 @@ def prepare(spec):
         # N0's metadata cross-check also covers legacy retention fields. Keep
         # that exact envelope; install() replaces the policy with the bound
         # frozen scorer before any token can enter a newly reset cache.
-        Server=type("MemoryNativeServer",(Server,),{})
         install(Server,spec["model"])
     return module,Server,cfg,manifest
 
 
 def configuration_contract(cfg,manifest):
     import hashlib
-    keys=["frame_chunk_size","action_dim","action_per_frame","used_action_channel_ids","obs_cam_keys",
+    keys=["enable_offload","frame_chunk_size","action_dim","action_per_frame","used_action_channel_ids","obs_cam_keys",
         "cold_seed_mode","guidance_scale","action_guidance_scale","num_inference_steps",
         "action_num_inference_steps","video_exec_step","snr_shift","action_snr_shift","attn_window"]
     result={k:getattr(cfg,k,None) for k in keys}
