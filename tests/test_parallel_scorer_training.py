@@ -74,3 +74,15 @@ def test_linear_patch_projection_matches_float32_conv_and_gradients():
     torch.testing.assert_close(y,z,atol=1e-6,rtol=1e-5)
     y.square().sum().backward();z.square().sum().backward()
     for v,w in zip(a.parameters(),b.parameters()):torch.testing.assert_close(v.grad,w.grad,atol=1e-5,rtol=1e-5)
+
+@pytest.mark.parametrize("name,width,heads,count", [("p067m",64,1,66752),("p26m",128,2,264576),("p59m",192,3,593472)])
+def test_submillion_scorers(name,width,heads,count):
+    from training.parallel_scorer.model import ParallelScorer
+    c=ScorerConfig.preset(name,vision_dim=12,text_dim=10,checkpoint_layers=False)
+    m=ParallelScorer(c)
+    assert (c.width,c.heads,c.layers)==(width,heads,1)
+    assert m.counts()["interaction"]==count
+    y=m(torch.randn(9,12),torch.randn(3,10),torch.arange(9).float(),torch.rand(9,2),torch.zeros(9,dtype=torch.long),torch.zeros(9,dtype=torch.long),8.)
+    y.square().mean().backward()
+    assert torch.isfinite(y).all()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())

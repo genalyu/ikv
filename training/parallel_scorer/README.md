@@ -339,3 +339,12 @@ positive score term. Persistence support is not added. This standalone offline
 baseline does not alter the serving retention policy or any training model.
 An offline raw-frame expansion must declare its mapping and distinguish it from
 an exact native KV replay. The separate alpha/beta/gamma mixture is not applied.
+
+
+### Sub-million memory specialization
+Presets p067m / p26m / p59m use one interaction block with width 64 / 128 / 192
+and 1 / 2 / 3 heads (head dimension 64). Interaction counts are 66,752 /
+264,576 / 593,472; projections and output head are additional parameters.
+All-history attention, regression/ranking supervision, and resume semantics remain unchanged.
+Memory-only experiments must preserve episode splits and report per-task Top-k and
+early-evidence retention, not interpret teacher agreement as closed-loop success.

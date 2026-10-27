@@ -12,7 +12,7 @@ def atomic_save(obj,path):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("--manifest",required=True);p.add_argument("--validation",required=True)
-    p.add_argument("--output",required=True);p.add_argument("--preset",choices=["p1m","p5m","p8m","p13m","small","medium"],default="small")
+    p.add_argument("--output",required=True);p.add_argument("--preset",choices=["p067m","p26m","p59m","p1m","p5m","p8m","p13m","small","medium"],default="small")
     p.add_argument("--device",default="cuda:0");p.add_argument("--epochs",type=int,default=3)
     p.add_argument("--lr",type=float,default=1e-4);p.add_argument("--encoder-lr",type=float,default=5e-6)
     p.add_argument("--accumulate",type=int,default=4);p.add_argument("--seed",type=int,default=42)

@@ -22,6 +22,9 @@ class ScorerConfig:
     @classmethod
     def preset(cls, name, **kwargs):
         presets = {
+            "p067m": dict(width=64, layers=1, heads=1),
+            "p26m": dict(width=128, layers=1, heads=2),
+            "p59m": dict(width=192, layers=1, heads=3),
             "p1m": dict(width=256, layers=1, heads=4),
             "p5m": dict(width=384, layers=2, heads=6),
             "p8m": dict(width=512, layers=2, heads=8),
