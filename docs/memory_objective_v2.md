@@ -1,0 +1,7 @@
+# History scoring objective v2
+
+The opt-in memory_objective module leaves deployed models and old trainers unchanged. Full real observed context, including the current image, enters attention. Only times strictly less than query_time intersected with supervision are loss/selection candidates. Skip query zero. Masking legacy labels does not turn them into history-given-current-v1 annotations. Never supply imagined future targets as observations.
+
+Loss combines score-level-balanced and uniform SmoothL1, graded gap-weighted pair ranking with random and student-high-scoring comparisons, and linear teacher utility of a differentiable fixed-budget set. All boundary ties receive regression supervision. The soft threshold uses the implicit fixed-mass derivative. Default weights 1/0.1/0.1 are an experimental starting point, not an optimum. No age bonus, fixed early quota, or evidence-group annotations are introduced.
+
+Report historical linear NDCG, tie-aware overlap, teacher-score regret, normalized gain over random, strict and early recall, and MAE at k=256/1024/4096. Early recall is diagnostic, not optimized. Choose models on episode-disjoint development selection quality; reserve original validation for final reporting, keep test sealed. Retain all four sizes, random initialization, full histories and immutable encoder revisions. Log learning rate, warmup, accumulated queries, exposures and compute; compare fitting and development gaps separately. Teacher agreement does not establish closed-loop memory success.
