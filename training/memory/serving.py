@@ -21,11 +21,21 @@ def validate_config(cfg):
         raise ValueError("An explicit frozen scorer binding is required")
 
 
+def frozen_policy(server,device):
+    """Select the explicit history/current protocol; legacy bindings stay exact."""
+    scorer=server.memory_scorer
+    kwargs={}
+    if getattr(server.job_config,"memory_history_context",False):
+        kwargs=dict(score_history=scorer.score_history,
+                    observed_prefix=lambda:scorer.next_frame)
+    return FrozenMemoryRetention(device,scorer.score,**kwargs)
+
+
 class LingbotCache:
     """Use upstream attention intact; override only native slot allocation."""
     def __init__(self,server):
         self.server=server;self.model=server.transformer;self.context=None
-        self.policy=FrozenMemoryRetention("cpu",server.memory_scorer.score)
+        self.policy=frozen_policy(server,"cpu")
         for block in self.model.blocks:
             attn=block.attn1
             cache=attn.attn_caches[server.cache_name]
@@ -98,7 +108,7 @@ def install(Server,model):
             caches=self.transformer.mot.shared_attn
             cache=caches[0].attn_caches[self.cache_name]
             if len(cache["mask"])!=4096:raise ValueError("Memory requires exactly 4096 native KV slots")
-            self.transformer.mot.retention_policies[self.cache_name]=FrozenMemoryRetention(cache["mask"].device,self.memory_scorer.score)
+            self.transformer.mot.retention_policies[self.cache_name]=frozen_policy(self,cache["mask"].device)
         else:
             if not hasattr(self.transformer,"memory_original_forward"):
                 self.transformer.memory_original_forward=self.transformer.forward
