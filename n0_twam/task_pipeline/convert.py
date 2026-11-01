@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 import io
 import json
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -77,7 +78,7 @@ def image_stats_video(path):
         )
 
 
-def encode_aligned_video(source, destination, ids, fps):
+def encode_aligned_video(source, destination, ids, fps, in_pass=False, preset="fast"):
     import av
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +102,13 @@ def encode_aligned_video(source, destination, ids, fps):
                         for frame in container.decode(video=0):
                             yield frame.to_ndarray(format="rgb24")
 
+    count = 0
+    frames_seen = 0
+    sums = np.zeros(3, dtype=np.float64)
+    sums_sq = np.zeros(3, dtype=np.float64)
+    minimum = np.full(3, 255, dtype=np.uint8)
+    maximum = np.zeros(3, dtype=np.uint8)
+    import cv2
     with av.open(str(temp), "w") as out:
         stream = None
         target = 0
@@ -110,8 +118,19 @@ def encode_aligned_video(source, destination, ids, fps):
                 stream.width, stream.height = rgb.shape[1], rgb.shape[0]
                 stream.pix_fmt = "yuv420p"
                 stream.thread_count = 2
-                stream.options = {"crf": "18", "preset": "fast"}
+                stream.options = {"crf": "18", "preset": preset}
             while target < len(ids) and ids[target] == index:
+                if in_pass:
+                    pixels = rgb.reshape(-1, 3)
+                    n = len(pixels)
+                    mean, std = cv2.meanStdDev(rgb)
+                    mean, std = mean[:, 0], std[:, 0]
+                    sums += mean * n
+                    sums_sq += (std * std + mean * mean) * n
+                    minimum = np.minimum(minimum, pixels.min(axis=0))
+                    maximum = np.maximum(maximum, pixels.max(axis=0))
+                    count += n
+                    frames_seen += 1
                 f = av.VideoFrame.from_ndarray(rgb, format="rgb24")
                 f.pts = target
                 f.time_base = Fraction(1, 1) / Fraction(str(fps))
@@ -127,7 +146,17 @@ def encode_aligned_video(source, destination, ids, fps):
         for packet in stream.encode():
             out.mux(packet)
     temp.replace(destination)
-    return [stream.height, stream.width, 3]
+    if not in_pass:
+        return [stream.height, stream.width, 3], image_stats_video(destination)
+    mean = sums / count / 255
+    variance = np.maximum(sums_sq / count / (255 * 255) - mean * mean, 0)
+    video_stats = {
+        k: np.asarray(v).reshape(3, 1, 1).tolist()
+        for k, v in {"min": minimum.astype(np.float64) / 255,
+                     "max": maximum.astype(np.float64) / 255,
+                     "mean": mean, "std": np.sqrt(variance)}.items()
+    } | {"count": [frames_seen]}
+    return [stream.height, stream.width, 3], video_stats
 
 
 def convert(task):
@@ -158,9 +187,17 @@ def convert(task):
         return
     # A partial conversion is restartable only for the identical inputs/configuration.
     pending = root / "conversion_pending.json"
-    if pending.exists() and json.loads(pending.read_text())["fingerprint"] != spec:
-        raise ValueError("Partial conversion configuration differs")
-    pending.write_text(json.dumps({"fingerprint": spec}))
+    pending_payload = json.dumps({"fingerprint": spec})
+    if pending.exists():
+        try:
+            pending_data = json.loads(pending.read_text())
+        except (json.JSONDecodeError, OSError):
+            pending_data = {"fingerprint": spec}
+        if pending_data.get("fingerprint") != spec:
+            raise ValueError("Partial conversion configuration differs")
+    pending_tmp = pending.with_name(f".{pending.name}.{os.getpid()}.tmp")
+    pending_tmp.write_text(pending_payload)
+    os.replace(pending_tmp, pending)
     fps = 30
     robot = task["robot"]
     all_eps = []
@@ -170,6 +207,13 @@ def convert(task):
     total = 0
     excluded = []
     source_count = 0
+    shard_count = int(os.environ.get("N0_CONVERT_SHARD_COUNT", "1"))
+    shard_index = int(os.environ.get("N0_CONVERT_SHARD_INDEX", "0"))
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("Invalid conversion shard configuration")
+    in_pass = task.get("in_pass_video_stats", False)
+    preset = task.get("video_encoder_preset", "fast")
+    usable_index = 0
     width = robot.get("arms", 1) * 10
     for ep in episodes(task):
         source_count += 1
@@ -190,7 +234,13 @@ def convert(task):
             excluded.append(dict(source_id=ep.source_id, reason=str(error)))
             print(f"EXCLUDED {ep.source_id}: {error}", flush=True)
             continue
-        index = len(all_eps)
+        max_usable = task.get("max_usable_episodes")
+        if max_usable is not None and usable_index >= int(max_usable):
+            break
+        index = usable_index
+        usable_index += 1
+        if shard_count > 1 and index % shard_count != shard_index:
+            continue
         a = np.zeros((len(ts), 20), np.float32)
         s = a.copy()
         a[:, :width] = ep.action[ai]
@@ -199,20 +249,20 @@ def convert(task):
         stem = f"episode_{index:06d}"
         marker = root / "conversion_episodes" / (stem + ".json")
         marker_data = json.loads(marker.read_text()) if marker.exists() else None
-        encoded = False
+        encoded_video_stats = {}
         alignment = {}
         if task["format"] == "collector_v06":
             # The tar handle is shared; read sources serially, then encode cameras in parallel.
             jobs = {}
-            with ThreadPoolExecutor(max_workers=min(4, len(ep.videos))) as pool:
+            with ThreadPoolExecutor(max_workers=len(ep.videos)) as pool:
                 for key, source in ep.videos.items():
                     ids = camera_indices[key]
                     alignment[key] = time_audit["cameras"][key]
                     video = root / "videos" / chunk / key / (stem + ".mp4")
-                    if marker_data is not None and video.exists():
+                    if (marker_data is not None and video.exists()
+                            and key in marker_data.get("video_stats", {})):
                         shapes[key] = marker_data["shapes"][key]
                     else:
-                        encoded = True
                         with video_reader(source) as source_file:
                             payload = (
                                 Path(source_file).read_bytes()
@@ -220,20 +270,20 @@ def convert(task):
                                 else source_file.read()
                             )
                         jobs[key] = pool.submit(
-                            encode_aligned_video, payload, video, ids, fps
+                            encode_aligned_video, payload, video, ids, fps, in_pass, preset
                         )
                 for key, job in jobs.items():
-                    shapes[key] = job.result()
+                    shapes[key], encoded_video_stats[key] = job.result()
         else:
             for key, source in ep.videos.items():
                 ids = camera_indices[key]
                 alignment[key] = time_audit["cameras"][key]
                 video = root / "videos" / chunk / key / (stem + ".mp4")
-                if marker_data is not None and video.exists():
+                if (marker_data is not None and video.exists()
+                            and key in marker_data.get("video_stats", {})):
                     shapes[key] = marker_data["shapes"][key]
                 else:
-                    encoded = True
-                    shapes[key] = encode_aligned_video(source, video, ids, fps)
+                    shapes[key], encoded_video_stats[key] = encode_aligned_video(source, video, ids, fps, in_pass, preset)
         data = dict(
             action=list(a),
             **{"observation.state": list(s)},
@@ -258,21 +308,9 @@ def convert(task):
             )
         )
         st = {k: stats(np.stack(df[k])) for k in df.columns}
-        # Cache exact converted-video statistics at the episode boundary so a
-        # preempted conversion never decodes completed episodes twice.
-        if marker_data is not None and not encoded and "video_stats" in marker_data:
-            st.update(marker_data["video_stats"])
-        else:
-            with ThreadPoolExecutor(max_workers=min(4, len(ep.videos))) as pool:
-                stat_jobs = {
-                    key: pool.submit(
-                        image_stats_video,
-                        root / "videos" / chunk / key / (stem + ".mp4"),
-                    )
-                    for key in ep.videos
-                }
-                for key, job in stat_jobs.items():
-                    st[key] = job.result()
+        for key in ep.videos:
+            st[key] = (encoded_video_stats[key] if key in encoded_video_stats
+                       else marker_data["video_stats"][key])
         all_stats.append(dict(episode_index=index, stats=st))
         provenance.append(
             dict(
@@ -292,6 +330,9 @@ def convert(task):
         marker_tmp.replace(marker)
         total += len(ts)
         print(f"Converted {index}: {ep.source_id} ({len(ts)} frames)", flush=True)
+    if shard_count > 1:
+        print(f"Shard {shard_index}/{shard_count} complete: {len(all_eps)} episodes", flush=True)
+        return
     if not all_eps:
         raise ValueError("Empty input")
     features = {}

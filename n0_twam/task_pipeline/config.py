@@ -328,6 +328,9 @@ def conversion_identity(task):
             "allowed_quality_labels",
         )
     }
+    for key in ("max_usable_episodes", "video_encoder_preset", "in_pass_video_stats"):
+        if key in task:
+            fields[key] = task[key]
     if task.get("format") == "robodojo_hdf5":
         codec = Path(task["runtime"]["xpolicylab_root"]) / "utils/process_data.py"
         fields["image_decode_contract"] = "xpolicylab-marker-aware-rgb-v1"
