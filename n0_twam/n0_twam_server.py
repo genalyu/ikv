@@ -1201,9 +1201,19 @@ class TWAM_Server:
             raise ValueError("NeoForce/visual frame alignment mismatch")
         visual = dict(dense_index)
         neo = features.new_zeros(vf, (vh // ph) * (vw // pw), features.shape[-1])
+        # Preserve the already observed seed descriptors in a mixed cold layout.
+        seed_rows = offset * neo.shape[1]
+        if seed_rows:
+            previous = dense_index["neoforce"]
+            if previous.shape[-1]:
+                if previous.shape[-1] != features.shape[-1]:
+                    raise ValueError("NeoForce width changed at cold grounding")
+                neo[:offset] = previous[:seed_rows].reshape(offset, neo.shape[1], -1)
         neo[offset:] = frame_features[:, None]
         visual["neoforce"] = neo.flatten(0, 1)
         present = torch.zeros(vf, neo.shape[1], dtype=torch.bool, device=self.device)
+        if seed_rows and "contact_present" in dense_index:
+            present[:offset] = dense_index["contact_present"][:seed_rows].reshape(offset, neo.shape[1])
         present[offset:] = active.any(0).any(-1)[:, None]
         visual["contact_present"] = present.flatten()
         tail = {"neoforce": features, "contact_present": response > 0,
@@ -3209,6 +3219,10 @@ class TWAM_Server:
                     "cold RGB-motion grounding needs at least one executed "
                     "action frame after the seed")
             action_model_input = action_model_input[:, :, 1:]
+        if "contact_index" in obs and action_model_input.shape[2] != latent_model_input.shape[2]:
+            raise ValueError(
+                f"Grounding temporal mismatch: video latents={latent_model_input.shape[2]}, "
+                f"action frames={action_model_input.shape[2]}; refusing misaligned KV history")
         action_model_input = action_model_input.to(latent_model_input)
         tactile_latents = (
             self._encode_tactile_obs(obs)

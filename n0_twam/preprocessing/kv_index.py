@@ -13,7 +13,7 @@ def observed_index(payload, count, device):
     There are intentionally no persisted visual_valid/tactile_valid fields.
     """
     payload = {} if payload is None else payload
-    unsupported = set(payload) - {"dino", "neoforce", "duration", "observation_flag", "task_relevance"}
+    unsupported = set(payload) - {"dino", "neoforce", "duration", "observation_flag", "task_relevance", "contact_present"}
     if unsupported:
         raise ValueError(f"unknown kv_index fields: {sorted(unsupported)}")
     result = {}
@@ -38,6 +38,11 @@ def observed_index(payload, count, device):
     flag = torch.as_tensor(payload.get("observation_flag", 1), device=device)
     if not (flag == 1).all():
         raise ValueError("observed RGB index cannot be labelled predicted")
+    contact = torch.as_tensor(payload.get("contact_present", False), device=device)
+    contact = torch.broadcast_to(contact.reshape(-1), (count,))
+    if not ((contact == 0) | (contact == 1)).all():
+        raise ValueError("kv_index.contact_present must be boolean")
+    result["contact_present"] = contact.detach().bool()
     result["duration"] = duration.detach().float()
     result["observation_flag"] = torch.ones(count, dtype=torch.bool, device=device)
     return result
@@ -65,6 +70,7 @@ def prediction_index(count, device, seed=None):
         raise ValueError("real seed index exceeds prediction chunk")
     result = {
         "observation_flag": torch.zeros(count, dtype=torch.bool, device=device),
+        "contact_present": torch.zeros(count, dtype=torch.bool, device=device),
         "duration": torch.ones(count, device=device),
         "task_relevance": torch.zeros(count, device=device),
     }
@@ -83,6 +89,18 @@ def concat_indices(first, second):
         return second
     if second is None:
         return first
+    unexpected = (set(first) ^ set(second)) - {"contact_present"}
+    if unexpected:
+        raise ValueError(f"index fields differ: {sorted(unexpected)}")
+    first, second = dict(first), dict(second)
+    if "contact_present" in first and "contact_present" not in second:
+        second["contact_present"] = torch.zeros(
+            len(second["observation_flag"]), dtype=torch.bool,
+            device=second["observation_flag"].device)
+    if "contact_present" in second and "contact_present" not in first:
+        first["contact_present"] = torch.zeros(
+            len(first["observation_flag"]), dtype=torch.bool,
+            device=first["observation_flag"].device)
     result = {}
     for name in first:
         a, b = first[name], second[name].to(first[name].device)

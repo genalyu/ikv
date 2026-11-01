@@ -805,8 +805,8 @@ class WanTransformerBlock(nn.Module):
 
         ff_output = self.ffn(norm_hidden_states)
 
-        hidden_states = (hidden_states.float() +
-                         ff_output.float() * c_gate_msa).type_as(hidden_states)
+        hidden_states = torch.addcmul(hidden_states.float(),
+                                      ff_output.float(), c_gate_msa).type_as(hidden_states)
         return hidden_states
 
     # ───────────────────── MoT split (Mixture-of-Transformers) ─────────────────────
@@ -864,14 +864,30 @@ class WanTransformerBlock(nn.Module):
                                      update_cache=0,
                                      attn_mask=cross_attn_mask)
             hidden_states = hidden_states + attn_output
-        # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) *
-                              (1. + c_scale_msa) +
-                              c_shift_msa).type_as(hidden_states)
-        ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states.float() +
-                         ff_output.float() * c_gate_msa).type_as(hidden_states)
-        return hidden_states
+        # Token-local FFN: bound activation and fp32 residual temporaries.
+        import os
+        chunk = int(os.environ.get("IKV_FFN_TOKEN_CHUNK", "0"))
+        def feed_forward(h, shift, scale, gate):
+            n = (self.norm3(h.float()) * (1. + scale) + shift).type_as(h)
+            f = self.ffn(n)
+            return torch.addcmul(h.float(), f.float(), gate).type_as(h)
+        if chunk > 0 and hidden_states.shape[1] > chunk:
+            from torch.utils.checkpoint import checkpoint
+            def part(x, start, end):
+                return x[:, start:end] if x.shape[1] != 1 else x
+            outputs = []
+            for start in range(0, hidden_states.shape[1], chunk):
+                end = start + chunk
+                args = (hidden_states[:, start:end],
+                        part(c_shift_msa, start, end),
+                        part(c_scale_msa, start, end),
+                        part(c_gate_msa, start, end))
+                if torch.is_grad_enabled():
+                    outputs.append(checkpoint(feed_forward, *args, use_reentrant=False))
+                else:
+                    outputs.append(feed_forward(*args))
+            return torch.cat(outputs, dim=1)
+        return feed_forward(hidden_states, c_shift_msa, c_scale_msa, c_gate_msa)
 
 
 class ContactStateGate(nn.Module):
