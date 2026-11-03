@@ -234,7 +234,7 @@ def training_config(task, mode, world_size, *, require_ready=True):
         * len(cfg.obs_cam_keys)
     )
     cfg.kv_semantic_encoder = dict(runtime.get("semantic_encoder", {}) or {})
-    semantic_enabled = cfg.kv_semantic_encoder.get("backend", "dinov2") != "dinov2"
+    semantic_enabled = cfg.kv_semantic_encoder.get("backend", "dinov3") != "dinov3"
     if semantic_enabled and ikv:
         if cfg.kv_retention.get("version", 2) != 2:
             raise ValueError("semantic patch scoring requires IKV retention version 2")

@@ -32,7 +32,7 @@ At startup the server cross-checks the config against the checkpoint's
 config rather than bypassing the check.
 
 This fork defaults to full-RGB indexed KV with global retention and output-DINO
-annotation. Set `kv_index_dino_model_name_or_path` to local/cached DINOv2 weights;
+annotation. Set `kv_index_dino_model_name_or_path` to local/cached DINOv3 weights;
 no automatic download occurs. See [INDEXED_KV.md](INDEXED_KV.md) for configuration,
 extra decoding cost, and payloads. To run the original serving cache without
 DINO, explicitly set `kv_cache_policy='fifo'`.

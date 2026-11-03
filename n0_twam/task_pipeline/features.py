@@ -200,29 +200,29 @@ def build_tactile_payload(task, root, chunk, name, ids, anchors, encoder):
         # The converted action clock is 30Hz, each WAN world step spans 12 frames.
         return np.asarray(result,dtype=np.float32)/12.
     return dict(tactile_camera_keys=keys,tactile_grid_shape=[4,4],
-        tactile_semantic_backend="dinov2-native-rgb",
+        tactile_semantic_backend="dinov3-native-rgb",
         tactile_dino_features=torch.stack(features,dim=1),
         frame_contact_duration=torch.from_numpy(duration(contact.any(1))[anchor_ids]),
         tactile_contact_duration=torch.from_numpy(duration(contact)[anchor_ids]))
 
 
 def build_features(task, device="cuda"):
-    from n0_twam.preprocessing.dinov2 import FrozenDinoV2PatchEncoder
+    from n0_twam.preprocessing.dinov3 import FrozenDinoV3PatchEncoder
 
     root = paths(task)["dataset"]
     keys = list(task["robot"]["cameras"].values())
     model = task["runtime"].get("dino_model")
     semantic_config = dict(task["runtime"].get("semantic_encoder", {}) or {})
-    semantic_enabled = semantic_config.get("backend", "dinov2") != "dinov2"
-    tactile_semantics = task.get("features",{}).get("tactile_semantic_backend") == "dinov2"
+    semantic_enabled = semantic_config.get("backend", "dinov3") != "dinov3"
+    tactile_semantics = task.get("features",{}).get("tactile_semantic_backend") == "dinov3"
     if tactile_semantics and semantic_enabled:
-        raise ValueError("tactile DINO currently requires the DINO visual backend")
+        raise ValueError("tactile DINOv3 requires the raw DINOv3 visual backend")
     if not semantic_enabled and (not model or not Path(model).is_dir()):
         raise FileNotFoundError(
-            "Set runtime.dino_model to local DINOv2 weights; no implicit downloads"
+            "Set runtime.dino_model to local DINOv3 weights; no implicit downloads"
         )
     progress_path = root / "features.progress.json"
-    progress = dict(task_fingerprint=fingerprint(task), builder_version=3 if tactile_semantics else (2 if semantic_enabled else 1))
+    progress = dict(task_fingerprint=fingerprint(task), builder_version=4 if tactile_semantics else (2 if semantic_enabled else 1))
     if progress_path.exists():
         if json.loads(progress_path.read_text()) != progress:
             raise ValueError(
@@ -240,7 +240,8 @@ def build_features(task, device="cuda"):
         from n0_twam.preprocessing.semantic_patch import load_patch_encoder
         encoder = load_patch_encoder(semantic_config, device=device, prompt=task["prompt"])
     else:
-        encoder = FrozenDinoV2PatchEncoder.from_pretrained(model, device=device)
+        encoder = FrozenDinoV3PatchEncoder.from_pretrained(
+            model, device=device, torch_dtype=torch.bfloat16, image_size=tuple(task["runtime"].get("dino_image_size", [224,224])))
     latent_files = sorted((root / "latents").glob(f"chunk-*/{keys[0]}/episode_*.pth"))
     if not latent_files:
         raise FileNotFoundError("Encode RGB latents first")
@@ -278,9 +279,12 @@ def build_features(task, device="cuda"):
             old = torch.load(dense_dest, map_location="cpu", weights_only=True)
             semantic_matches = (old.get("semantic_provenance") == encoder.provenance()
                                 and "task_relevance" in old)
+        if not semantic_enabled and dense_dest.exists():
+            old = torch.load(dense_dest,map_location="cpu",weights_only=True)
+            semantic_matches = old.get("dino_provenance") == encoder.provenance()
         if tactile_semantics and dense_dest.exists():
             old = torch.load(dense_dest,map_location="cpu",weights_only=True)
-            semantic_matches = semantic_matches and old.get("tactile_semantic_backend") == "dinov2-native-rgb"
+            semantic_matches = semantic_matches and old.get("tactile_semantic_backend") == "dinov3-native-rgb"
         if semantic_matches and _existing_sidecars_match(
             motion_dest, dense_dest, ids, anchors, keys, threshold
         ):
@@ -299,6 +303,8 @@ def build_features(task, device="cuda"):
             encoder,
             threshold,
         )
+        if not semantic_enabled:
+            dense["dino_provenance"] = encoder.provenance()
         if tactile_semantics:
             dense.update(build_tactile_payload(task,root,chunk,lp.name,ids,anchors,encoder))
         for dest, payload in ((motion_dest, motion), (dense_dest, dense)):
@@ -314,9 +320,10 @@ def build_features(task, device="cuda"):
                 task_fingerprint=fingerprint(task),
                 episodes=len(latent_files),
                 dino_model=model,
+                dino_provenance=encoder.provenance() if not semantic_enabled else None,
                 semantic_provenance=encoder.provenance() if semantic_enabled else None,
                 neoforce="unavailable; zero width",
-                tactile_semantic_backend="dinov2-native-rgb" if tactile_semantics else None,
+                tactile_semantic_backend="dinov3-native-rgb" if tactile_semantics else None,
                 threshold=task.get("features", {}).get("motion_threshold", 0.02),
             ),
             indent=2,

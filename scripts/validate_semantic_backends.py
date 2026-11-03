@@ -18,11 +18,6 @@ PROMPT = "Remember which USB slot is highlighted. After the highlight disappears
 def configurations(root):
     shared = dict(image_size=[224,224],dtype="bfloat16",task_temperature=.07,task_bias=0.)
     return {
-        "dinov2_txt": dict(shared,backend="dinov2_txt",repo=str(root/"dinov2"),
-            backbone_weights=str(root/"dinov2_vitl14_reg4_pretrain.pth"),
-            head_weights=str(root/"dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_vision_head.pth"),
-            text_weights=str(root/"dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_text_encoder.pth"),
-            bpe=str(root/"bpe_simple_vocab_16e6.txt.gz")),
         "dinov3_txt": dict(shared,backend="dinov3_txt",repo=str(root/"dinov3"),
             backbone_weights=str(root/"dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"),
             head_weights=str(root/"dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth"),

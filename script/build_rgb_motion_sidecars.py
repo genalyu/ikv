@@ -8,7 +8,7 @@ per-camera WAN latent files used by training, and the exact raw-frame anchors
 corresponding to WAN latent time steps.
 
 All relative paths in the manifest are resolved relative to the manifest
-file.  DINOv2 loading is local-only unless ``--allow-dino-download`` is passed
+file.  DINOv3 loading is local-only unless ``--allow-dino-download`` is passed
 explicitly.
 """
 
@@ -31,7 +31,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from n0_twam.models.rgb_motion import EgoMotionCompensatedMotionDetector
-from n0_twam.preprocessing.dinov2 import FrozenDinoV2PatchEncoder
+from n0_twam.preprocessing.dinov3 import FrozenDinoV3PatchEncoder
 from n0_twam.preprocessing.rgb_motion_sequence import (
     RGBDCameraSequence,
     RGBMotionSequencePreprocessor,
@@ -90,7 +90,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--allow-dino-download",
         action="store_true",
-        help="Explicitly permit Hugging Face network loading for DINOv2.",
+        help="Explicitly permit Hugging Face network loading for DINOv3.",
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
@@ -532,7 +532,7 @@ def _model_source(value: str, manifest_dir: Path) -> str:
     manifest_relative = (manifest_dir / candidate).resolve()
     if manifest_relative.exists():
         return str(manifest_relative)
-    # Keep a cached Hugging Face model id such as facebook/dinov2-base intact.
+    # Keep a cached Hugging Face model id such as facebook/dinov3-vitl16-pretrain-lvd1689m intact.
     return value
 
 
@@ -544,7 +544,7 @@ def _make_dino_encoder(
     device: str,
     dtype: torch.dtype,
     allow_download: bool,
-) -> FrozenDinoV2PatchEncoder:
+) -> FrozenDinoV3PatchEncoder:
     source = (
         model_override if model_override is not None else manifest.get("dino_model")
     )
@@ -554,7 +554,7 @@ def _make_dino_encoder(
             "encoder is injected"
         )
     image_size = manifest.get("dino_image_size", [224, 224])
-    return FrozenDinoV2PatchEncoder.from_pretrained(
+    return FrozenDinoV3PatchEncoder.from_pretrained(
         _model_source(source, manifest_dir),
         local_files_only=not allow_download,
         device=device,

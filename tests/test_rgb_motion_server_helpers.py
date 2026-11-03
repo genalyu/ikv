@@ -1447,7 +1447,7 @@ def test_online_rgb_motion_requires_sparse_mode_and_positive_fixed_budget():
 
 
 def test_online_preprocessor_lazy_loads_dino_local_only(monkeypatch):
-    from n0_twam.preprocessing.dinov2 import FrozenDinoV2PatchEncoder
+    from n0_twam.preprocessing.dinov3 import FrozenDinoV3PatchEncoder
 
     calls = []
 
@@ -1460,17 +1460,17 @@ def test_online_preprocessor_lazy_loads_dino_local_only(monkeypatch):
         return _FakeDino()
 
     monkeypatch.setattr(
-        FrozenDinoV2PatchEncoder, "from_pretrained", fake_from_pretrained
+        FrozenDinoV3PatchEncoder, "from_pretrained", fake_from_pretrained
     )
     server = _server(online=True)
-    server.job_config.rgb_motion_dino_model_name_or_path = "/local/dinov2"
+    server.job_config.rgb_motion_dino_model_name_or_path = "/local/dinov3"
 
     first = server._get_rgb_motion_preprocessor()
     second = server._get_rgb_motion_preprocessor()
 
     assert first is second
     assert len(calls) == 1
-    assert calls[0][0] == "/local/dinov2"
+    assert calls[0][0] == "/local/dinov3"
     assert calls[0][1]["local_files_only"] is True
     assert first.detector.max_tokens is None
     assert first.camera_keys == ("camera",)

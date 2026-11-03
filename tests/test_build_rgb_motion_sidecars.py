@@ -95,7 +95,7 @@ def _write_fixture(tmp_path: Path, *, camera_order=("cam_a", "cam_b")) -> Path:
         "schema_version": 1,
         "camera_keys": ["cam_a", "cam_b"],
         "output_root": "rgb_motion",
-        "dino_model": "locally-cached-dinov2",
+        "dino_model": "locally-cached-dinov3",
         "max_tokens": 2,
         "patch_size": [1, 2, 2],
         "first_frame_policy": "empty",
@@ -333,7 +333,7 @@ def test_all_existing_outputs_skip_without_loading_dino_checkpoint(
         raise AssertionError("DINO must not load when every output is skipped")
 
     monkeypatch.setattr(
-        BUILDER.FrozenDinoV2PatchEncoder,
+        BUILDER.FrozenDinoV3PatchEncoder,
         "from_pretrained",
         unexpected_dino_load,
     )
@@ -399,7 +399,7 @@ def test_latent_chunk_mismatch_fails_before_dino_loading(
         raise AssertionError("chunk validation must run before DINO loading")
 
     monkeypatch.setattr(
-        BUILDER.FrozenDinoV2PatchEncoder,
+        BUILDER.FrozenDinoV3PatchEncoder,
         "from_pretrained",
         unexpected_dino_load,
     )
@@ -431,7 +431,7 @@ def test_latent_path_without_standard_chunk_directory_is_rejected(
         raise AssertionError("chunk validation must run before DINO loading")
 
     monkeypatch.setattr(
-        BUILDER.FrozenDinoV2PatchEncoder,
+        BUILDER.FrozenDinoV3PatchEncoder,
         "from_pretrained",
         unexpected_dino_load,
     )
@@ -456,7 +456,7 @@ def test_cli_dino_loading_is_local_only_unless_explicitly_enabled(
         return FakeDinoEncoder()
 
     monkeypatch.setattr(
-        BUILDER.FrozenDinoV2PatchEncoder,
+        BUILDER.FrozenDinoV3PatchEncoder,
         "from_pretrained",
         fake_from_pretrained,
     )
@@ -466,7 +466,7 @@ def test_cli_dino_loading_is_local_only_unless_explicitly_enabled(
     )
 
     assert len(calls) == 1
-    assert calls[0][0] == "locally-cached-dinov2"
+    assert calls[0][0] == "locally-cached-dinov3"
     assert calls[0][1]["local_files_only"] is expected_local_only
 
 

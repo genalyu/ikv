@@ -24,7 +24,7 @@ twam_shared_cfg.kv_retention = dict(
 # Already-cached/local DINO only. Alternatively provide obs['kv_index']['dino'].
 # To run without DINO, disable BOTH online observation and predicted DINO.
 twam_shared_cfg.kv_index_dino_online = True
-twam_shared_cfg.kv_index_dino_model_name_or_path = 'facebook/dinov2-base'
+twam_shared_cfg.kv_index_dino_model_name_or_path = 'facebook/dinov3-vitl16-pretrain-lvd1689m'
 twam_shared_cfg.kv_index_dino_device = 'cpu'
 twam_shared_cfg.kv_index_dino_image_size = (224, 224)
 # After the FINAL video forward only: decode for DINO labels, never feed the
@@ -48,10 +48,10 @@ twam_shared_cfg.rgb_motion_require_index = True
 twam_shared_cfg.rgb_motion_online_preprocess = False
 # Supported online input contract: native RGB only; no depth/geometry required.
 twam_shared_cfg.rgb_motion_input_mode = 'rgb'
-# DINOv2-B/14 may be either a local directory or an already-cached HF model id.
+# DINOv3-L/16 may be either a local directory or an already-cached HF model id.
 # The server always calls from_pretrained(..., local_files_only=True): it never
 # downloads weights implicitly while serving.
-twam_shared_cfg.rgb_motion_dino_model_name_or_path = 'facebook/dinov2-base'
+twam_shared_cfg.rgb_motion_dino_model_name_or_path = 'facebook/dinov3-vitl16-pretrain-lvd1689m'
 twam_shared_cfg.rgb_motion_dino_device = 'cpu'
 twam_shared_cfg.rgb_motion_dino_image_size = (224, 224)
 twam_shared_cfg.rgb_motion_dino_float_input_range = '0_1'

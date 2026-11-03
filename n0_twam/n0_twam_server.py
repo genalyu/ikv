@@ -987,14 +987,14 @@ class TWAM_Server:
         """Real RGB only; independent of the legacy motion detector."""
         encoder = getattr(self, '_kv_dino_encoder', None)
         if encoder is None:
-            from n0_twam.preprocessing.dinov2 import FrozenDinoV2PatchEncoder
+            from n0_twam.preprocessing.dinov3 import FrozenDinoV3PatchEncoder
             device = getattr(self.job_config, 'kv_index_dino_device', 'cpu')
             if str(device) == 'server':
                 device = self.device
             from n0_twam.preprocessing.semantic_patch import load_patch_encoder
             semantic_config = dict(getattr(self.job_config, 'kv_semantic_encoder', {}) or {})
             semantic_config.setdefault('model', getattr(self.job_config,
-                'kv_index_dino_model_name_or_path', 'facebook/dinov2-base'))
+                'kv_index_dino_model_name_or_path', 'facebook/dinov3-vitl16-pretrain-lvd1689m'))
             semantic_config.setdefault('image_size', getattr(self.job_config,
                 'kv_index_dino_image_size', (224, 224)))
             encoder = load_patch_encoder(semantic_config, device=device,
@@ -1028,7 +1028,7 @@ class TWAM_Server:
             return self._get_sys2_client().index(videos, anchors, target, device=self.device)
         payload = dict(obs.get('kv_index') or {})
         semantic = dict(getattr(self.job_config, 'kv_semantic_encoder', {}) or {})
-        semantic_enabled = semantic.get('backend', 'dinov2') != 'dinov2'
+        semantic_enabled = semantic.get('backend', 'dinov3') != 'dinov3'
         task_enabled = bool(dict(getattr(self.job_config, 'kv_retention', {})).get('task_weight', 0))
         if task_enabled and not semantic_enabled and 'task_relevance' not in payload:
             raise ValueError('task_weight requires a semantic backend or supplied patch relevance')
@@ -1246,7 +1246,7 @@ class TWAM_Server:
         from n0_twam.models.rgb_motion import (
             EgoMotionCompensatedMotionDetector,
         )
-        from n0_twam.preprocessing.dinov2 import FrozenDinoV2PatchEncoder
+        from n0_twam.preprocessing.dinov3 import FrozenDinoV3PatchEncoder
         from n0_twam.preprocessing.rgb_motion_sequence import (
             RGBMotionSequencePreprocessor,
         )
@@ -1256,12 +1256,12 @@ class TWAM_Server:
             source = getattr(
                 self.job_config,
                 'rgb_motion_dino_model_name_or_path',
-                'facebook/dinov2-base',
+                'facebook/dinov3-vitl16-pretrain-lvd1689m',
             )
             if not isinstance(source, (str, os.PathLike)) or not str(source):
                 raise ValueError(
                     "rgb_motion_dino_model_name_or_path must name a local "
-                    "DINOv2 checkpoint or an already-cached model id."
+                    "DINOv3 checkpoint or an already-cached model id."
                 )
             dino_device = getattr(
                 self.job_config, 'rgb_motion_dino_device', 'cpu')
@@ -1269,7 +1269,7 @@ class TWAM_Server:
                 dino_device = self.device
             # Serving is deliberately local-only.  There is no config switch
             # which can accidentally authorize a network download.
-            dino_encoder = FrozenDinoV2PatchEncoder.from_pretrained(
+            dino_encoder = FrozenDinoV3PatchEncoder.from_pretrained(
                 source,
                 local_files_only=True,
                 device=dino_device,

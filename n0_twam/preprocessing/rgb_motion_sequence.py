@@ -1,6 +1,6 @@
 """Sequence-level RGB-D preprocessing for sparse N0-TWAM video tokens.
 
-This module deliberately owns no DINOv2 weights and no dataset I/O.  Callers
+This module deliberately owns no DINOv3 weights and no dataset I/O.  Callers
 inject a patch encoder and the motion detector, then provide already aligned
 RGB/depth/calibration sequences.  Keeping this layer independent makes the
 same temporal and multi-camera logic usable by an offline sidecar builder and

@@ -12,14 +12,14 @@ switches and their serving configuration.
 ## Enable and run
 
 The shared defaults now enable this mode. In your chosen serving config, set a
-local DINOv2 checkpoint (or an already cached Hugging Face model ID):
+local DINOv3 checkpoint (or an already cached Hugging Face model ID):
 
 ```python
 cfg.use_rgb_motion_tokens = False
 cfg.kv_cache_policy = 'global'
 cfg.kv_index_dino_online = True
 cfg.kv_index_predicted_dino = True
-cfg.kv_index_dino_model_name_or_path = '/path/to/local/dinov2-base'
+cfg.kv_index_dino_model_name_or_path = '/path/to/local/dinov3-vitl16-pretrain-lvd1689m'
 cfg.kv_index_dino_device = 'server'  # GPU; 'cpu' is also supported
 cfg.kv_index_dino_image_size = (224, 224)
 cfg.kv_retention = dict(
@@ -50,7 +50,7 @@ importance is zero. To restore the original cache policy entirely, select
 
 1. Real RGB is resized and encoded by the existing streaming WAN VAE. All WAN
    patches enter the original model; no motion mask or patch gather is used.
-2. Frozen DINOv2 runs on real RGB at the causal endpoints represented by those
+2. Frozen DINOv3 runs on real RGB at the causal endpoints represented by those
    latent frames. DINO features are pooled to each camera's WAN patch grid and
    flattened in exactly `(frame, row, concatenated-camera-column)` order.
 3. Each committed video/action/tactile token receives independent metadata.

@@ -116,7 +116,7 @@ CameraIntrinsics_previous[, CameraIntrinsics_current]
 默认建议的单相机网格对齐为：
 
 ```text
-DINOv2 ViT-B/14, 224x224 input  -> 16x16 DINO patches
+DINOv3 ViT-L/16, 256x256 input  -> 16x16 DINO patches
 WAN VAE, 256x256 RGB            -> 16x16 latent
 WAN transformer patch (1,2,2)  ->  8x8 video tokens
 ```
@@ -183,7 +183,7 @@ WAN transformer patch (1,2,2)  ->  8x8 video tokens
   "schema_version": 1,
   "camera_keys": ["observation.images.top", "observation.images.wrist_l"],
   "output_root": "../dataset/rgb_motion",
-  "dino_model": "/models/dinov2-base",
+  "dino_model": "/models/dinov3-vitl16-pretrain-lvd1689m",
   "dino_image_size": [224, 224],
   "max_tokens": 32,
   "patch_size": [1, 2, 2],
@@ -267,7 +267,7 @@ python script/build_rgb_motion_sidecars.py \
   --device cuda
 ```
 
-DINOv2 默认 `local_files_only=True`，本地路径/缓存缺失会明确失败，不会静默访问网络。只有显式添加 `--allow-dino-download` 才允许下载。构建器会在加载 DINO 前解析全部输出地址并检查上述 latent chunk 路径契约；已存在的 sidecar 默认跳过，只处理尚缺失的 segment。若全部输出都存在，则会直接成功退出，既不读取已跳过 segment 的 bundle/latent payload，也不要求 DINO checkpoint。确认需要重新生成时使用 `--overwrite`。由于 `.pth` 使用 PyTorch 反序列化，manifest、bundle 和 latent 文件都应来自受信任来源。
+DINOv3 默认 `local_files_only=True`，本地路径/缓存缺失会明确失败，不会静默访问网络。只有显式添加 `--allow-dino-download` 才允许下载。构建器会在加载 DINO 前解析全部输出地址并检查上述 latent chunk 路径契约；已存在的 sidecar 默认跳过，只处理尚缺失的 segment。若全部输出都存在，则会直接成功退出，既不读取已跳过 segment 的 bundle/latent payload，也不要求 DINO checkpoint。确认需要重新生成时使用 `--overwrite`。由于 `.pth` 使用 PyTorch 反序列化，manifest、bundle 和 latent 文件都应来自受信任来源。
 
 ## 6. 训练数据流
 
@@ -284,7 +284,7 @@ DINOv2 默认 `local_files_only=True`，本地路径/缓存缺失会明确失败
 
 ## 7. Serving 数据流
 
-server 不会在 diffusion denoising 循环里运行 DINOv2。最稳定的接口仍是客户端预先计算 canonical sidecar，并作为 `obs["rgb_motion"]` 发送：
+server 不会在 diffusion denoising 循环里运行 DINOv3。最稳定的接口仍是客户端预先计算 canonical sidecar，并作为 `obs["rgb_motion"]` 发送：
 
 ```python
 obs["rgb_motion"] = {
@@ -353,7 +353,7 @@ obs["rgb_motion_inputs"] = {
 
 `first_frame_policy=require_previous` 时，startup/reset 后第一次 raw 调用必须带 `previous`，否则立即报冷启动错误。每次成功处理后，server 保存每台相机 `anchor_indices[-1]` 指向的 raw RGB/depth/pose/intrinsics，而不是无条件保存 raw 序列尾帧；因此下次比较严格接在最新的实际 WAN anchor 上。下次可以不再传 `previous`；reset 会清空这些状态。`empty` 和 `all` 不要求 previous，但 `all` 的 token budget 必须容纳完整多相机网格。
 
-如果同一个 observation 同时含有 `rgb_motion` 和 `rgb_motion_inputs`，预计算 `rgb_motion` 始终优先，raw producer 不会运行。在线 DINOv2 仅在第一个确实需要 raw 处理的 observation 才懒加载，并强制 `local_files_only=True`；本地目录/Hugging Face cache 缺失时明确失败，不会在 serving 期间自动下载。
+如果同一个 observation 同时含有 `rgb_motion` 和 `rgb_motion_inputs`，预计算 `rgb_motion` 始终优先，raw producer 不会运行。在线 DINOv3 仅在第一个确实需要 raw 处理的 observation 才懒加载，并强制 `local_files_only=True`；本地目录/Hugging Face cache 缺失时明确失败，不会在 serving 期间自动下载。
 
 canonical `rgb_motion` 中的 `world_time_id` 和 `observation_flag` 即使由客户端提供，server 也会按当前调用的真实语义重新生成：grounding 为 `observation_flag=1`，future imagination 为 `0`，world time 使用当前 `frame_st_id` 起的 WAN latent-step 坐标。raw `rgb_motion_inputs.world_time_ids` 如果显式给出，则会先校验它与这个坐标完全相等，不会先接受再静默忽略。这里的 `frame_st_id` 同样不是原始相机帧号或 diffusion timestep。
 
@@ -396,7 +396,7 @@ cfg.rgb_motion_require_index = True
 
 ```python
 cfg.rgb_motion_online_preprocess = True
-cfg.rgb_motion_dino_model_name_or_path = "/local/models/dinov2-base"
+cfg.rgb_motion_dino_model_name_or_path = "/local/models/dinov3-vitl16-pretrain-lvd1689m"
 cfg.rgb_motion_dino_device = "cpu"  # 也可显式指定 cuda device
 cfg.rgb_motion_dino_image_size = (224, 224)
 cfg.rgb_motion_dino_float_input_range = "0_1"  # 仅影响 float RGB
@@ -432,7 +432,7 @@ detector = EgoMotionCompensatedMotionDetector(
 
 RGB motion v1 刻意只完成“二维运动区域稀疏化 + 独立语义 index”这一层：
 
-- 仓库现在同时支持预计算 `obs["rgb_motion"]` 和 opt-in `obs["rgb_motion_inputs"]` raw RGB-D 路径；后者使用懒加载、仅本地的 frozen DINOv2，且只在 observation grounding 之前运行一次。
+- 仓库现在同时支持预计算 `obs["rgb_motion"]` 和 opt-in `obs["rgb_motion_inputs"]` raw RGB-D 路径；后者使用懒加载、仅本地的 frozen DINOv3，且只在 observation grounding 之前运行一次。
 - 自动离线/在线 producer 当前是 **RGB-only**：它输出宽度为 0 的 NeoForce 和 `tactile_valid=False`。canonical sidecar 接口可以接收外部提供的 NeoForce，但仓库尚未实现 NeoForce encoder，也没有实现“触觉接触关联到哪个运动 patch”的生产逻辑。
 - DINO、NeoForce 和 `world_time_id` 当前作为彼此独立的 cache sidecar metadata 保存，可读取但不会进入 Q/K/V、attention score 或训练 loss。`observation_flag` 会参与 observed/predicted cache 状态管理。也就是说，语义 index 的存储通路已经接好，利用各分量做检索、替换或压缩的在线策略尚未接好。
 - future imagination 当前沿用最近一次真实观测的 motion support 和 DINO/NeoForce，仅更新 `world_time_id` 并标记 `observation_flag=0`；它没有预测新的 motion mask、DINO、NeoForce 或 identity。这里是稀疏 denoising 支撑集的 carry-forward，不是完整世界模型的 index prediction head。

@@ -58,7 +58,7 @@ LeRobot 使用 --no-deps 是为了避免替换训练环境的 torch 等固定依
 export TASK_SOURCE=/path/to/yanqiang.tar
 export TASK_WORK_ROOT=/path/to/task_outputs
 export BASE_CHECKPOINT=/path/to/n0-twam-base
-export DINO_MODEL=/path/to/local/dinov2-base
+export DINO_MODEL=/path/to/local/dinov3-vitl16-pretrain-lvd1689m
 TASK=examples/tasks/ur5e_phone_weight.json
 ```
 

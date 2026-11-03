@@ -1,10 +1,10 @@
-"""Frozen DINOv2 patch feature extraction without implicit network access.
+"""Frozen DINOv3 patch feature extraction without implicit network access.
 
 The RGB-motion path treats DINO features as semantic index metadata.  This
 module therefore remains separate from the N0-TWAM transformer and never adds
 the extracted features to WAN content embeddings or Q/K/V values.
 
-Construct :class:`FrozenDinoV2PatchEncoder` with an existing model for tests or
+Construct :class:`FrozenDinoV3PatchEncoder` with an existing model for tests or
 for applications which manage model loading themselves.  The optional
 ``from_pretrained`` constructor imports ``transformers`` lazily and defaults to
 ``local_files_only=True``; importing this module never loads weights or touches
@@ -16,6 +16,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+import json
+import hashlib
+import importlib
+import sys
+import subprocess
 from typing import Any, Literal
 
 import torch
@@ -65,6 +71,18 @@ def _model_device_and_dtype(
     return fallback_device, torch.float32
 
 
+class OfficialDinoV3Adapter(nn.Module):
+    """Expose only normalized spatial patch tokens from the official backbone."""
+    def __init__(self, backbone):
+        super().__init__()
+        self.backbone = backbone
+        self.config = SimpleNamespace(model_type="dinov3_vit",patch_size=16)
+
+    def forward(self, *, pixel_values, return_dict=True):
+        features = self.backbone.forward_features(pixel_values)
+        return SimpleNamespace(last_hidden_state=features["x_norm_patchtokens"])
+
+
 @dataclass(frozen=True)
 class DinoPatchOutput:
     """Dense, channels-last DINO patch tokens for one image batch."""
@@ -101,7 +119,7 @@ class DinoPatchOutput:
         return self.tokens.flatten(1, 2)
 
 
-class FrozenDinoV2PatchEncoder(nn.Module):
+class FrozenDinoV3PatchEncoder(nn.Module):
     """Run a permanently frozen DINO-style model and return patch tokens.
 
     Input is RGB in ``(B,3,H,W)`` or ``(B,H,W,3)`` form. ``uint8`` inputs use
@@ -194,20 +212,55 @@ class FrozenDinoV2PatchEncoder(nn.Module):
         patch_size: int | Sequence[int] | None = None,
         float_input_range: FloatInputRange = "0_1",
         output_dtype: torch.dtype | None = torch.float32,
-    ) -> "FrozenDinoV2PatchEncoder":
+    ) -> "FrozenDinoV3PatchEncoder":
         """Load weights and normalization metadata, locally by default.
 
         Set ``local_files_only=False`` explicitly to authorize Hugging Face
         downloads. No online fallback is attempted after a local-only failure.
         """
 
+        source_root = Path(pretrained_model_name_or_path)
+        descriptor = source_root / "dinov3_encoder.json"
+        if descriptor.is_file():
+            spec = json.loads(descriptor.read_text())
+            repo = (source_root / spec["repo"]).resolve()
+            weights = (source_root / spec["backbone_weights"]).resolve()
+            if not repo.is_relative_to(source_root.resolve()) or not weights.is_relative_to(source_root.resolve()):
+                raise ValueError("DINOv3 descriptor assets must stay inside the local model directory")
+            actual_revision = subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip()
+            if actual_revision != spec["repo_revision"]:
+                raise ValueError("DINOv3 official source revision differs")
+            if subprocess.check_output(["git","-C",str(repo),"status","--porcelain","--untracked-files=no"],text=True):
+                raise ValueError("DINOv3 official source must be clean")
+            digest = hashlib.sha256()
+            with weights.open("rb") as stream:
+                for block in iter(lambda:stream.read(8*1024**2),b""):digest.update(block)
+            if digest.hexdigest() != spec["sha256"]:
+                raise ValueError("DINOv3 backbone SHA256 differs")
+            sys.path.insert(0,str(repo))
+            try:
+                module = importlib.import_module("dinov3.hub.backbones")
+            finally:
+                sys.path.remove(str(repo))
+            if not Path(module.__file__).resolve().is_relative_to(repo):
+                raise ValueError("DINOv3 module came from a different checkout")
+            backbone = module.dinov3_vitl16(pretrained=False)
+            backbone.load_state_dict(torch.load(weights,map_location="cpu",weights_only=True),strict=True)
+            model = OfficialDinoV3Adapter(backbone).to(device=device,dtype=torch_dtype)
+            encoder = cls(model,patch_size=16,image_size=image_size,
+                          float_input_range=float_input_range,output_dtype=output_dtype)
+            encoder.pretrained_source = str(source_root)
+            encoder.pretrained_revision = actual_revision
+            encoder.backbone_sha256 = spec["sha256"]
+            return encoder
+
         try:
             from transformers import AutoImageProcessor, AutoModel
         except (ImportError, ModuleNotFoundError) as exc:
             raise RuntimeError(
-                "Loading DINOv2 weights requires the 'transformers' package. "
+                "Loading DINOv3 weights requires the 'transformers' package. "
                 "Install the project dependencies, or inject an existing "
-                "torch.nn.Module into FrozenDinoV2PatchEncoder(model=...)."
+                "torch.nn.Module into FrozenDinoV3PatchEncoder(model=...)."
             ) from exc
 
         source = str(pretrained_model_name_or_path)
@@ -238,9 +291,11 @@ class FrozenDinoV2PatchEncoder(nn.Module):
                     "the requested source."
                 )
             raise RuntimeError(
-                f"Failed to load DINOv2 from {source!r}. {detail}"
+                f"Failed to load DINOv3 from {source!r}. {detail}"
             ) from exc
 
+        if getattr(model.config, "model_type", None) != "dinov3_vit":
+            raise ValueError("Expected a DINOv3 ViT checkpoint (model_type=dinov3_vit)")
         mean = getattr(processor, "image_mean", None)
         std = getattr(processor, "image_std", None)
         if mean is None or std is None:
@@ -262,7 +317,17 @@ class FrozenDinoV2PatchEncoder(nn.Module):
         encoder.pretrained_revision = revision
         return encoder
 
-    def train(self, mode: bool = True) -> "FrozenDinoV2PatchEncoder":
+    def provenance(self):
+        return dict(backend="dinov3", repo_revision=getattr(self,"pretrained_revision",None),
+                    backbone_sha256=getattr(self,"backbone_sha256",None),
+                    source=getattr(self,"pretrained_source",None),
+                    image_size=list(self.image_size),patch_size=list(self.patch_size),
+                    dtype=str(next(self.model.parameters()).dtype),
+                    image_mean=self.image_mean.flatten().tolist(),
+                    image_std=self.image_std.flatten().tolist(),
+                    resize="full_field_bicubic_antialias",pixel_layout="contiguous_NCHW")
+
+    def train(self, mode: bool = True) -> "FrozenDinoV3PatchEncoder":
         """Keep the wrapper and its model in eval mode permanently."""
 
         super().train(False)
@@ -311,7 +376,7 @@ class FrozenDinoV2PatchEncoder(nn.Module):
         # Exact full-frame resize: deliberately no shortest-edge resize and no
         # center crop, so normalized patch locations stay aligned with depth.
         values = F.interpolate(
-            values,
+            values.contiguous(),
             size=self.image_size,
             mode="bicubic",
             align_corners=False,
@@ -321,7 +386,7 @@ class FrozenDinoV2PatchEncoder(nn.Module):
             values.device
         )
         model_device, model_dtype = _model_device_and_dtype(self.model, values.device)
-        return values.to(device=model_device, dtype=model_dtype)
+        return values.to(device=model_device, dtype=model_dtype).contiguous()
 
     @staticmethod
     def _last_hidden_state(output: Any) -> torch.Tensor:
@@ -382,4 +447,4 @@ class FrozenDinoV2PatchEncoder(nn.Module):
         )
 
 
-__all__ = ["DinoPatchOutput", "FrozenDinoV2PatchEncoder"]
+__all__ = ["DinoPatchOutput", "FrozenDinoV3PatchEncoder"]

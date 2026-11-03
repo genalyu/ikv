@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from n0_twam.preprocessing.dinov2 import (
+from n0_twam.preprocessing.dinov3 import (
     DinoPatchOutput,
-    FrozenDinoV2PatchEncoder,
+    FrozenDinoV3PatchEncoder,
 )
 
 
@@ -23,7 +23,7 @@ class FakeDino(nn.Module):
         feature_dim: int = 4,
     ) -> None:
         super().__init__()
-        self.config = SimpleNamespace(patch_size=patch_size)
+        self.config = SimpleNamespace(patch_size=patch_size, model_type="dinov3_vit")
         self.scale = nn.Parameter(torch.tensor(1.0))
         self.prefix_tokens = prefix_tokens
         self.feature_dim = feature_dim
@@ -52,7 +52,7 @@ class FakeDino(nn.Module):
 
 
 def _encoder(model=None, **kwargs):
-    return FrozenDinoV2PatchEncoder(
+    return FrozenDinoV3PatchEncoder(
         model or FakeDino(),
         image_size=(4, 6),
         image_mean=(0.0, 0.0, 0.0),
@@ -168,8 +168,8 @@ def test_from_pretrained_is_local_only_and_uses_processor_statistics(
     fake_transformers.AutoModel = FakeAutoModel
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-    encoder = FrozenDinoV2PatchEncoder.from_pretrained(
-        "local/dinov2",
+    encoder = FrozenDinoV3PatchEncoder.from_pretrained(
+        "local/dinov3",
         revision="fixed-revision",
         image_size=(4, 6),
     )
@@ -185,7 +185,7 @@ def test_from_pretrained_is_local_only_and_uses_processor_statistics(
     torch.testing.assert_close(
         encoder.image_std.flatten(), torch.tensor([0.4, 0.5, 0.6])
     )
-    assert encoder.pretrained_source == "local/dinov2"
+    assert encoder.pretrained_source == "local/dinov3"
     assert encoder.pretrained_revision == "fixed-revision"
 
 
@@ -206,7 +206,7 @@ def test_local_only_load_failure_has_actionable_error(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     with pytest.raises(RuntimeError, match="No network request was attempted") as exc:
-        FrozenDinoV2PatchEncoder.from_pretrained("not-in-cache")
+        FrozenDinoV3PatchEncoder.from_pretrained("not-in-cache")
     assert "local_files_only=False" in str(exc.value)
 
 
@@ -226,14 +226,14 @@ def test_rgb_input_validation_is_clear(rgb, error) -> None:
 
 def test_patch_and_output_shape_validation_is_clear() -> None:
     with pytest.raises(ValueError, match="must be divisible"):
-        FrozenDinoV2PatchEncoder(FakeDino(patch_size=3), image_size=(4, 6))
+        FrozenDinoV3PatchEncoder(FakeDino(patch_size=3), image_size=(4, 6))
 
     class MissingPatchConfig(nn.Module):
         def forward(self, **kwargs):
             raise AssertionError
 
     with pytest.raises(ValueError, match="config.patch_size is missing"):
-        FrozenDinoV2PatchEncoder(MissingPatchConfig())
+        FrozenDinoV3PatchEncoder(MissingPatchConfig())
 
     class TooShortDino(FakeDino):
         def forward(self, **kwargs):
@@ -253,3 +253,28 @@ def test_output_dtype_can_be_preserved_or_selected() -> None:
 
     selected = _encoder(FakeDino(), output_dtype=torch.float16)(rgb)
     assert selected.tokens.dtype is torch.float16
+
+
+def test_official_adapter_returns_only_normalized_spatial_tokens():
+    from n0_twam.preprocessing.dinov3 import OfficialDinoV3Adapter
+    class Backbone(nn.Module):
+        def forward_features(self,pixels):
+            return {"x_norm_patchtokens":torch.ones(len(pixels),6,32),
+                    "x_norm_clstoken":torch.full((len(pixels),32),-100.),
+                    "x_norm_regtokens":torch.full((len(pixels),4,32),-200.)}
+    encoder = FrozenDinoV3PatchEncoder(OfficialDinoV3Adapter(Backbone()),image_size=(32,48))
+    result = encoder(torch.randint(0,256,(2,39,51,3),dtype=torch.uint8))
+    assert result.tokens.shape == (2,2,3,32)
+    assert result.tokens.eq(1).all() and not result.tokens.requires_grad
+
+
+def test_pretrained_rejects_old_backbone(monkeypatch):
+    fake = types.ModuleType("transformers")
+    model = FakeDino()
+    model.config.model_type = "dinov2"
+    fake.AutoImageProcessor = SimpleNamespace(from_pretrained=lambda *a,**kw:
+        SimpleNamespace(image_mean=[.485,.456,.406],image_std=[.229,.224,.225]))
+    fake.AutoModel = SimpleNamespace(from_pretrained=lambda *a,**kw:model)
+    monkeypatch.setitem(sys.modules,"transformers",fake)
+    with pytest.raises(ValueError,match="DINOv3 ViT checkpoint"):
+        FrozenDinoV3PatchEncoder.from_pretrained("incompatible-local-checkpoint")

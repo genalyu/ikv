@@ -49,7 +49,7 @@ class TextModel(nn.Module):
         return torch.stack((-value, value * 0, value, value * 0), dim=-1)
 
 
-@pytest.mark.parametrize("backend", ["dinov2_txt", "dinov3_txt"])
+@pytest.mark.parametrize("backend", ["dinov3_txt"])
 def test_dinotxt_uses_local_half_and_one_backbone_pass(backend):
     model = TextModel()
     encoder = FrozenSemanticPatchEncoder(model, TextTokenizer(), backend=backend,

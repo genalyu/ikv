@@ -1,12 +1,12 @@
 # Native tactile semantic sidecars
 
-Set `features.tactile_semantic_backend="dinov2"` with
+Set `features.tactile_semantic_backend="dinov3"` with
 `formula_variant="screenshot_v1"` and `random_weight=0.1`.
 
 The builder reads native tactile RGB, runs the same frozen DINO encoder used for
 visual indexing, and pools each sensor to a 4x4 grid matching 8x8 tactile VAE
 latents with 2x2 transformer patches. Features are detached metadata, never added
-to latent content or Q/K/V. The cache records `dinov2-native-rgb`; it does not
+to latent content or Q/K/V. The cache records `dinov3-native-rgb`; it does not
 claim to be a NeoForce model output.
 
 The sidecar stores tactile features as [world frame, sensor, 16 patches, D].

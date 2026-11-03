@@ -5,7 +5,7 @@ from urllib.request import urlopen, Request
 from urllib.parse import urlencode
 
 # Verified released bytes; reject incomplete existing official files.
-OFFICIAL_ASSETS = {'dinov2_vitl14_reg4_pretrain.pth': (1217607321, '36e4deffbaef061a2576705b0c36f93621e2ae20bf6274694821b0b492551b51'), 'dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_vision_head.pth': (101317814, '706fba5bcb7019d80e127f0ff123872a75e0e6099527cf1911db85bd61c88ef5'), 'dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_text_encoder.pth': (2152639923, '13378274c79f67af8b47b11dd57827d659e7b1ee01e4dde58d2266422ea7846a'), 'bpe_simple_vocab_16e6.txt.gz': (1356917, '924691ac288e54409236115652ad4aa250f48203de50a9e4722a6ecd48d6804a')}
+OFFICIAL_ASSETS = {'bpe_simple_vocab_16e6.txt.gz': (1356917, '924691ac288e54409236115652ad4aa250f48203de50a9e4722a6ecd48d6804a')}
 
 def sha256_file(path):
     digest = hashlib.sha256()
@@ -50,11 +50,7 @@ def fetch(url, path, size=None, sha=None):
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True)
     root=p.parse_args().root.resolve();jobs=[]
-    for name in ['dinov2_vitl14_reg4_pretrain.pth',
-                 'dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_vision_head.pth',
-                 'dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_text_encoder.pth']:
-        jobs.append((f'https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/{name}',root/name,*OFFICIAL_ASSETS[name]))
-    jobs.append(('https://dl.fbaipublicfiles.com/dinov2/thirdparty/bpe_simple_vocab_16e6.txt.gz',
+    jobs.append(('https://raw.githubusercontent.com/openai/CLIP/a1d071733d7111c9c014f024669f959182114e33/clip/bpe_simple_vocab_16e6.txt.gz',
                  root/'bpe_simple_vocab_16e6.txt.gz',*OFFICIAL_ASSETS['bpe_simple_vocab_16e6.txt.gz']))
     for model,names,folder in [
         ('ciqiangxu/DINOv3',{'dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth',

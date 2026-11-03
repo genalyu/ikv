@@ -124,7 +124,7 @@ def check(task, mode="baseline"):
                         full_frames=frames,
                         tactile_keys=tactile,
                     )
-                    if task.get("features",{}).get("tactile_semantic_backend") == "dinov2" and "tactile_dino_features" not in index_payload:
+                    if task.get("features",{}).get("tactile_semantic_backend") == "dinov3" and "tactile_dino_features" not in index_payload:
                         errors.append(f"Missing real tactile semantic sidecar {f}")
                 except (FileNotFoundError, ValueError) as e:
                     errors.append(str(e))

@@ -17,7 +17,7 @@ from unittest.mock import patch as mock_patch
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .dinov2 import FrozenDinoV2PatchEncoder
+from .dinov3 import FrozenDinoV3PatchEncoder
 
 
 @dataclass
@@ -28,12 +28,12 @@ class SemanticPatchOutput:
     task_relevance: torch.Tensor
 
 
-class FrozenSemanticPatchEncoder(FrozenDinoV2PatchEncoder):
+class FrozenSemanticPatchEncoder(FrozenDinoV3PatchEncoder):
     def __init__(self, model, tokenizer, *, backend, prompt, image_size=(224, 224),
                  patch_size=16, image_mean=(.485, .456, .406),
                  image_std=(.229, .224, .225), task_temperature=.07,
                  task_bias=0., identity=None):
-        if backend not in ("dinov2_txt", "dinov3_txt", "siglip2"):
+        if backend not in ("dinov3_txt", "siglip2"):
             raise ValueError("unknown semantic patch backend")
         if not math.isfinite(task_temperature) or task_temperature <= 0:
             raise ValueError("task_temperature must be finite and positive")
@@ -99,12 +99,7 @@ class FrozenSemanticPatchEncoder(FrozenDinoV2PatchEncoder):
         if rgb.ndim == 4 and rgb.shape[-1] == 3 and rgb.shape[1] != 3:
             canonical = rgb.permute(0, 3, 1, 2)
         pixels = self._prepare_pixel_values(canonical.contiguous()).contiguous()
-        if self.backend == "dinov2_txt":
-            visual = self.model.visual_model
-            cls, raw, registers = visual.get_backbone_features(pixels)
-            adapted = visual.head(torch.cat((cls[:, None], registers, raw), dim=1))
-            aligned = adapted[:, 1 + registers.shape[1]:]
-        elif self.backend == "dinov3_txt":
+        if self.backend == "dinov3_txt":
             _, aligned, raw = self.model.visual_model.get_class_and_patch_tokens(pixels)
         else:
             vision = self.model.vision_model
@@ -176,75 +171,49 @@ def _identity(config):
 
 
 def load_patch_encoder(config, *, device="cpu", prompt=None):
-    """Local assets only. Legacy dinov2 remains available without text scoring.
+    """Local assets only. DINOv3 raw patches are the default without text scoring.
 
     Semantic config keys: backend, repo (local official DINO checkout),
-    backbone_weights, head_weights, text_weights (v2 only), bpe, model (SigLIP2),
+    backbone_weights, head_weights, bpe, model (SigLIP2),
     image_size, task_temperature, task_bias.
     """
     config = dict(config)
-    backend = config.get("backend", "dinov2")
+    backend = config.get("backend", "dinov3")
     dtypes = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     if config.get("dtype", "float32") not in dtypes:
         raise ValueError("dtype must be float32, float16, or bfloat16")
     dtype = dtypes[config.get("dtype", "float32")]
-    if backend == "dinov2":
-        return FrozenDinoV2PatchEncoder.from_pretrained(
+    if backend == "dinov3":
+        return FrozenDinoV3PatchEncoder.from_pretrained(
             config["model"], local_files_only=True, device=device,
             image_size=tuple(config.get("image_size", (224, 224))), torch_dtype=dtype)
-    if backend in ("dinov2_txt", "dinov3_txt"):
+    if backend == "dinov3_txt":
         repo = Path(config["repo"]).expanduser().resolve()
         if not (repo / "hubconf.py").is_file():
             raise FileNotFoundError("repo must be a local official DINO checkout")
         backbone = _file(config["backbone_weights"])
         head = _file(config["head_weights"])
         bpe = _file(config["bpe"])
-        if backend == "dinov3_txt":
-            # Import the text entrypoint directly; hubconf also imports unrelated
-            # segmentation/detection code and its optional dependencies.
-            sys.path.insert(0, str(repo))
-            try:
-                module = importlib.import_module("dinov3.hub.dinotxt")
-            finally:
-                sys.path.remove(str(repo))
-            if not Path(module.__file__).resolve().is_relative_to(repo):
-                raise ValueError("DINOv3 module came from a different checkout; use a fresh process")
-            # Official hub code copies file:// assets into TORCH_HOME. Load them
-            # directly so CFS assets do not fill a small server root filesystem.
-            def local_weights(url, *args, **kwargs):
-                parsed = urlparse(str(url))
-                if parsed.scheme != "file":
-                    raise ValueError("DINOv3 loader attempted a nonlocal weight URL")
-                return torch.load(unquote(parsed.path), map_location="cpu", weights_only=True)
-            with mock_patch("torch.hub.load_state_dict_from_url", side_effect=local_weights):
-                model, tokenizer = module.dinov3_vitl16_dinotxt_tet1280d20h24l(
-                    weights=head, backbone_weights=backbone, bpe_path_or_url=bpe)
-            patch = 16
-        else:
-            # The official v2 hub text entrypoint downloads weights unconditionally.
-            # Build the identical architecture and load all three local assets.
-            backbone_model = torch.hub.load(str(repo), "dinov2_vitl14_reg",
-                                            source="local", pretrained=False)
-            from dinov2.hub.text.dinov2_wrapper import DINOv2Wrapper
-            from dinov2.hub.text.dinotxt_model import DinoTxt, DinoTxtConfig
-            from dinov2.hub.text.text_transformer import TextTransformer
-            from dinov2.hub.text.tokenizer import Tokenizer
-            backbone_model.load_state_dict(torch.load(backbone, map_location="cpu",
-                                                      weights_only=True), strict=True)
-            cfg = DinoTxtConfig(embed_dim=2048, vision_model_use_patch_tokens=True,
-                                vision_model_num_head_blocks=2,
-                                text_model_use_linear_projection=True,
-                                text_model_tokens_pooler_type="argmax")
-            text = TextTransformer(context_length=77, vocab_size=49408, dim=1280,
-                                   num_heads=20, num_layers=24, ffn_ratio=4,
-                                   is_causal=True, ls_init_value=None, dropout_prob=0.)
-            model = DinoTxt(cfg, DINOv2Wrapper(backbone_model), text)
-            model.visual_model.head.load_state_dict(torch.load(
-                head, map_location="cpu", weights_only=True), strict=True)
-            model.text_model.load_state_dict(torch.load(
-                _file(config["text_weights"]), map_location="cpu", weights_only=True), strict=True)
-            tokenizer = Tokenizer(vocab_path=bpe)
-            patch = 14
+        # Import the text entrypoint directly; hubconf also imports unrelated
+        # segmentation/detection code and its optional dependencies.
+        sys.path.insert(0, str(repo))
+        try:
+            module = importlib.import_module("dinov3.hub.dinotxt")
+        finally:
+            sys.path.remove(str(repo))
+        if not Path(module.__file__).resolve().is_relative_to(repo):
+            raise ValueError("DINOv3 module came from a different checkout; use a fresh process")
+        # Official hub code copies file:// assets into TORCH_HOME. Load them
+        # directly so CFS assets do not fill a small server root filesystem.
+        def local_weights(url, *args, **kwargs):
+            parsed = urlparse(str(url))
+            if parsed.scheme != "file":
+                raise ValueError("DINOv3 loader attempted a nonlocal weight URL")
+            return torch.load(unquote(parsed.path), map_location="cpu", weights_only=True)
+        with mock_patch("torch.hub.load_state_dict_from_url", side_effect=local_weights):
+            model, tokenizer = module.dinov3_vitl16_dinotxt_tet1280d20h24l(
+                weights=head, backbone_weights=backbone, bpe_path_or_url=bpe)
+        patch = 16
         mean, std = (.485, .456, .406), (.229, .224, .225)
         image_size = tuple(config.get("image_size", (224, 224)))
     elif backend == "siglip2":
