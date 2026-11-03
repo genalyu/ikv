@@ -164,6 +164,9 @@ def training_config(task, mode, world_size, *, require_ready=True):
         cfg.save_root = str(p["runs"] / mode)
         cfg.per_repo_norm_stat = {child["name"]: item.norm_stat for child, item in zip(children, configs)}
         cfg.per_repo_semantic_provenance = {child["name"]: item.kv_semantic_provenance for child, item in zip(children, configs)}
+        cfg.per_repo_obs_cam_keys = {child["name"]: item.obs_cam_keys for child, item in zip(children, configs)}
+        cfg.per_repo_tactile_keys = {child["name"]: item.tactile_keys for child, item in zip(children, configs)}
+        cfg.per_repo_used_action_channel_ids = {child["name"]: item.used_action_channel_ids for child, item in zip(children, configs)}
         cfg.expected_dataset_count = len(children)
         cfg.task_fingerprint = fingerprint(task)
         cfg.update(task.get("training", {}))

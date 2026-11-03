@@ -49,10 +49,12 @@ def iter_neosim(task):
     robot = task["robot"]
     if robot.get("quaternion_order") != "wxyz":
         raise ValueError("NeoSim Pose.totensor convention is explicitly wxyz")
-    if robot.get("arms", 1) != 1:
-        raise ValueError(
-            "Verified NeoSim adapter supports single-arm embodiment/ee; use a mapped LeRobot dataset for dual arm"
-        )
+    arms = int(robot.get("arms", 1))
+    if arms not in (1, 2):
+        raise ValueError("NeoSim supports one or two explicitly mapped arms")
+    embodiment_paths = robot.get("embodiment_paths", ["embodiment"])
+    if len(embodiment_paths) != arms or len(set(embodiment_paths)) != arms:
+        raise ValueError("embodiment_paths must map every arm exactly once")
     policy = task.get("action_labels")
     for path in sorted((root / "hdf5").glob("*.hdf5"), key=lambda p: int(p.stem)):
         meta_path = root / "metadata" / (path.stem + ".json")
@@ -65,21 +67,26 @@ def iter_neosim(task):
                 raise ValueError(
                     "Recorded simulation frequency differs from explicit robot fps"
                 )
-            ee = np.asarray(h["embodiment/ee"], dtype=float)
-            joints = np.asarray(h["embodiment/joint"], dtype=float)
             if (np.diff(steps) <= 0).any():
                 raise ValueError("Non-monotonic simulation steps")
-            grip = joints[:, robot["gripper_joint_indices"]].sum(axis=1) / float(
-                robot["gripper_stroke_m"]
-            )
-            if grip.min() < -0.002 or grip.max() > 1.002:
-                raise ValueError("Gripper joints exceed configured physical stroke")
-            # Allow only numerical simulator limit overshoot, recorded in provenance.
-            meta["gripper_clamped_samples"] = int(((grip < 0) | (grip > 1)).sum())
-            state = np.column_stack(
-                [ee[:, :3], quaternion_to_rot6d(ee[:, 3:7]), np.clip(grip, 0, 1)]
-            )
-            validate_pose(state, "NeoSim state")
+            states = []
+            clamped = 0
+            for embodiment in embodiment_paths:
+                ee = np.asarray(h[embodiment + "/ee"], dtype=float)
+                joints = np.asarray(h[embodiment + "/joint"], dtype=float)
+                if ee.shape != (len(steps), 7) or len(joints) != len(steps):
+                    raise ValueError("Arm observations must align with the simulation clock")
+                grip = joints[:, robot["gripper_joint_indices"]].sum(axis=1) / float(
+                    robot["gripper_stroke_m"])
+                if grip.min() < -0.002 or grip.max() > 1.002:
+                    raise ValueError("Gripper joints exceed configured physical stroke")
+                clamped += int(((grip < 0) | (grip > 1)).sum())
+                states.append(np.column_stack(
+                    [ee[:, :3], quaternion_to_rot6d(ee[:, 3:7]), np.clip(grip, 0, 1)]))
+            meta["gripper_clamped_samples"] = clamped
+            meta["embodiment_paths"] = list(embodiment_paths)
+            state = np.concatenate(states, axis=1)
+            validate_pose(state, "NeoSim state", arms=arms)
             times = (steps - steps[0]) / float(robot["simulation_hz"])
             action = np.full_like(state, np.nan)
             if policy == "next_observation":
