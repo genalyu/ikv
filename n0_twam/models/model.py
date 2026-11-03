@@ -2288,7 +2288,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             training_memory = dict(config=ikv_config, layout=masks, splits=split_list,
                 rows=training_metadata(position_inputs[3], masks, split_list,
                                        latent_dict, action_dict, prepared.get("condition_motion_layout"),
-                                       version=ikv_config.get("retention", {}).get("version", 1)),
+                                       version=ikv_config.get("retention", {}).get("version", 2)),
                 dense_dino_features=latent_dict.get("dense_dino_features",
                     latent_dict.get("dino_features") if prepared.get("condition_motion_layout") is None else None))
             self_attention_mask = cross_attention_mask = None

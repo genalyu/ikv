@@ -20,17 +20,17 @@ class RetentionConfig:
     archive_max_bytes: int = 8 * 1024**3
     archive_overflow: str = "error"
     archive_directory: str = ""
-    version: int = 1
+    version: int = 2
     score_backend: str = "formula"
-    formula_variant: str = "legacy"
-    random_weight: float = 0.0
+    formula_variant: str = "screenshot_v1"
+    random_weight: float = 0.1
     sys2_endpoint: str = ""
     sys2_task: str = ""
     sys2_timeout: float = 300.0
     ikv_interval_frames: int = 1
-    video_capacity: int = 0
-    action_capacity: int = 0
-    tactile_capacity: int = 0
+    video_capacity: int = 2816
+    action_capacity: int = 512
+    tactile_capacity: int = 768
     action_query_weight: float = 1.0
     tactile_query_weight: float = 1.0
     persistence_weight: float = 1.0
@@ -57,18 +57,12 @@ class RetentionConfig:
             raise ValueError("ikv_interval_frames must be a positive integer")
         if self.ikv_interval_frames != 1 and self.version != 2:
             raise ValueError("periodic IKV requires retention version 2")
-        if self.formula_variant not in ("legacy", "screenshot_v1"):
-            raise ValueError("unknown formula_variant")
-        if not math.isfinite(self.random_weight) or not 0 <= self.random_weight <= 1:
-            raise ValueError("random_weight must be in [0, 1]")
-        if (self.formula_variant != "legacy" or self.random_weight) and (
-                self.version != 2 or self.score_backend != "formula"):
-            raise ValueError("screenshot/random scoring requires v2 formula backend")
-        if self.formula_variant == "screenshot_v1" and (
-                self.class_recency_scale != 8.0 or self.content_threshold != 0.9):
-            raise ValueError("screenshot_v1 requires class scale 8 and threshold 0.9")
-        if self.random_weight and self.formula_variant != "screenshot_v1":
-            raise ValueError("random_weight requires screenshot_v1")
+        if self.version != 2:
+            raise ValueError("only multimodal retention version 2 is supported")
+        if self.score_backend == "formula" and (
+                self.formula_variant != "screenshot_v1" or self.random_weight != 0.1
+                or self.class_recency_scale != 8 or self.content_threshold != 0.9):
+            raise ValueError("formula uses screenshot scoring with fixed 10% random mixing")
         if self.score_backend not in ("formula", "qwen_sys2"):
             raise ValueError("score_backend must be formula or qwen_sys2")
         if self.score_backend == "qwen_sys2":
@@ -92,8 +86,6 @@ class RetentionConfig:
             if self.archive_overflow == "disk" and not self.archive_directory:
                 raise ValueError("disk overflow requires archive_directory")
 
-        if isinstance(self.version, bool) or self.version not in (1, 2):
-            raise ValueError("retention version must be 1 (legacy) or 2 (multimodal)")
         for name in ("video_capacity", "action_capacity", "tactile_capacity", "content_capacity"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < (1 if self.version == 2 and name != "tactile_capacity" else 0):
@@ -210,35 +202,6 @@ class GlobalKVRetention:
         self.data['dino'][slots[predicted]] = features[predicted]
         return int(predicted.sum())
 
-    @staticmethod
-    def _unit_scale(values):
-        return values / values.amax().clamp_min(1e-12) if len(values) else values
-
-    def components(self, slots, *, t0=None, reference=None):
-        d = self.data
-        anchor = self.t0 if t0 is None else t0
-        time = torch.zeros(len(slots), device=self.device)
-        if anchor is not None:
-            time = torch.exp(-(d["world_time_id"][slots] - anchor).abs()
-                             / self.config.time_scale)
-        reference = self.reference_dino if reference is None else reference
-        visual = _max_cosine(d["dino"][slots], reference)
-        usage = d["query_mass"][slots] / d["query_exposure"][slots].clamp_min(1)
-        return {
-            "contact": self._unit_scale(d["contact_duration"][slots]),
-            "visual": visual,
-            "time": time,
-            "query": self._unit_scale(usage),
-            "repetition": d["action_repetition"][slots],
-        }
-
-    def scores(self, slots, **kwargs):
-        terms = self.components(slots, **kwargs)
-        c = self.config
-        return (c.contact_weight * terms["contact"] + c.visual_weight * terms["visual"]
-                + c.time_weight * terms["time"] + c.query_weight * terms["query"]
-                - c.repetition_weight * terms["repetition"])
-
     def anchor_for(self, rows):
         """Only real VIDEO observations advance the global observation clock."""
         real = rows["observation_flag"] & (rows["kind"] == 0)
@@ -250,78 +213,6 @@ class GlobalKVRetention:
         at_anchor = real & (rows["world_time_id"] == newest)
         return newest, rows["dino"][at_anchor].detach()
 
-    def plan(self, mask, count, rows):
-        """Protect global top-k OLD tokens, then randomly free the exact deficit.
-
-        Incoming tokens must fit. If necessary k is capped by capacity-count;
-        this explicit bound prevents impossible protection guarantees. Plans do
-        not advance RNG/state, so temporary forwards and failed retries repeat
-        the same draw. The caller applies this same plan to every layer.
-        """
-        if count > self.capacity:
-            raise ValueError("current KV update exceeds global cache capacity")
-        free = (~mask).nonzero().flatten()
-        victims = free[:0]
-        if len(free) < count:
-            used = mask.nonzero().flatten()
-            anchor, reference = self.anchor_for(rows)
-            # A first DINO observation may arrive after featureless predictions.
-            if reference.shape[-1] != self.data["dino"].shape[-1]:
-                reference = self.reference_dino
-            scores = self.scores(used, t0=anchor, reference=reference)
-            protected_count = min(self.config.top_k, self.capacity - count, len(used))
-            order = torch.argsort(scores, descending=True, stable=True)
-            candidates = used[order[protected_count:]]
-            rng = torch.Generator(device="cpu")
-            rng.manual_seed(self.config.seed + self.revision)
-            draw = torch.randperm(len(candidates), generator=rng).to(mask.device)
-            victims = candidates[draw[:count - len(free)]]
-            free = torch.cat((free, victims))
-        return free[:count], victims
-
-    @torch.no_grad()
-    def commit(self, slots, rows, old_mask):
-        """Store features once, independent of layer count and denoising steps."""
-        if not len(slots):
-            return
-        for name in ("dino", "neoforce", "action"):
-            width = rows[name].shape[-1]
-            old_width = self.data[name].shape[-1]
-            if width and old_width not in (0, width):
-                raise ValueError(f"{name} width changed within one KV cache")
-            if width and old_width == 0:
-                self.data[name] = torch.zeros(self.capacity, width, device=self.device)
-        # Compare committed action vectors, not Q/K features or vector magnitude.
-        action_rows = (rows["kind"] == 1).nonzero().flatten()
-        repetition = torch.zeros(len(slots), device=self.device)
-        previous = self.data["action"][old_mask & (self.data["kind"] == 1)]
-        for pos in action_rows.tolist():
-            current = rows["action"][pos:pos + 1]
-            if not current.shape[-1]:
-                continue
-            if current.shape[-1] and len(previous):
-                distances = (previous - current).square().mean(-1)
-                repetition[pos] = torch.exp(-distances.min() / self.config.action_scale**2)
-            previous = torch.cat((previous, current), dim=0)
-        self.t0, self.reference_dino = self.anchor_for(rows)
-        for name in ("world_time_id", "grid_position", "observation_flag", "kind"):
-            self.data[name][slots] = rows[name]
-        for name in ("dino", "neoforce", "action"):
-            self.data[name][slots] = 0
-            if rows[name].shape[-1]:
-                self.data[name][slots] = rows[name].detach().float()
-        contact = (rows["neoforce"] != 0).any(-1)
-        self.data["contact_time"][slots] = rows["world_time_id"].masked_fill(~contact, -torch.inf)
-        self.data["contact_duration"][slots] = rows["duration"] * contact
-        self.data["action_repetition"][slots] = repetition
-        self.data["query_mass"][slots] = 0
-        self.data["query_exposure"][slots] = 0
-        self.data["token_uid"][slots] = torch.arange(
-            self.next_uid, self.next_uid + len(slots), device=self.device)
-        self.next_uid += len(slots)
-        self.revision += 1
-
-    @torch.no_grad()
     def measure_usage(self, q, k, slots, query_valid=None):
         """Sample conditional-batch queries; never materialize full Q x K."""
         q = q[0]

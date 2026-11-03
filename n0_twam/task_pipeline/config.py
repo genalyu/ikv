@@ -236,7 +236,7 @@ def training_config(task, mode, world_size, *, require_ready=True):
     cfg.kv_semantic_encoder = dict(runtime.get("semantic_encoder", {}) or {})
     semantic_enabled = cfg.kv_semantic_encoder.get("backend", "dinov2") != "dinov2"
     if semantic_enabled and ikv:
-        if cfg.kv_retention.get("version", 1) != 2:
+        if cfg.kv_retention.get("version", 2) != 2:
             raise ValueError("semantic patch scoring requires IKV retention version 2")
         cfg.kv_retention["task_weight"] = float(task.get("features", {}).get("task_weight", 1.))
         cfg.kv_retention["content_threshold"] = float(task.get("features", {}).get("content_threshold", .9))

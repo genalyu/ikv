@@ -893,7 +893,7 @@ class TWAM_Server:
         # Sparse mode supplies metadata through the selected motion sidecar.
         return (getattr(self.job_config, 'kv_cache_policy', 'fifo') == 'global'
                 and (not bool(getattr(self.job_config, 'use_rgb_motion_tokens', False))
-                     or dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2))
+                     or dict(getattr(self.job_config, 'kv_retention', {})).get('version', 2) == 2))
 
     def _predicted_dino_enabled(self):
         return (self._global_index_enabled()
@@ -1087,13 +1087,13 @@ class TWAM_Server:
             visual_grid=(self.height // (16 * ph), self.width // (16 * pw)),
             tactile_grid=(th // (16 * ph), tw // (16 * pw)),
             paired_camera=(self.job_config.obs_cam_keys[0] if
-                dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2
+                dict(getattr(self.job_config, 'kv_retention', {})).get('version', 2) == 2
                 else self.job_config.kv_contact_pair_camera_keys[0]),
-            frame_level=dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2,
+            frame_level=dict(getattr(self.job_config, 'kv_retention', {})).get('version', 2) == 2,
             device=self.device,
             min_similarity=getattr(self.job_config, 'kv_contact_min_similarity', .7),
             min_margin=getattr(self.job_config, 'kv_contact_min_margin', .15))
-        if dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2:
+        if dict(getattr(self.job_config, 'kv_retention', {})).get('version', 2) == 2:
             return dict(obs, contact_index=pairs)
         active = pairs['response'] > 0
         paired = active & (pairs['visual_rows'] >= 0)
@@ -1117,7 +1117,7 @@ class TWAM_Server:
         This is an input boundary, not an automatic RGB contact localizer.
         Rows of contact_pairs follow the existing tactile (sensor,F,H,W) order.
         """
-        if dict(getattr(self.job_config, 'kv_retention', {})).get('version', 1) == 2:
+        if dict(getattr(self.job_config, 'kv_retention', {})).get('version', 2) == 2:
             return self._attach_frame_contacts(obs, input_dict, dense_index,
                 video_latents, tactile_latents, cold_seed_frames=cold_seed_frames)
         from n0_twam.preprocessing.kv_index import route_contact_index
@@ -2588,7 +2588,7 @@ class TWAM_Server:
                     'noisy_latents'][:, :, 0:1] = action_cond[:, :, 0:1]
                 input_dict['action_res_lst']['timesteps'][0:1] *= 0
                 if (self._global_index_enabled() and
-                        dict(getattr(self.job_config, "kv_retention", {})).get("version", 1) != 2):
+                        dict(getattr(self.job_config, "kv_retention", {})).get("version", 2) != 2):
                     # Legacy v1 only. V2 action follows baseline prediction lifetime.
                     # This is a clean condition, not a predicted action. The
                     # first grounding keeps the observed RGB seed and skips
@@ -2734,7 +2734,7 @@ class TWAM_Server:
             logger.info("tactile cache tokens per chunk: %d", tactile_token_per_chunk)
         trained_ikv = bool(getattr(self.job_config, 'use_ikv_training', False))
         multimodal_cfg = dict(getattr(self.job_config, 'kv_retention', {}))
-        multimodal = cache_policy == 'global' and multimodal_cfg.get('version', 1) == 2
+        multimodal = cache_policy == 'global' and multimodal_cfg.get('version', 2) == 2
         if multimodal:
             capacity = sum(multimodal_cfg[name] for name in
                            ('video_capacity', 'action_capacity', 'tactile_capacity'))

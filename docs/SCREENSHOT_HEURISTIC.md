@@ -1,13 +1,6 @@
-# Screenshot heuristic with random exploration
+# Heuristic scoring
 
-Enable explicitly in task JSON `features`:
-
-```json
-{"formula_variant":"screenshot_v1","random_weight":0.1}
-```
-
-This uses retention version 2 and the formula backend. Existing legacy configurations
-retain their scoring behavior. Motion remains disabled in mode `ikv`.
+The formula backend always uses the screenshot heuristic with 10% random mixing. No version, formula variant or mixing parameter is required. Qwen remains a separate backend.
 
 For real visual tokens:
 H = exp(-max(t_ref-t_i,0)/8) + exp(-d_i/8)

@@ -1113,7 +1113,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         """
         config = getattr(self, "config", None)
         retention = dict(getattr(config, "kv_retention", {}))
-        if bool(getattr(config, "use_ikv_training", False)) and retention.get("version", 1) == 2:
+        if bool(getattr(config, "use_ikv_training", False)) and retention.get("version", 2) == 2:
             root_name = getattr(config, "ikv_index_root_name", None)
             if not root_name and (retention.get("persistence_weight", 1)
                                   or retention.get("class_recency_weight", 0)):

@@ -16,7 +16,7 @@ from .global_kv_retention import GlobalKVRetention, RetentionConfig
 _HISTORY_DECISION_CACHE = {}
 
 
-def training_metadata(grid, layout, splits, latent, action, motion_layout, version=1):
+def training_metadata(grid, layout, splits, latent, action, motion_layout, version=2):
     """Describe condition tokens; index features never enter content embeddings."""
     n = len(layout["seq"])
     device = grid.device
@@ -237,8 +237,6 @@ def sample_ikv_capacity(memory, device, retention):
             raise ValueError("v2 min_capacity must reserve one slot per active modality")
     sampled = int(torch.randint(minimum, maximum + 1, (1,), device=device))
     config["sampled_capacity"] = sampled
-    if retention.version == 1:
-        return sampled, retention
     # Reserve one slot in each enabled modality, then allocate remaining sampled
     # slots in proportion to configured modality slack. No trajectory metadata
     # enters the budget decision; an oversized current phase fails explicitly.
