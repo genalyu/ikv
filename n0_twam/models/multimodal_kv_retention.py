@@ -161,6 +161,7 @@ class MultimodalKVRetention(GlobalKVRetention):
             del self.data[name]
         self.data["contact_present"] = torch.zeros(capacity, dtype=torch.bool, device=self.device)
         self.history = ContentHistory(config, self.device)
+        self.tactile_history = ContentHistory(config, self.device)
         self._frame_clock = float("-inf")
         self._frames_since_management = 0
         self._managed_once = False
@@ -178,7 +179,8 @@ class MultimodalKVRetention(GlobalKVRetention):
     def snapshot(self):
         return (super().snapshot(), self.history.snapshot(),
                 None if self.archive is None else self.archive.snapshot(),
-                (self._frame_clock, self._frames_since_management, self._managed_once))
+                (self._frame_clock, self._frames_since_management, self._managed_once),
+                self.tactile_history.snapshot())
 
     def restore(self, state):
         super().restore(state[0])
@@ -186,6 +188,7 @@ class MultimodalKVRetention(GlobalKVRetention):
         if self.archive is not None:
             self.archive.restore(state[2])
         self._frame_clock, self._frames_since_management, self._managed_once = state[3]
+        self.tactile_history.restore(state[4])
 
     def _new_observation_frames(self, rows):
         # Only real visual latent frames advance cadence. Action/tactile forwards
@@ -256,6 +259,36 @@ class MultimodalKVRetention(GlobalKVRetention):
             "task": d["task_relevance"][slots] * real_video,
         }
 
+    def screenshot_scores(self, slots, *, t0=None, reference=None):
+        """Screenshot formula, with a stateless UID/time-keyed random mixture."""
+        d, c = self.data, self.config
+        anchor = self.t0 if t0 is None else t0
+        times = d["world_time_id"][slots]
+        age = torch.zeros_like(times) if anchor is None else (anchor-times).clamp_min(0)
+        kind = d["kind"][slots]
+        raw = torch.exp(-age / 8.0)
+        video, touch = kind == 0, kind == 2
+        raw = raw + video * torch.exp(-d["contact_duration"][slots] / 8.0)
+        for selected, history, features in (
+                (video, self.history, d["dino"]),
+                (touch, self.tactile_history, d["neoforce"])):
+            real = selected & d["observation_flag"][slots]
+            if real.any():
+                raw[real] += history.class_recency(features[slots[real]], times[real])
+        # Fixed theoretical bounds avoid candidate-set dependent min/max scaling.
+        normalized = raw / torch.where(video, 3.0, 2.0)
+        if not c.random_weight:
+            return normalized
+        # Integer avalanche hash: same token/decision/seed across ranks, slot
+        # permutations and activation-checkpoint recomputation. No global RNG use.
+        clock = 0 if anchor is None else int(round(float(anchor) * 1024))
+        x = (d["token_uid"][slots] + c.seed * 104729 + clock * 1009) & 0xffffffff
+        x = ((x ^ (x >> 16)) * 0x45d9f3b) & 0xffffffff
+        x = ((x ^ (x >> 16)) * 0x45d9f3b) & 0xffffffff
+        x = x ^ (x >> 16)
+        random = (x.to(torch.float64) + 0.5) / 4294967296.0
+        return (1-c.random_weight) * normalized + c.random_weight * random.to(raw.dtype)
+
     @torch.no_grad()
     def scores(self, slots, **kwargs):
         sensory = self.data["kind"][slots] != 1
@@ -266,6 +299,8 @@ class MultimodalKVRetention(GlobalKVRetention):
             return result  # action has no importance score
         if self.config.score_backend == "qwen_sys2":
             return self.data["sys2_score"][slots]
+        if self.config.formula_variant == "screenshot_v1":
+            return self.screenshot_scores(slots, **kwargs)
         terms, c = self.components(slots, **kwargs), self.config
         kind = self.data["kind"][slots]
         qw = torch.where(kind == 0, c.query_weight,
@@ -390,6 +425,11 @@ class MultimodalKVRetention(GlobalKVRetention):
         self.data["token_uid"][slots] = torch.arange(self.next_uid, self.next_uid+len(slots), device=self.device)
         self.next_uid += len(slots)
         self.revision += 1
+        if self.config.formula_variant == "screenshot_v1":
+            real_touch = (rows["kind"] == 2) & rows["observation_flag"]
+            if real_touch.any():
+                self.tactile_history.observe(rows["neoforce"][real_touch],
+                    rows["world_time_id"][real_touch], rows["duration"][real_touch])
         self._commit_cadence(rows)
 
 

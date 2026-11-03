@@ -22,6 +22,8 @@ class RetentionConfig:
     archive_directory: str = ""
     version: int = 1
     score_backend: str = "formula"
+    formula_variant: str = "legacy"
+    random_weight: float = 0.0
     sys2_endpoint: str = ""
     sys2_task: str = ""
     sys2_timeout: float = 300.0
@@ -55,6 +57,18 @@ class RetentionConfig:
             raise ValueError("ikv_interval_frames must be a positive integer")
         if self.ikv_interval_frames != 1 and self.version != 2:
             raise ValueError("periodic IKV requires retention version 2")
+        if self.formula_variant not in ("legacy", "screenshot_v1"):
+            raise ValueError("unknown formula_variant")
+        if not math.isfinite(self.random_weight) or not 0 <= self.random_weight <= 1:
+            raise ValueError("random_weight must be in [0, 1]")
+        if (self.formula_variant != "legacy" or self.random_weight) and (
+                self.version != 2 or self.score_backend != "formula"):
+            raise ValueError("screenshot/random scoring requires v2 formula backend")
+        if self.formula_variant == "screenshot_v1" and (
+                self.class_recency_scale != 8.0 or self.content_threshold != 0.9):
+            raise ValueError("screenshot_v1 requires class scale 8 and threshold 0.9")
+        if self.random_weight and self.formula_variant != "screenshot_v1":
+            raise ValueError("random_weight requires screenshot_v1")
         if self.score_backend not in ("formula", "qwen_sys2"):
             raise ValueError("score_backend must be formula or qwen_sys2")
         if self.score_backend == "qwen_sys2":
