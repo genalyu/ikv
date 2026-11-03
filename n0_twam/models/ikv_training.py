@@ -73,6 +73,32 @@ def training_metadata(grid, layout, splits, latent, action, motion_layout, versi
             if len(frame) and (frame.min() < 0 or frame.max() >= frame_neo.shape[1]):
                 raise ValueError("NeoForce frames do not cover the training sequence")
             rows["neoforce"][selected] = frame_neo[layout["seq"][selected], frame]
+    if version == 2 and "tactile_dino_features" in latent:
+        features = latent["tactile_dino_features"].detach().float()
+        if features.ndim != 5 or not torch.isfinite(features).all():
+            raise ValueError("tactile DINO must be finite [B,F,S,P,D]")
+        frame_duration = latent["frame_contact_duration"].detach().float()
+        tactile_duration = latent["tactile_contact_duration"].detach().float()
+        if frame_duration.shape != features.shape[:2] or tactile_duration.shape != features.shape[:3]:
+            raise ValueError("contact durations must align with tactile semantic frames")
+        rows["neoforce"] = torch.zeros(n,features.shape[-1],device=device)
+        rows["contact_present"] = torch.zeros(n,dtype=torch.bool,device=device)
+        rows["contact_duration"] = torch.zeros(n,device=device)
+        for batch in torch.unique(layout["seq"][layout["seq"]>=0]).tolist():
+            selected = layout["clean"] & (layout["seq"]==batch) & (layout["kind"]==2)
+            # Global tactile tokens are sensor-major, then frame and spatial patch.
+            values = features[batch].permute(1,0,2,3).reshape(-1,features.shape[-1])
+            if int(selected.sum()) != len(values):
+                raise ValueError("tactile DINO patch grid differs from tactile token layout")
+            rows["neoforce"][selected] = values
+            duration = tactile_duration[batch].T[...,None].expand(
+                features.shape[2],features.shape[1],features.shape[3]).reshape(-1)
+            rows["contact_duration"][selected] = duration
+            rows["contact_present"][selected] = duration>0
+            visual = layout["clean"] & (layout["seq"]==batch) & (layout["kind"]==0)
+            frame = rows["world_time_id"][visual].long()
+            rows["contact_duration"][visual] = frame_duration[batch,frame]
+            rows["contact_present"][visual] = frame_duration[batch,frame]>0
     return rows
 
 

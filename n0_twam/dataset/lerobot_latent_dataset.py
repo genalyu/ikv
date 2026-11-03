@@ -1129,8 +1129,12 @@ class LatentLeRobotDataset(LeRobotDataset):
                     latent_frame_ids=latent_frame_ids, full_frames=int(expected_full_frames),
                     start=truncate_start, end=truncate_end,
                     semantic_expected=(getattr(self.config, "per_repo_semantic_provenance", {}) or {}).get(self.repo_name, getattr(self.config, "kv_semantic_provenance", None)),
-                    require_task=bool(dict(getattr(self.config, "kv_retention", {})).get("task_weight", 0)))
+                    require_task=bool(dict(getattr(self.config, "kv_retention", {})).get("task_weight", 0)),
+                    tactile_keys=self.used_tactile_keys)
                 out_dict["dense_dino_features"] = dense["dino_features"]
+                for name in ("tactile_dino_features","frame_contact_duration","tactile_contact_duration"):
+                    if name in dense:
+                        out_dict[name] = dense[name]
                 if "task_relevance" in dense:
                     out_dict["task_relevance"] = dense["task_relevance"]
                 if "frame_neoforce_features" in dense:
@@ -1151,7 +1155,8 @@ class LatentLeRobotDataset(LeRobotDataset):
                     latent_frame_ids=latent_frame_ids, full_frames=int(expected_full_frames),
                     start=truncate_start, end=truncate_end,
                     semantic_expected=(getattr(self.config, "per_repo_semantic_provenance", {}) or {}).get(self.repo_name, getattr(self.config, "kv_semantic_provenance", None)),
-                    require_task=bool(dict(getattr(self.config, "kv_retention", {})).get("task_weight", 0))))
+                    require_task=bool(dict(getattr(self.config, "kv_retention", {})).get("task_weight", 0)),
+                    tactile_keys=self.used_tactile_keys))
             return
         if latent_world_time_ids is None:
             raise ValueError(

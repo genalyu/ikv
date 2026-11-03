@@ -4,7 +4,7 @@ import torch
 
 def load_dense_index(path, *, camera_keys, patch_size, grid_shape,
                      latent_frame_ids, full_frames, start=None, end=None, semantic_expected=None,
-                     require_task=False):
+                     require_task=False, tactile_keys=None):
     payload = torch.load(Path(path), map_location="cpu", weights_only=True)
     expected = dict(camera_keys=list(camera_keys), patch_size=list(patch_size),
                     spatial_grid_shape=list(grid_shape), frame_ids=list(latent_frame_ids))
@@ -37,4 +37,23 @@ def load_dense_index(path, *, camera_keys, patch_size, grid_shape,
         if frame_neo.ndim != 2 or len(frame_neo) != full_frames or not torch.isfinite(frame_neo).all():
             raise ValueError("frame_neoforce_features requires finite [F,D], zero without contact")
         result["frame_neoforce_features"] = frame_neo[slice(start, end)].float()
+    if "tactile_dino_features" in payload:
+        keys = payload.get("tactile_camera_keys")
+        if not isinstance(keys, list) or not keys or len(set(keys)) != len(keys):
+            raise ValueError("tactile semantics require unique sensor keys")
+        if tactile_keys is not None and list(tactile_keys) != keys:
+            raise ValueError("tactile semantic sensor order changed")
+        value = torch.as_tensor(payload["tactile_dino_features"])
+        if (value.ndim != 4 or value.shape[0] != full_frames or value.shape[1] != len(keys)
+                or value.shape[2] != 16 or value.shape[-1] < 1 or not torch.isfinite(value).all()):
+            raise ValueError("tactile DINO requires finite [F,S,16,D]")
+        result["tactile_dino_features"] = value[slice(start,end)].float()
+        for name, shape in (("frame_contact_duration", (full_frames,)),
+                            ("tactile_contact_duration", (full_frames,len(keys)))):
+            if name not in payload:
+                raise ValueError("tactile semantics require measured contact durations")
+            value = torch.as_tensor(payload[name])
+            if tuple(value.shape) != shape or not torch.isfinite(value).all() or (value<0).any():
+                raise ValueError("contact duration must be finite nonnegative and aligned")
+            result[name] = value[slice(start,end)].float()
     return result

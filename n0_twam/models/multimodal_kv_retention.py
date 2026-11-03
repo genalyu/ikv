@@ -403,6 +403,11 @@ class MultimodalKVRetention(GlobalKVRetention):
         self.data["contact_present"][slots] = contact
         self.data["contact_time"][slots] = rows["world_time_id"].masked_fill(~contact, -torch.inf)
         self.data["contact_duration"][slots] = rows["duration"] * contact
+        if self.config.formula_variant == "screenshot_v1" and "contact_duration" in rows:
+            duration = rows["contact_duration"]
+            if not torch.isfinite(duration).all() or (duration<0).any():
+                raise ValueError("explicit contact duration must be finite and nonnegative")
+            self.data["contact_duration"][slots] = duration * contact
         self.data["query_mass"][slots] = 0
         self.data["query_exposure"][slots] = 0
         self.data["token_uid"][slots] = torch.arange(self.next_uid, self.next_uid+len(slots), device=self.device)

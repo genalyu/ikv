@@ -154,6 +154,58 @@ def _existing_sidecars_match(motion_path, dense_path, frame_ids, anchors, camera
         return False
 
 
+def build_tactile_payload(task, root, chunk, name, ids, anchors, encoder):
+    """Native tactile RGB patches plus measured-contact spans in world-time units."""
+    import h5py
+    from .neosim import iter_neosim
+    from .data import aligned_timeline
+    from n0_twam.models.rgb_motion import pool_dino_to_grid
+
+    marker = json.loads((root/"conversion_episodes"/("_".join(Path(name).stem.split("_")[:2])+".json")).read_text())
+    sid = marker["source_id"]
+    source = Path(task["source"])
+    # Reuse the explicit single-episode source view made by the converter worker.
+    view = root/"tactile_index_sources"/sid
+    for kind, ext in (("hdf5",".hdf5"),("metadata",".json")):
+        (view/kind).mkdir(parents=True,exist_ok=True)
+        dest = view/kind/(sid+ext)
+        if not dest.exists():
+            dest.symlink_to(source/kind/(sid+ext))
+    episode = next(iter_neosim(dict(task,source=str(view))))
+    _, _, aligned, _ = aligned_timeline(episode,task["robot"])
+    keys = list(task["robot"]["tactile"].values())
+    anchor_ids = [int(ids[i]) for i in anchors]
+    features, contacts = [], []
+    with h5py.File(source/"hdf5"/(sid+".hdf5"),"r") as raw:
+        for raw_key,key in task["robot"]["tactile"].items():
+            force = np.asarray(raw[raw_key.rsplit("/",1)[0]+"/contact_force"])
+            if not np.isfinite(force).all():
+                raise ValueError("nonfinite measured contact force")
+            contact = np.any(force.reshape(len(force),-1)!=0,axis=1)[aligned[key]]
+            contacts.append(contact)
+            frames = selected_rgb(root/"videos"/chunk/key/("_".join(Path(name).stem.split("_")[:2])+".mp4"),anchor_ids)
+            values = []
+            for rgb in frames:
+                tokens = encoder(torch.from_numpy(rgb)[None]).tokens
+                values.append(pool_dino_to_grid(tokens,(4,4)).reshape(16,-1).detach().cpu())
+            if len(values)!=len(anchors):
+                raise ValueError("tactile semantics do not cover WAN anchors")
+            features.append(torch.stack(values))
+    contact = np.stack(contacts,axis=1)
+    def duration(mask):
+        count=np.zeros(mask.shape[1:],dtype=np.float32)
+        result=[]
+        for row in mask:
+            count=np.where(row,count+1,0);result.append(count.copy())
+        # The converted action clock is 30Hz, each WAN world step spans 12 frames.
+        return np.asarray(result,dtype=np.float32)/12.
+    return dict(tactile_camera_keys=keys,tactile_grid_shape=[4,4],
+        tactile_semantic_backend="dinov2-native-rgb",
+        tactile_dino_features=torch.stack(features,dim=1),
+        frame_contact_duration=torch.from_numpy(duration(contact.any(1))[anchor_ids]),
+        tactile_contact_duration=torch.from_numpy(duration(contact)[anchor_ids]))
+
+
 def build_features(task, device="cuda"):
     from n0_twam.preprocessing.dinov2 import FrozenDinoV2PatchEncoder
 
@@ -162,12 +214,15 @@ def build_features(task, device="cuda"):
     model = task["runtime"].get("dino_model")
     semantic_config = dict(task["runtime"].get("semantic_encoder", {}) or {})
     semantic_enabled = semantic_config.get("backend", "dinov2") != "dinov2"
+    tactile_semantics = task.get("features",{}).get("tactile_semantic_backend") == "dinov2"
+    if tactile_semantics and semantic_enabled:
+        raise ValueError("tactile DINO currently requires the DINO visual backend")
     if not semantic_enabled and (not model or not Path(model).is_dir()):
         raise FileNotFoundError(
             "Set runtime.dino_model to local DINOv2 weights; no implicit downloads"
         )
     progress_path = root / "features.progress.json"
-    progress = dict(task_fingerprint=fingerprint(task), builder_version=2 if semantic_enabled else 1)
+    progress = dict(task_fingerprint=fingerprint(task), builder_version=3 if tactile_semantics else (2 if semantic_enabled else 1))
     if progress_path.exists():
         if json.loads(progress_path.read_text()) != progress:
             raise ValueError(
@@ -223,6 +278,9 @@ def build_features(task, device="cuda"):
             old = torch.load(dense_dest, map_location="cpu", weights_only=True)
             semantic_matches = (old.get("semantic_provenance") == encoder.provenance()
                                 and "task_relevance" in old)
+        if tactile_semantics and dense_dest.exists():
+            old = torch.load(dense_dest,map_location="cpu",weights_only=True)
+            semantic_matches = semantic_matches and old.get("tactile_semantic_backend") == "dinov2-native-rgb"
         if semantic_matches and _existing_sidecars_match(
             motion_dest, dense_dest, ids, anchors, keys, threshold
         ):
@@ -241,6 +299,8 @@ def build_features(task, device="cuda"):
             encoder,
             threshold,
         )
+        if tactile_semantics:
+            dense.update(build_tactile_payload(task,root,chunk,lp.name,ids,anchors,encoder))
         for dest, payload in ((motion_dest, motion), (dense_dest, dense)):
             dest.parent.mkdir(parents=True, exist_ok=True)
             torch.save(payload, dest.with_suffix(".tmp"))
@@ -256,6 +316,7 @@ def build_features(task, device="cuda"):
                 dino_model=model,
                 semantic_provenance=encoder.provenance() if semantic_enabled else None,
                 neoforce="unavailable; zero width",
+                tactile_semantic_backend="dinov2-native-rgb" if tactile_semantics else None,
                 threshold=task.get("features", {}).get("motion_threshold", 0.02),
             ),
             indent=2,

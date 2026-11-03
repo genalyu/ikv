@@ -115,14 +115,17 @@ def check(task, mode="baseline"):
             if ikv:
                 f = root / "ikv_index" / chunk / name
                 try:
-                    load_dense_index(
+                    index_payload = load_dense_index(
                         f,
                         camera_keys=cameras,
                         patch_size=[1, 2, 2],
                         grid_shape=grid,
                         latent_frame_ids=reference["frame_ids"],
                         full_frames=frames,
+                        tactile_keys=tactile,
                     )
+                    if task.get("features",{}).get("tactile_semantic_backend") == "dinov2" and "tactile_dino_features" not in index_payload:
+                        errors.append(f"Missing real tactile semantic sidecar {f}")
                 except (FileNotFoundError, ValueError) as e:
                     errors.append(str(e))
     if not (p["pool"] / "norm_stat_absee.json").exists():

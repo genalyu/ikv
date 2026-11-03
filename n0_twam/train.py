@@ -443,6 +443,7 @@ class Trainer:
             'rgb_motion_valid_mask', 'motion_indices', 'motion_valid_mask',
             'world_time_id', 'dino_features', 'neoforce_features',
             'dense_dino_features', 'frame_neoforce_features', 'task_relevance',
+            'tactile_dino_features', 'frame_contact_duration', 'tactile_contact_duration',
             'observation_flag', 'visual_valid', 'tactile_valid',
             'motion_scores', 'camera_ids', 'patch_uv',
         ):

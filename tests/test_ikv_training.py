@@ -317,7 +317,7 @@ def test_dense_sidecar_alignment_and_temporal_crop(tmp_path):
         load_dense_index(path,**dict(args,camera_keys=['wrist','top']))
     with pytest.raises(ValueError,match='frame_ids'):
         load_dense_index(path,**dict(args,latent_frame_ids=[0,3,7]))
-    payload['dino_features'][0,0,0]=float('nan');torch.save(payload,path)
+    payload['dino_features'][0,0,0]=float('nan');path=tmp_path/'invalid_index.pth';torch.save(payload,path)
     with pytest.raises(ValueError,match='finite'):
         load_dense_index(path,**args)
 

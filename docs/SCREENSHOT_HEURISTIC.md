@@ -28,3 +28,5 @@ tokens are randomly selected.
 The class threshold is fixed at 0.9 and the class decay scale at 8 for this variant.
 The variant and random weight propagate through the task pipeline into resolved
 training configs and serving overrides.
+
+For native tactile RGB preprocessing, see [tactile sidecars](TACTILE_SEMANTIC_SIDECARS.md).
