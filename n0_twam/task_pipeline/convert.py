@@ -324,6 +324,7 @@ def convert(task):
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker_tmp = marker.with_suffix(".tmp")
         marker_tmp.write_text(json.dumps({
+            "source_id": ep.source_id,
             "shapes": shapes,
             "video_stats": {key: st[key] for key in ep.videos},
         }))

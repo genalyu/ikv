@@ -162,7 +162,19 @@ def build_tactile_payload(task, root, chunk, name, ids, anchors, encoder):
     from n0_twam.models.rgb_motion import pool_dino_to_grid
 
     marker = json.loads((root/"conversion_episodes"/("_".join(Path(name).stem.split("_")[:2])+".json")).read_text())
-    sid = marker["source_id"]
+    provenance = root / "meta/source_provenance.jsonl"
+    sid = marker.get("source_id")
+    if provenance.is_file():
+        episode_index = int(Path(name).stem.split("_")[1])
+        matches = [row["source_id"] for row in map(json.loads, provenance.read_text().splitlines())
+                   if row["episode_index"] == episode_index]
+        if len(matches) != 1:
+            raise ValueError("Expected exactly one audited source mapping for tactile episode")
+        if sid is not None and str(sid) != str(matches[0]):
+            raise ValueError("Conversion marker and audited tactile source mapping disagree")
+        sid = str(matches[0])
+    if sid is None:
+        raise ValueError("Missing audited tactile source mapping")
     source = Path(task["source"])
     # Reuse the explicit single-episode source view made by the converter worker.
     view = root/"tactile_index_sources"/sid

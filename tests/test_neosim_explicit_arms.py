@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from n0_twam.task_pipeline.neosim import iter_neosim
 
-def make_task(tmp_path, arms):
+def make_task(tmp_path, arms, contact_force=None):
     (tmp_path/"hdf5").mkdir()
     with h5py.File(tmp_path/"hdf5/0.hdf5","w") as h:
         h["step"]=np.arange(6)*4
@@ -13,6 +13,7 @@ def make_task(tmp_path, arms):
             j=np.zeros((6,8));j[:,6:]=.039;h[name+"/joint"]=j
         h["observation/head/rgb"]=np.zeros((6,),dtype="S1")
         h["tactile/left_tactile/rgb"]=np.zeros((6,),dtype="S1")
+        if contact_force is not None:h["tactile/left_tactile/contact_force"]=contact_force
     return dict(source=str(tmp_path),action_labels="next_observation",robot=dict(
         arms=arms,embodiment_paths=["embodiment","embodiment_b"][:arms],
         quaternion_order="wxyz",simulation_hz=120,fps=30,

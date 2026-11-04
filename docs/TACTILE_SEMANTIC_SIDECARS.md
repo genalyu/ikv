@@ -25,3 +25,8 @@ No oracle target IDs or actor poses enter semantic features.
 Real tactile observations update an independent tactile content history.
 Predicted branches carry zero semantic/contact metadata. Missing real tactile
 sidecars fail task preflight when this feature backend is requested.
+
+Raw tactile filenames are resolved from the converted episode's audited
+source_provenance.jsonl mapping. Finalized conversion markers may lack legacy
+source_id fields; a conflicting marker or missing/duplicate provenance fails
+explicitly. New conversion markers retain source_id.

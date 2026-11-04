@@ -44,13 +44,17 @@ def test_tactile_sidecar_slice_and_sensor_contract(tmp_path):
     v=payload();v["tactile_contact_duration"][0,0]=-1;path=tmp_path/"negative.pth";torch.save(v,path)
     with pytest.raises(ValueError,match="duration"):load(path)
 
-def test_builder_uses_native_tactile_rgb_and_force_clock(tmp_path,monkeypatch):
-    source=tmp_path/"raw";source.mkdir();task=make_task(source,1)
+@pytest.mark.parametrize("finalized", [False, True])
+def test_builder_uses_native_tactile_rgb_and_force_clock(tmp_path,monkeypatch,finalized):
+    source=tmp_path/"raw";source.mkdir()
+    force=np.zeros((6,169,3));force[1:,0,0]=.01
+    task=make_task(source,1,contact_force=force)
     task["source"]=str(source)
-    with h5py.File(source/"hdf5/0.hdf5","a") as h:
-        force=np.zeros((6,169,3));force[1:,0,0]=.01;h["tactile/left_tactile/contact_force"]=force
     root=tmp_path/"dataset";(root/"conversion_episodes").mkdir(parents=True)
-    (root/"conversion_episodes/episode_000000.json").write_text(json.dumps(dict(source_id="0")))
+    (root/"conversion_episodes/episode_000000.json").write_text(json.dumps({} if finalized else dict(source_id="0")))
+    if finalized:
+        (root/"meta").mkdir()
+        (root/"meta/source_provenance.jsonl").write_text(json.dumps(dict(episode_index=0,source_id="0"))+"\n")
     seen=[]
     def encoder(rgb):
         seen.append(rgb.clone())
