@@ -35,3 +35,5 @@ explicitly. New conversion markers retain source_id.
 When force is absent, contact is explicitly estimated from native tactile depth: per-pixel temporal 95th-percentile reference, indentation above 0.1 mm on at least 0.5% of pixels. Sidecars record contact_provenance per sensor. This relative estimate may miss sustained contact and is not measured force. Measured-force inputs keep their existing behavior. Feature extraction supports disjoint IKV_FEATURE_SHARD_COUNT/ID trajectory modulo partitions; finalize once after all shards succeed.
 
 Tactile VAE uses the same exact source stride-select grid as RGB (not FFmpeg fps resampling). Both retain F modulo 4 equal to 1; preflight compares tactile/RGB frame IDs and latent counts. Legacy fps-resampled tactile latents must be rebuilt, including apparently equal-length files, because source pixels may differ.
+
+Dataset construction retries transient filesystem EIO at most five times with staggered backoff. Persistent I/O and invalid datasets still fail the required full-corpus guard; this never authorizes dropping tasks.

@@ -36,17 +36,22 @@ def construct_lerobot(
     repo_id,
     config,
 ):
-    # Tolerate broken/in-flight repos (conversion interrupted mid-episode,
-    # parquet missing, meta inconsistent): skip with a warning instead of
-    # killing the whole multi-dataset init. Essential for train-while-convert.
-    try:
-        return LatentLeRobotDataset(
-            repo_id=repo_id,
-            config=config,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Skipping unusable repo %s: %s", repo_id, exc)
-        return None
+    # Shared filesystems can transiently return EIO during concurrent metadata reads.
+    import errno
+    import time
+    for attempt in range(5):
+        try:
+            return LatentLeRobotDataset(repo_id=repo_id, config=config)
+        except OSError as exc:
+            if exc.errno == errno.EIO and attempt < 4:
+                logging.warning("Retrying transient dataset EIO repo=%s attempt=%s", repo_id, attempt + 1)
+                time.sleep(1 + attempt + int(os.environ.get("RANK", "0")) * 0.1)
+                continue
+            logging.warning("Skipping unusable repo %s: %s", repo_id, exc)
+            return None
+        except Exception as exc:
+            logging.warning("Skipping unusable repo %s: %s", repo_id, exc)
+            return None
 
 def construct_lerobot_multi_processor(config, 
                                       num_init_worker=8,
