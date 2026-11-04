@@ -124,13 +124,17 @@ def extract_frames(
     request: EpisodeRequest, width: int, height: int, target_fps: int, ori_fps: int,
 ) -> tuple[np.ndarray, list[int]]:
     """Decode + downsample + resize. Returns (frames uint8 (N,H,W,3), local_frame_ids)."""
+    if ori_fps % target_fps:
+        raise ValueError("Tactile target fps must divide source fps")
+    stride = ori_fps // target_fps
     ffmpeg_bin = ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_bin, "-v", "error",
         "-ss", str(request.start_timestamp),
         "-to", str(request.end_timestamp),
         "-i", str(request.source_video),
-        "-vf", f"fps={target_fps},scale={width}:{height}:flags=area",
+        "-vf", f"select=not(mod(n\\,{stride})),scale={width}:{height}:flags=area",
+        "-vsync", "0",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "pipe:1",
     ]
@@ -142,10 +146,9 @@ def extract_frames(
     if num <= 0:
         raise RuntimeError(f"no frames decoded from {request.source_video}")
     frames = np.frombuffer(raw, dtype=np.uint8).reshape(num, height, width, 3).copy()
-    local_frame_ids = [
-        min(request.length - 1, int(round(i * ori_fps / target_fps)))
-        for i in range(num)
-    ]
+    local_frame_ids = list(range(0, request.length, stride))
+    if len(local_frame_ids) != num:
+        raise RuntimeError("Decoded tactile frames differ from declared causal frame grid")
     # Wan VAE wants F % 4 == 1 for clean temporal compression
     while len(frames) > 1 and len(frames) % 4 != 1:
         frames = frames[:-1]
@@ -330,6 +333,7 @@ def main() -> None:
                     "end_frame": int(req.length),
                     "fps": int(args.target_fps),
                     "ori_fps": int(ori_fps),
+                    "sampling_provenance": "causal_stride_select_v1",
                     "tactile_residual_mode": mode,
                     "tactile_resize_h": int(args.height),
                     "tactile_resize_w": int(args.width),

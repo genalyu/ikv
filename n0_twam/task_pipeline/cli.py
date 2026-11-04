@@ -92,6 +92,12 @@ def check(task, mode="baseline"):
                     root / "latents_tactile" / stream / chunk / key / name
                 ).exists():
                     errors.append(f"Missing {stream} tactile: {idx}/{key}")
+                elif reference is not None:
+                    tactile_payload = torch.load(root / "latents_tactile" / stream / chunk / key / name,
+                                                 map_location="cpu", weights_only=True, mmap=True)
+                    if (tactile_payload["frame_ids"] != reference["frame_ids"]
+                        or tactile_payload["latent_num_frames"] != reference["latent_num_frames"]):
+                        errors.append(f"Misaligned {stream} tactile: {idx}/{key}")
         motion, ikv = MODES[mode]
         if reference is not None:
             frames = reference["latent_num_frames"]
