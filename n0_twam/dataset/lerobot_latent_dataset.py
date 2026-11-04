@@ -123,6 +123,20 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         return sample
 
 class LatentLeRobotDataset(LeRobotDataset):
+    def load_hf_dataset(self):
+        """Read immutable local Parquet directly, avoiding shared HF builder locks."""
+        import datasets
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from lerobot.datasets.utils import hf_transform_to_torch
+        files = sorted(self.get_episodes_file_paths())
+        if not files:
+            raise FileNotFoundError("No local episode Parquet files")
+        tables = [pq.ParquetFile(self.root / path).read() for path in files]
+        hf_dataset = datasets.Dataset(pa.concat_tables(tables), split="train")
+        hf_dataset.set_transform(hf_transform_to_torch)
+        return hf_dataset
+
     def __init__(
         self,
         repo_id,

@@ -37,3 +37,5 @@ When force is absent, contact is explicitly estimated from native tactile depth:
 Tactile VAE uses the same exact source stride-select grid as RGB (not FFmpeg fps resampling). Both retain F modulo 4 equal to 1; preflight compares tactile/RGB frame IDs and latent counts. Legacy fps-resampled tactile latents must be rebuilt, including apparently equal-length files, because source pixels may differ.
 
 Dataset construction retries transient filesystem EIO at most five times with staggered backoff. Persistent I/O and invalid datasets still fail the required full-corpus guard; this never authorizes dropping tasks.
+
+Immutable local episode Parquet is read directly into Arrow with the same LeRobot torch transform, bypassing shared Hugging Face builder/cache locks. This prevents lock reentrancy after a shared-filesystem read error and does not download or omit episode rows.
