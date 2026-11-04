@@ -154,6 +154,16 @@ def _existing_sidecars_match(motion_path, dense_path, frame_ids, anchors, camera
         return False
 
 
+def estimate_depth_contact(depth, threshold_mm=0.1, minimum_fraction=0.005):
+    """Estimate contact from indentation relative to each pixel's temporal 95th percentile."""
+    depth = np.asarray(depth, dtype=np.float32)
+    if depth.ndim != 3 or not np.isfinite(depth).all():
+        raise ValueError("Expected finite tactile depth [time,height,width]")
+    reference = np.quantile(depth, 0.95, axis=0)
+    fraction = ((reference[None] - depth) > threshold_mm).mean(axis=(1, 2))
+    return fraction >= minimum_fraction
+
+
 def build_tactile_payload(task, root, chunk, name, ids, anchors, encoder):
     """Native tactile RGB patches plus measured-contact spans in world-time units."""
     import h5py
@@ -187,13 +197,21 @@ def build_tactile_payload(task, root, chunk, name, ids, anchors, encoder):
     _, _, aligned, _ = aligned_timeline(episode,task["robot"])
     keys = list(task["robot"]["tactile"].values())
     anchor_ids = [int(ids[i]) for i in anchors]
-    features, contacts = [], []
+    features, contacts, contact_sources = [], [], []
     with h5py.File(source/"hdf5"/(sid+".hdf5"),"r") as raw:
         for raw_key,key in task["robot"]["tactile"].items():
-            force = np.asarray(raw[raw_key.rsplit("/",1)[0]+"/contact_force"])
-            if not np.isfinite(force).all():
-                raise ValueError("nonfinite measured contact force")
-            contact = np.any(force.reshape(len(force),-1)!=0,axis=1)[aligned[key]]
+            sensor = raw_key.rsplit("/",1)[0]
+            if sensor+"/contact_force" in raw:
+                force = np.asarray(raw[sensor+"/contact_force"])
+                if not np.isfinite(force).all():
+                    raise ValueError("nonfinite measured contact force")
+                contact = np.any(force.reshape(len(force),-1)!=0,axis=1)[aligned[key]]
+                contact_sources.append(dict(sensor=key, method="measured_contact_force"))
+            else:
+                contact = estimate_depth_contact(raw[sensor+"/depth"])[aligned[key]]
+                contact_sources.append(dict(sensor=key, method="estimated_depth_indentation",
+                    reference="per_pixel_temporal_95th_percentile", threshold_mm=0.1,
+                    minimum_area_fraction=0.005, limitation="relative deformation estimate; sustained contact may be underestimated"))
             contacts.append(contact)
             frames = selected_rgb(root/"videos"/chunk/key/("_".join(Path(name).stem.split("_")[:2])+".mp4"),anchor_ids)
             values = []
@@ -211,7 +229,7 @@ def build_tactile_payload(task, root, chunk, name, ids, anchors, encoder):
             count=np.where(row,count+1,0);result.append(count.copy())
         # The converted action clock is 30Hz, each WAN world step spans 12 frames.
         return np.asarray(result,dtype=np.float32)/12.
-    return dict(tactile_camera_keys=keys,tactile_grid_shape=[4,4],
+    return dict(contact_provenance=contact_sources,tactile_camera_keys=keys,tactile_grid_shape=[4,4],
         tactile_semantic_backend="dinov3-native-rgb",
         tactile_dino_features=torch.stack(features,dim=1),
         frame_contact_duration=torch.from_numpy(duration(contact.any(1))[anchor_ids]),

@@ -30,3 +30,6 @@ Raw tactile filenames are resolved from the converted episode's audited
 source_provenance.jsonl mapping. Finalized conversion markers may lack legacy
 source_id fields; a conflicting marker or missing/duplicate provenance fails
 explicitly. New conversion markers retain source_id.
+
+
+When force is absent, contact is explicitly estimated from native tactile depth: per-pixel temporal 95th-percentile reference, indentation above 0.1 mm on at least 0.5% of pixels. Sidecars record contact_provenance per sensor. This relative estimate may miss sustained contact and is not measured force. Measured-force inputs keep their existing behavior. Feature extraction supports disjoint IKV_FEATURE_SHARD_COUNT/ID trajectory modulo partitions; finalize once after all shards succeed.
