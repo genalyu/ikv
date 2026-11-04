@@ -39,3 +39,5 @@ Tactile VAE uses the same exact source stride-select grid as RGB (not FFmpeg fps
 Dataset construction retries transient filesystem EIO at most five times with staggered backoff. Persistent I/O and invalid datasets still fail the required full-corpus guard; this never authorizes dropping tasks.
 
 Immutable local episode Parquet is read directly into Arrow with the same LeRobot torch transform, bypassing shared Hugging Face builder/cache locks. This prevents lock reentrancy after a shared-filesystem read error and does not download or omit episode rows.
+
+Corpus discovery stops descending when meta/info.json identifies a dataset root. Per-episode tactile source views and sidecars are not recursively scanned during startup.

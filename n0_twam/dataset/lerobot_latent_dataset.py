@@ -22,6 +22,12 @@ def recursive_find_file(directory, filename='info.json'):
     ignored_dirs = {"data", "videos", "latents", ".cache", "__pycache__"}
     try:
         for root, dirs, files in os.walk(directory, followlinks=True):
+            # Once a dataset root is found, never scan its per-episode sidecars.
+            metadata = Path(root) / "meta" / filename
+            if metadata.is_file():
+                result.append(str(metadata))
+                dirs[:] = []
+                continue
             dirs[:] = [d for d in dirs if d not in ignored_dirs]
             if filename in files:
                 full_path = os.path.join(root, filename)
