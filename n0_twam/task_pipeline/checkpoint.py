@@ -80,6 +80,7 @@ def save_training_state(trainer, directory):
             ikv_train_execution=getattr(trainer.config, "ikv_train_execution", "recurrent"),
             ikv_train_sample_capacity=bool(getattr(trainer.config, "ikv_train_sample_capacity", False)),
             ikv_train_min_capacity=int(getattr(trainer.config, "ikv_train_min_capacity", 0)),
+            ikv_sampler_layout=getattr(trainer.config, "ikv_sampler_layout", "standard"),
             step=trainer.step,
         )
         temp = directory / "complete.tmp"
@@ -99,10 +100,11 @@ def load_training_state(trainer, directory):
         ikv_train_execution=getattr(trainer.config, "ikv_train_execution", "recurrent"),
         ikv_train_sample_capacity=bool(getattr(trainer.config, "ikv_train_sample_capacity", False)),
         ikv_train_min_capacity=int(getattr(trainer.config, "ikv_train_min_capacity", 0)),
+        ikv_sampler_layout=getattr(trainer.config, "ikv_sampler_layout", "standard"),
     )
     legacy_defaults = {"ikv_train_execution": "recurrent",
                        "ikv_train_sample_capacity": False,
-                       "ikv_train_min_capacity": 0}
+                       "ikv_train_min_capacity": 0, "ikv_sampler_layout": "standard"}
     for k, v in expected.items():
         if manifest.get(k, legacy_defaults.get(k)) != v:
             raise ValueError(

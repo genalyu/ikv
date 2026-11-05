@@ -45,6 +45,7 @@ from utils import (
 )
 
 from dataset import MultiLatentLeRobotDataset, BucketedDistributedBatchSampler
+from dataset.bucket_sampler import WithinUpdateDistributedSampler
 import gc
 
 
@@ -251,6 +252,12 @@ class Trainer:
         logger.info("Setting up datasets...")
         train_dataset = MultiLatentLeRobotDataset(config=config)
         _bs = int(getattr(config, 'batch_size', 1))
+        grouped = os.environ.get("IKV_GROUP_WITHIN_UPDATE") == "1"
+        if grouped and (_bs != 1 or config.world_size < 2 or not getattr(config, "use_ikv_training", False)):
+            raise ValueError("Within-update grouping requires distributed singleton IKV training")
+        config.ikv_sampler_layout = (
+            f"within_update_v1_accum{self.gradient_accumulation_steps}" if grouped else "standard"
+        )
         if _bs > 1:
             # Per-GPU batch>1: the pool is shape-heterogeneous (cameras 1/3,
             # tactile streams 0/2/4) so default_collate cannot stack arbitrary
@@ -283,12 +290,15 @@ class Trainer:
                     f"batches/rank across {config.world_size} ranks."
                 )
         else:
-            train_sampler = DistributedSampler(
+            sampler_class = WithinUpdateDistributedSampler if grouped else DistributedSampler
+            sampler_options = {"accumulation_steps": self.gradient_accumulation_steps} if grouped else {}
+            train_sampler = sampler_class(
                 train_dataset,
                 num_replicas=config.world_size,
                 rank=config.rank,
                 shuffle=True,
                 seed=getattr(config, 'seed', 42)
+                **sampler_options,
             ) if config.world_size > 1 or getattr(config, 'save_training_state', False) else None
             self.train_loader = DataLoader(
                 train_dataset,

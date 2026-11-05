@@ -99,3 +99,45 @@ class BucketedDistributedBatchSampler:
 
 
 __all__ = ["BucketedDistributedBatchSampler"]
+
+
+class WithinUpdateDistributedSampler(torch.utils.data.DistributedSampler):
+    """Reorder singleton samples only inside their original optimizer update.
+
+    The upstream sampler still owns shuffling, padding and epoch boundaries.
+    Group similarly expensive examples into the same synchronized microstep;
+    do not move examples between updates or drop a trajectory.
+    """
+    def __init__(self, dataset, *, accumulation_steps, **kwargs):
+        super().__init__(dataset, **kwargs)
+        self.accumulation_steps = int(accumulation_steps)
+        if self.accumulation_steps < 1:
+            raise ValueError("accumulation_steps must be positive")
+        self.cost = [
+            (row["end_frame"] - row["start_frame"]) * len(repo.used_video_keys)
+            for repo in dataset._datasets for row in repo.new_metas
+        ]
+        if len(self.cost) != len(dataset) or any(c <= 0 for c in self.cost):
+            raise ValueError("Expected one positive frame/camera cost per segment")
+
+    def __iter__(self):
+        streams = []
+        for rank in range(self.num_replicas):
+            sampler = torch.utils.data.DistributedSampler(
+                self.dataset, num_replicas=self.num_replicas, rank=rank,
+                shuffle=self.shuffle, seed=self.seed, drop_last=self.drop_last,
+            )
+            sampler.set_epoch(self.epoch)
+            streams.append(iter(sampler))
+        order = [idx for micro in zip(*streams) for idx in micro]
+        width = self.num_replicas
+        window = self.accumulation_steps * width
+        # Leave partial windows on both sides of a sampler epoch unchanged.
+        begin = (-self.epoch * self.num_samples) % self.accumulation_steps * width
+        for start in range(begin, len(order) - window + 1, window):
+            group = sorted(order[start:start + window], key=self.cost.__getitem__, reverse=True)
+            shift = (self.epoch + start // window) % width
+            for offset in range(0, window, width):
+                row = group[offset:offset + width]
+                order[start + offset:start + offset + width] = row[shift:] + row[:shift]
+        return iter(order[self.rank::width])

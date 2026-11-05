@@ -276,3 +276,18 @@ packed-attention autograd at several chunk budgets, including padded tokens.
 Component timings on a shared GPU are diagnostic only. Full-trajectory FSDP
 forward, backward and optimizer-step timing must still be measured before
 claiming a production speedup or changing the running training process.
+
+
+### Length grouping within an optimizer update
+
+For distributed IKV with one sample per GPU, set
+`IKV_GROUP_WITHIN_UPDATE=1` to group samples of similar frame count and
+camera count into the same microstep. The sampler keeps the exact set of
+examples (including padding multiplicity) in every original optimizer update.
+It leaves partial windows across epoch boundaries in their original order.
+Sample order and rank assignment within an update can change, so per-example
+noise draws and floating-point reduction order can differ. The loss, sample
+weights, retention formula and optimizer cadence stay unchanged. A complete
+checkpoint records the sampler layout and refuses an incompatible resume.
+This flag is independent of `IKV_COMPACT_ATTENTION`, which executes the same
+retained-key visibility with packed attention.
