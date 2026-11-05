@@ -6,101 +6,83 @@ No persistent inference pool or detached historical K/V is used here.
 """
 from dataclasses import replace
 import os
-
 import torch
 import torch.distributed as dist
 from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig
-
-
 _HISTORY_DECISION_CACHE = {}
 
-
-def training_metadata(grid, layout, splits, latent, action, motion_layout, version=2):
+def training_metadata(grid, layout, splits, latent, action, version=2):
     """Describe condition tokens; index features never enter content embeddings."""
-    n = len(layout["seq"])
+    n = len(layout['seq'])
     device = grid.device
     full_grid = torch.zeros(4, n, device=device)
     full_grid[:, :grid.shape[-1]] = grid[0]
-    rows = dict(world_time_id=full_grid[0].float(),
-                grid_position=full_grid[1:].T.float(), kind=layout["kind"],
-                observation_flag=torch.ones(n, dtype=torch.bool, device=device),
-                duration=torch.ones(n, device=device))
-    v_start, v_end = splits[0], sum(splits[:2])
-    for name, source in (("dino", "dino_features"), ("neoforce", "neoforce_features")):
-        # Sparse fields have already been validated/aligned by _rgb_motion_layout.
+    rows = dict(world_time_id=full_grid[0].float(), grid_position=full_grid[1:].T.float(), kind=layout['kind'], observation_flag=torch.ones(n, dtype=torch.bool, device=device), duration=torch.ones(n, device=device))
+    v_start, v_end = (splits[0], sum(splits[:2]))
+    for name, source in (('dino', 'dino_features'), ('neoforce', 'neoforce_features')):
         features = None
-        if motion_layout is not None and motion_layout["semantic_index"] is not None:
-            features = motion_layout["semantic_index"][name]
-        elif motion_layout is None and source in latent:
+        if source in latent:
             features = latent[source]
-        if version == 2 and name == "dino" and "dense_dino_features" in latent:
-            features = latent["dense_dino_features"].flatten(1, 2)
-            if motion_layout is not None:
-                indices = motion_layout["indices"]
-                features = features.gather(1, indices[..., None].expand(-1, -1, features.shape[-1]))
+        if version == 2 and name == 'dino' and ('dense_dino_features' in latent):
+            features = latent['dense_dino_features'].flatten(1, 2)
         if features is None:
             rows[name] = torch.empty(n, 0, device=device)
         else:
-            features = features.reshape(v_end-v_start, features.shape[-1]).detach().float()
+            features = features.reshape(v_end - v_start, features.shape[-1]).detach().float()
             if not torch.isfinite(features).all():
-                raise ValueError("IKV training metadata must be finite")
+                raise ValueError('IKV training metadata must be finite')
             rows[name] = torch.zeros(n, features.shape[-1], device=device)
             rows[name][v_start:v_end] = features
-    if version == 2 and "task_relevance" in latent:
-        relevance = latent["task_relevance"].flatten(1, 2)
-        if motion_layout is not None:
-            relevance = relevance.gather(1, motion_layout["indices"])
+    if version == 2 and 'task_relevance' in latent:
+        relevance = latent['task_relevance'].flatten(1, 2)
         relevance = relevance.reshape(-1).detach().float()
-        if len(relevance) != v_end-v_start or not torch.isfinite(relevance).all() or ((relevance < 0) | (relevance > 1)).any():
-            raise ValueError("training task relevance must align with video patches in [0,1]")
-        rows["task_relevance"] = torch.zeros(n, device=device)
-        rows["task_relevance"][v_start:v_end] = relevance
-    values = action["latent"].permute(0, 2, 3, 4, 1).flatten(0, 3).detach().float()
+        if len(relevance) != v_end - v_start or not torch.isfinite(relevance).all() or ((relevance < 0) | (relevance > 1)).any():
+            raise ValueError('training task relevance must align with video patches in [0,1]')
+        rows['task_relevance'] = torch.zeros(n, device=device)
+        rows['task_relevance'][v_start:v_end] = relevance
+    values = action['latent'].permute(0, 2, 3, 4, 1).flatten(0, 3).detach().float()
     start = sum(splits[:3])
-    rows["action"] = torch.zeros(n, values.shape[-1], device=device)
+    rows['action'] = torch.zeros(n, values.shape[-1], device=device)
     if len(values) != splits[3]:
-        raise ValueError("condition action metadata/token count mismatch")
-    rows["action"][start:start+splits[3]] = values
+        raise ValueError('condition action metadata/token count mismatch')
+    rows['action'][start:start + splits[3]] = values
     if version == 2:
-        frame_neo = latent.get("frame_neoforce_features")
+        frame_neo = latent.get('frame_neoforce_features')
         if frame_neo is not None:
             if frame_neo.ndim != 3 or not torch.isfinite(frame_neo).all():
-                raise ValueError("frame_neoforce_features must be finite [B,F,D], zero without contact")
-            rows["neoforce"] = torch.zeros(n, frame_neo.shape[-1], device=device)
-            selected = layout["clean"] & (layout["seq"] >= 0) & (layout["kind"] != 1)
-            frame = rows["world_time_id"][selected].long()
+                raise ValueError('frame_neoforce_features must be finite [B,F,D], zero without contact')
+            rows['neoforce'] = torch.zeros(n, frame_neo.shape[-1], device=device)
+            selected = layout['clean'] & (layout['seq'] >= 0) & (layout['kind'] != 1)
+            frame = rows['world_time_id'][selected].long()
             if len(frame) and (frame.min() < 0 or frame.max() >= frame_neo.shape[1]):
-                raise ValueError("NeoForce frames do not cover the training sequence")
-            rows["neoforce"][selected] = frame_neo[layout["seq"][selected], frame]
-    if version == 2 and "tactile_dino_features" in latent:
-        features = latent["tactile_dino_features"].detach().float()
+                raise ValueError('NeoForce frames do not cover the training sequence')
+            rows['neoforce'][selected] = frame_neo[layout['seq'][selected], frame]
+    if version == 2 and 'tactile_dino_features' in latent:
+        features = latent['tactile_dino_features'].detach().float()
         if features.ndim != 5 or not torch.isfinite(features).all():
-            raise ValueError("tactile DINO must be finite [B,F,S,P,D]")
-        frame_duration = latent["frame_contact_duration"].detach().float()
-        tactile_duration = latent["tactile_contact_duration"].detach().float()
+            raise ValueError('tactile DINO must be finite [B,F,S,P,D]')
+        frame_duration = latent['frame_contact_duration'].detach().float()
+        tactile_duration = latent['tactile_contact_duration'].detach().float()
         if frame_duration.shape != features.shape[:2] or tactile_duration.shape != features.shape[:3]:
-            raise ValueError("contact durations must align with tactile semantic frames")
-        rows["neoforce"] = torch.zeros(n,features.shape[-1],device=device)
-        rows["contact_present"] = torch.zeros(n,dtype=torch.bool,device=device)
-        rows["contact_duration"] = torch.zeros(n,device=device)
-        for batch in torch.unique(layout["seq"][layout["seq"]>=0]).tolist():
-            selected = layout["clean"] & (layout["seq"]==batch) & (layout["kind"]==2)
-            # Global tactile tokens are sensor-major, then frame and spatial patch.
-            values = features[batch].permute(1,0,2,3).reshape(-1,features.shape[-1])
+            raise ValueError('contact durations must align with tactile semantic frames')
+        rows['neoforce'] = torch.zeros(n, features.shape[-1], device=device)
+        rows['contact_present'] = torch.zeros(n, dtype=torch.bool, device=device)
+        rows['contact_duration'] = torch.zeros(n, device=device)
+        for batch in torch.unique(layout['seq'][layout['seq'] >= 0]).tolist():
+            selected = layout['clean'] & (layout['seq'] == batch) & (layout['kind'] == 2)
+            values = features[batch].permute(1, 0, 2, 3).reshape(-1, features.shape[-1])
             if int(selected.sum()) != len(values):
-                raise ValueError("tactile DINO patch grid differs from tactile token layout")
-            rows["neoforce"][selected] = values
-            duration = tactile_duration[batch].T[...,None].expand(
-                features.shape[2],features.shape[1],features.shape[3]).reshape(-1)
-            rows["contact_duration"][selected] = duration
-            rows["contact_present"][selected] = duration>0
-            visual = layout["clean"] & (layout["seq"]==batch) & (layout["kind"]==0)
-            frame = rows["world_time_id"][visual].long()
-            rows["contact_duration"][visual] = frame_duration[batch,frame]
-            rows["contact_present"][visual] = frame_duration[batch,frame]>0
+                raise ValueError('tactile DINO patch grid differs from tactile token layout')
+            rows['neoforce'][selected] = values
+            duration = tactile_duration[batch].T[..., None].expand(features.shape[2], features.shape[1], features.shape[3]).reshape(-1)
+            rows['contact_duration'][selected] = duration
+            rows['contact_present'][selected] = duration > 0
+            visual = layout['clean'] & (layout['seq'] == batch) & (layout['kind'] == 0)
+            frame = rows['world_time_id'][visual].long()
+            rows['contact_duration'][visual] = frame_duration[batch, frame]
+            rows['contact_present'][visual] = frame_duration[batch, frame] > 0
     return rows
-
 
 def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
     """Execute the original clean/noisy causal phases with bounded condition KV.
@@ -242,7 +224,6 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
         result = result + zero_anchor
     return result
 
-
 def sample_ikv_capacity(memory, device, retention):
     """Draw K without consulting future token counts or feature values."""
     config = memory["config"]
@@ -285,7 +266,6 @@ def sample_ikv_capacity(memory, device, retention):
     config["sampled_modality_capacities"] = budgets
     return sampled, replace(retention, video_capacity=budgets[0],
                             action_capacity=budgets[1], tactile_capacity=budgets[2])
-
 
 def build_ikv_support_plan(memory, device, *, return_groups=False):
     """Replay the detached retention policy from recorded metadata only.
@@ -403,7 +383,6 @@ def build_ikv_support_plan(memory, device, *, return_groups=False):
               f"frames={len(policy.history.decision_cache)}", flush=True)
     return dict(groups=groups) if return_groups else dict(clean=support_clean, noisy=support_noisy)
 
-
 def _preserve_parent_full_blocks(mask):
     """Keep 128-block traversal order while pruning empty 64 blocks.
 
@@ -444,7 +423,6 @@ def _preserve_parent_full_blocks(mask):
         partial_counts, partial_indices, full_counts, full_indices,
         BLOCK_SIZE=64, mask_mod=mask.mask_mod, seq_lengths=mask.seq_lengths,
     )
-
 
 def run_ikv_masked_training(mot, hidden, text, timestep, temb, rope, memory):
     """Use the normal one-pass MoT backward with IKV-derived visibility."""

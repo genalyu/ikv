@@ -181,27 +181,24 @@ def test_feature_builder_caches_relevance_on_dense_grid():
     encoder = FrozenSemanticPatchEncoder(TextModel(), TextTokenizer(), backend="dinov3_txt",
               prompt="right", image_size=(4, 4), patch_size=2, task_temperature=1.)
     frames = np.zeros((5, 32, 32, 3), dtype=np.uint8)
-    _, dense = build_payloads({"top": iter(frames), "wrist": iter(frames)},
+    dense = build_payloads({"top": iter(frames), "wrist": iter(frames)},
                              list(range(5)), [0, 4], encoder)
     assert dense["task_relevance"].shape == (2, 128)
     assert dense["semantic_provenance"] == encoder.provenance()
     assert encoder.model.visual_model.calls == 4  # two cameras, two anchors
 
 
-@pytest.mark.parametrize("sparse", [False, True])
-def test_training_metadata_gathers_dense_relevance(sparse):
+def test_training_metadata_gathers_dense_relevance():
     from n0_twam.models.ikv_training import training_metadata
-    indices = torch.tensor([[3, 0]]) if sparse else None
-    count = 2 if sparse else 4
+    count = 4
     splits = [count, count, 2, 2]
     n = sum(splits)
     latent = dict(task_relevance=torch.tensor([[[.1, .2], [.3, .9]]]),
                   dense_dino_features=torch.ones(1, 2, 2, 3))
-    motion = dict(indices=indices, semantic_index=None) if sparse else None
     metadata = training_metadata(
         torch.zeros(1, 4, n), {"kind": torch.zeros(n, dtype=torch.long), "seq": torch.zeros(n, dtype=torch.long)}, splits,
-        latent, {"latent": torch.zeros(1, 1, 1, 1, 2)}, motion, version=2)
-    expected = torch.tensor([.9, .1]) if sparse else torch.tensor([.1, .2, .3, .9])
+        latent, {"latent": torch.zeros(1, 1, 1, 1, 2)}, version=2)
+    expected = torch.tensor([.1, .2, .3, .9])
     torch.testing.assert_close(metadata["task_relevance"][count:2*count], expected)
     assert metadata["task_relevance"][:count].eq(0).all()
 

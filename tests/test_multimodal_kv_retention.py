@@ -142,13 +142,10 @@ def test_v2_real_mot_training_gradient_and_causality(checkpoint):
 
 
 
-@pytest.mark.parametrize("motion", [False, True])
-def test_full_model_v2_training_with_dense_history_and_frame_contacts(motion):
+def test_full_model_v2_training_with_dense_history_and_frame_contacts():
     from test_ikv_training import training_input, original_loss
     model = tiny_model(False).to(torch.bfloat16).train()
-    model.use_rgb_motion_tokens = motion
-    model.rgb_motion_require_index = False
-    data = training_input(motion=motion)
+    data = training_input()
     data["latent_dict"]["dense_dino_features"] = torch.ones(1, 3, 4, 2)
     data["latent_dict"]["frame_neoforce_features"] = torch.tensor([[[1., 0.], [0., 0.], [0., 1.]]])
     data["ikv_training"] = dict(capacity=12, retention=dict(
@@ -161,22 +158,16 @@ def test_full_model_v2_training_with_dense_history_and_frame_contacts(motion):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("motion", [False, True])
-def test_v2_serving_dense_history_survives_sparse_filter_and_rollback(motion):
+def test_v2_serving_dense_history_and_rollback():
     from unittest.mock import patch
     from test_global_kv_retention import model_input, cache_snapshot, assert_cache_equal
     model = tiny_model(False)
-    model.use_rgb_motion_tokens = motion
-    model.rgb_motion_require_index = False
     model.configure_global_retention("test", version=2, video_capacity=8,
                                      action_capacity=8, tactile_capacity=8)
     def data(t):
         value = model_input(t)
         value["kv_index"] = {"dino": torch.tensor([[1.,0.], [0.,1.], [1.,0.], [0.,1.]])}
         value["tactile_kv_index"] = {"neoforce": torch.tensor([[1.,2.]] * 4)}
-        if motion:
-            value.update(rgb_motion_patch_indices=torch.tensor([[[0, -1]]]),
-                         rgb_motion_valid_mask=torch.tensor([[[True, False]]]))
         return value
     model(data(0), update_cache=2, cache_name="test")
     p = model.mot.retention_policies["test"]

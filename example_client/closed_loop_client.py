@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Closed-loop N0-TWAM client: drive the policy from your own robot or simulator.
 
 `simple_client.py` is an **open-loop** smoke test — it sends a fixed frame a few
@@ -84,7 +83,6 @@ chunk must be re-grounded via ``compute_kv_cache`` after execution, and a failed
 commit must abort the episode. Both failures are silent.
 """
 from __future__ import annotations
-
 import argparse
 import math
 import sys
@@ -92,63 +90,18 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
-
 import numpy as np
-
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
-
-# Import the transport as a TOP-LEVEL package (rather than
-# `n0_twam.utils.Simple_Remote_Infer...`) so that neither `n0_twam/__init__.py`
-# nor `n0_twam/utils/__init__.py` runs — both eagerly import the training stack
-# and would drag in torch/diffusers. This client needs only numpy + websockets
-# + msgpack, and must stay importable on the machine driving the robot, which
-# typically cannot host the training dependencies at all.
-#
-# APPEND, never insert(0): `n0_twam/utils/` contains a `logging.py`, which at the
-# front of sys.path shadows the standard library's and breaks every `import
-# logging` in the process (including the transport's own).
-sys.path.append(str(REPO / "n0_twam" / "utils"))
-
-from Simple_Remote_Infer.deploy.websocket_client_policy import (  # noqa: E402
-    WebsocketClientPolicy,
-)
-
-__all__ = [
-    "EEPose",
-    "SlotContext",
-    "ActionChunk",
-    "ChunkResult",
-    "TwamClient",
-    "rot6d10_to_pose",
-    "pose_to_rot6d10",
-    "to_uint8",
-]
-
-#: Dims one arm occupies in the action/state vector: xyz(3) + rot6d(6) + gripper(1).
+sys.path.append(str(REPO / 'n0_twam' / 'utils'))
+from Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
+__all__ = ['EEPose', 'SlotContext', 'ActionChunk', 'ChunkResult', 'TwamClient', 'rot6d10_to_pose', 'pose_to_rot6d10', 'to_uint8']
 ARM_DIM = 10
-
-#: Server-side state/action vector width (``cfg.action_dim``). Two arms fit; a
-#: single-arm setup uses the first 10 dims and leaves the rest zero.
 STATE_DIM = 20
+IMAGE_KEY_PREFIX = 'observation.images.'
+DEFAULT_CAM_NAMES: Dict[int, Tuple[str, ...]] = {1: ('top', 'wrist_l'), 2: ('top', 'wrist_l', 'wrist_r')}
+DEFAULT_TACTILE_NAMES: Dict[int, Tuple[str, ...]] = {1: ('tactile_a', 'tactile_b'), 2: ('tactile_ll', 'tactile_lr', 'tactile_rl', 'tactile_rr')}
 
-#: Short name -> serve-config key. Mirrors ``twam_posttrain_cfg``'s defaults.
-IMAGE_KEY_PREFIX = "observation.images."
-
-DEFAULT_CAM_NAMES: Dict[int, Tuple[str, ...]] = {
-    1: ("top", "wrist_l"),
-    2: ("top", "wrist_l", "wrist_r"),
-}
-
-DEFAULT_TACTILE_NAMES: Dict[int, Tuple[str, ...]] = {
-    1: ("tactile_a", "tactile_b"),
-    2: ("tactile_ll", "tactile_lr", "tactile_rl", "tactile_rr"),
-}
-
-
-# --------------------------------------------------------------------------
-# rot6d <-> pose
-# --------------------------------------------------------------------------
 def _matrix_to_quat_wxyz(m: np.ndarray) -> np.ndarray:
     """Rotation matrix -> unit quaternion (w, x, y, z), Shepperd's method.
 
@@ -159,35 +112,25 @@ def _matrix_to_quat_wxyz(m: np.ndarray) -> np.ndarray:
     t = float(m[0, 0] + m[1, 1] + m[2, 2])
     if t > 0.0:
         s = math.sqrt(t + 1.0) * 2.0
-        w, x, y, z = (0.25 * s, (m[2, 1] - m[1, 2]) / s,
-                      (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s)
+        w, x, y, z = (0.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s)
     elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
         s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
-        w, x, y, z = ((m[2, 1] - m[1, 2]) / s, 0.25 * s,
-                      (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s)
+        w, x, y, z = ((m[2, 1] - m[1, 2]) / s, 0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s)
     elif m[1, 1] > m[2, 2]:
         s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
-        w, x, y, z = ((m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s,
-                      0.25 * s, (m[1, 2] + m[2, 1]) / s)
+        w, x, y, z = ((m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s)
     else:
         s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
-        w, x, y, z = ((m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s,
-                      (m[1, 2] + m[2, 1]) / s, 0.25 * s)
+        w, x, y, z = ((m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s)
     q = np.array([w, x, y, z], dtype=np.float64)
     return q / (np.linalg.norm(q) + 1e-12)
-
 
 def _quat_wxyz_to_matrix(q: Sequence[float]) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64).reshape(-1)
     if q.shape[0] != 4:
-        raise ValueError(f"quaternion must have 4 elements, got {q.shape[0]}")
+        raise ValueError(f'quaternion must have 4 elements, got {q.shape[0]}')
     w, x, y, z = q / (np.linalg.norm(q) + 1e-12)
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-    ], dtype=np.float64)
-
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]], dtype=np.float64)
 
 @dataclass
 class EEPose:
@@ -202,9 +145,7 @@ class EEPose:
 
     def as_tuple(self) -> Tuple[float, ...]:
         """Flat ``(x, y, z, qw, qx, qy, qz, gripper)`` — what most IK APIs take."""
-        return (*(float(v) for v in self.xyz),
-                *(float(v) for v in self.quat_wxyz), float(self.gripper))
-
+        return (*(float(v) for v in self.xyz), *(float(v) for v in self.quat_wxyz), float(self.gripper))
 
 def rot6d10_to_pose(vec: Sequence[float]) -> EEPose:
     """Decode one arm's 10-dim ``[xyz(3), rot6d(6), gripper(1)]`` slice into a pose.
@@ -217,17 +158,15 @@ def rot6d10_to_pose(vec: Sequence[float]) -> EEPose:
     """
     d = np.asarray(vec, dtype=np.float64).reshape(-1)
     if d.shape[0] < ARM_DIM:
-        raise ValueError(f"expected >= {ARM_DIM} dims per arm, got {d.shape[0]}")
+        raise ValueError(f'expected >= {ARM_DIM} dims per arm, got {d.shape[0]}')
     xyz = d[:3].copy()
-    c1, c2 = d[3:6].copy(), d[6:9].copy()
-    b1 = c1 / (np.linalg.norm(c1) + 1e-8)
-    c2 = c2 - (b1 @ c2) * b1
-    b2 = c2 / (np.linalg.norm(c2) + 1e-8)
+    c1, c2 = (d[3:6].copy(), d[6:9].copy())
+    b1 = c1 / (np.linalg.norm(c1) + 1e-08)
+    c2 = c2 - b1 @ c2 * b1
+    b2 = c2 / (np.linalg.norm(c2) + 1e-08)
     b3 = np.cross(b1, b2)
     rot = np.stack([b1, b2, b3], axis=1)
-    return EEPose(xyz=xyz, quat_wxyz=_matrix_to_quat_wxyz(rot),
-                  gripper=float(d[9]))
-
+    return EEPose(xyz=xyz, quat_wxyz=_matrix_to_quat_wxyz(rot), gripper=float(d[9]))
 
 def pose_to_rot6d10(pose: EEPose) -> np.ndarray:
     """Encode a pose back into a 10-dim ``[xyz(3), rot6d(6), gripper(1)]`` slice.
@@ -237,15 +176,11 @@ def pose_to_rot6d10(pose: EEPose) -> np.ndarray:
     rot = _quat_wxyz_to_matrix(pose.quat_wxyz)
     out = np.zeros(ARM_DIM, dtype=np.float32)
     out[:3] = np.asarray(pose.xyz, dtype=np.float64).reshape(-1)[:3]
-    out[3:9] = rot[:, :2].T.reshape(-1)   # [col0(3), col1(3)]
+    out[3:9] = rot[:, :2].T.reshape(-1)
     out[9] = float(pose.gripper)
     return out
 
-
-# --------------------------------------------------------------------------
-# image normalization
-# --------------------------------------------------------------------------
-def to_uint8(img, scale: str = "auto") -> np.ndarray:
+def to_uint8(img, scale: str='auto') -> np.ndarray:
     """Coerce an image buffer to contiguous ``uint8`` HxWx3.
 
     ``scale`` controls how float inputs are mapped:
@@ -260,34 +195,29 @@ def to_uint8(img, scale: str = "auto") -> np.ndarray:
     * ``"unit"`` — input is [0, 1], multiply by 255.
     * ``"byte"`` — input is already [0, 255], only clip and cast.
     """
-    x = np.asarray(img.cpu() if hasattr(img, "cpu") else img)
+    x = np.asarray(img.cpu() if hasattr(img, 'cpu') else img)
     x = np.squeeze(x)
     if x.ndim == 3 and x.shape[-1] > 3:
-        x = x[..., :3]           # drop alpha
+        x = x[..., :3]
     if x.dtype == np.uint8:
         return np.ascontiguousarray(x)
-    if scale == "auto":
+    if scale == 'auto':
         factor = 1.0 if float(x.max(initial=0.0)) > 1.5 else 255.0
-    elif scale == "unit":
+    elif scale == 'unit':
         factor = 255.0
-    elif scale == "byte":
+    elif scale == 'byte':
         factor = 1.0
     else:
-        raise ValueError(f"unknown scale mode {scale!r}")
+        raise ValueError(f'unknown scale mode {scale!r}')
     return np.ascontiguousarray((x * factor).clip(0, 255).astype(np.uint8))
 
-
-# --------------------------------------------------------------------------
-# chunk types
-# --------------------------------------------------------------------------
 @dataclass
 class SlotContext:
     """Where an action slot sits inside the chunk, handed to the execute callback."""
-    frame: int              #: frame index within the chunk
-    slot: int               #: action slot within the frame
-    slot_index: int         #: running index over the slots actually executed
-    is_keyframe: bool       #: an observation is sampled right after this slot
-
+    frame: int
+    slot: int
+    slot_index: int
+    is_keyframe: bool
 
 @dataclass
 class ActionChunk:
@@ -301,8 +231,6 @@ class ActionChunk:
     raw: np.ndarray
     num_arms: int
     server_timing: Optional[Dict] = None
-    #: Dims per arm. Override together with the client's ``arm_dim`` if your
-    #: checkpoint uses a different per-arm layout.
     arm_dim: int = ARM_DIM
 
     @property
@@ -320,27 +248,17 @@ class ActionChunk:
         ``[xyz, rot6d, gripper]`` per arm — e.g. joint targets.
         """
         vec = np.asarray(self.raw[:, frame, slot]).reshape(-1)
-        return [
-            rot6d10_to_pose(vec[a * self.arm_dim:(a + 1) * self.arm_dim])
-            for a in range(self.num_arms)
-        ]
-
+        return [rot6d10_to_pose(vec[a * self.arm_dim:(a + 1) * self.arm_dim]) for a in range(self.num_arms)]
 
 @dataclass
 class ChunkResult:
     """Outcome of one :meth:`TwamClient.run_chunk` bracket."""
     chunk: ActionChunk
     executed_slots: int
-    #: True if the execute callback aborted the chunk (task done / budget spent).
     stopped: bool = False
-    #: False when the abort happened before the KV cache could be re-grounded.
     committed: bool = False
     keyframes: List[Dict] = field(default_factory=list)
 
-
-# --------------------------------------------------------------------------
-# client
-# --------------------------------------------------------------------------
 class TwamClient:
     """Streaming closed-loop client for the N0-TWAM policy server.
 
@@ -375,66 +293,34 @@ class TwamClient:
         ``host``/``port`` when omitted.
     """
 
-    def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: Optional[int] = None,
-        *,
-        prompt: str,
-        num_arms: int = 1,
-        cam_names: Optional[Sequence[str]] = None,
-        tactile_names: Optional[Sequence[str]] = None,
-        video_keyframes_per_frame: int = 4,
-        tactile_keyframes: int = 0,
-        exec_slots: int = 0,
-        image_scale: str = "auto",
-        api_key: Optional[str] = None,
-        client: Optional[WebsocketClientPolicy] = None,
-    ) -> None:
+    def __init__(self, host: str='127.0.0.1', port: Optional[int]=None, *, prompt: str, num_arms: int=1, cam_names: Optional[Sequence[str]]=None, tactile_names: Optional[Sequence[str]]=None, video_keyframes_per_frame: int=4, tactile_keyframes: int=0, exec_slots: int=0, image_scale: str='auto', api_key: Optional[str]=None, client: Optional[WebsocketClientPolicy]=None) -> None:
         if num_arms not in (1, 2):
-            raise ValueError(f"num_arms must be 1 or 2, got {num_arms}")
+            raise ValueError(f'num_arms must be 1 or 2, got {num_arms}')
         if not prompt:
-            raise ValueError(
-                "prompt is required and must be the training instruction "
-                "verbatim — there is no safe default")
-
+            raise ValueError('prompt is required and must be the training instruction verbatim — there is no safe default')
         self.prompt = prompt
         self.num_arms = num_arms
         self.cam_names = tuple(cam_names or DEFAULT_CAM_NAMES[num_arms])
-        self.tactile_names = tuple(tactile_names
-                                   or DEFAULT_TACTILE_NAMES[num_arms])
+        self.tactile_names = tuple(tactile_names or DEFAULT_TACTILE_NAMES[num_arms])
         self.video_keyframes_per_frame = max(1, int(video_keyframes_per_frame))
         self.tactile_keyframes = int(tactile_keyframes)
         self.exec_slots = int(exec_slots)
         self.image_scale = image_scale
-        # Instance attributes, not module constants, so a subclass serving a
-        # checkpoint with a different action layout can change them without
-        # forking this file.
         self.arm_dim = ARM_DIM
         self.state_dim = STATE_DIM
         self.image_key_prefix = IMAGE_KEY_PREFIX
-
-        self._client = client if client is not None else WebsocketClientPolicy(
-            host=host, port=port, api_key=api_key)
-        # After a reset the server holds a 1-frame cold seed that already
-        # corresponds to frame 0 of the next chunk; executing frame 0 again
-        # would replay the current pose as a target and stall the arm.
+        self._client = client if client is not None else WebsocketClientPolicy(host=host, port=port, api_key=api_key)
         self._cold_chunk = True
 
-    # -- transport -------------------------------------------------------
     @property
     def server_metadata(self) -> Dict:
         return self._client.get_server_metadata()
 
     def full_keys(self, names: Sequence[str]) -> List[str]:
         """Short names -> the keys the serve config declares."""
-        return [
-            n if n.startswith(self.image_key_prefix) else
-            self.image_key_prefix + n for n in names
-        ]
+        return [n if n.startswith(self.image_key_prefix) else self.image_key_prefix + n for n in names]
 
-    def pack_images(self, images: Dict, names: Sequence[str],
-                    kind: str) -> Dict[str, np.ndarray]:
+    def pack_images(self, images: Dict, names: Sequence[str], kind: str) -> Dict[str, np.ndarray]:
         """Short-name dict -> ``observation.images.*`` dict of uint8 frames.
 
         Missing or unexpected keys raise here rather than reaching the server as
@@ -455,27 +341,20 @@ class TwamClient:
             elif full in images:
                 value = images[full]
             else:
-                raise KeyError(
-                    f"{kind} observation is missing {name!r} (expected keys: "
-                    f"{list(names)}, got: {sorted(images)})")
+                raise KeyError(f'{kind} observation is missing {name!r} (expected keys: {list(names)}, got: {sorted(images)})')
             packed[full] = to_uint8(value, self.image_scale)
         extra = set(images) - set(names) - set(self.full_keys(names))
         if extra:
-            raise KeyError(
-                f"{kind} observation has unexpected keys {sorted(extra)}; "
-                f"expected exactly {list(names)}. A key the serve config does "
-                f"not declare is dropped server-side, not reported.")
+            raise KeyError(f'{kind} observation has unexpected keys {sorted(extra)}; expected exactly {list(names)}. A key the serve config does not declare is dropped server-side, not reported.')
         return packed
 
-    # -- state helpers ---------------------------------------------------
     def encode_state(self, poses: Sequence[EEPose]) -> np.ndarray:
         """Build the 20-dim ``current_state`` vector from one pose per arm.
 
         Arm 0 occupies dims 0-9, arm 1 dims 10-19; unused dims stay zero.
         """
         if len(poses) != self.num_arms:
-            raise ValueError(
-                f"expected {self.num_arms} pose(s), got {len(poses)}")
+            raise ValueError(f'expected {self.num_arms} pose(s), got {len(poses)}')
         state = np.zeros(self.state_dim, dtype=np.float32)
         for i, pose in enumerate(poses):
             state[i * self.arm_dim:(i + 1) * self.arm_dim] = pose_to_rot6d10(pose)
@@ -484,13 +363,10 @@ class TwamClient:
     def _as_state_list(self, state) -> List[float]:
         vec = np.asarray(state, dtype=np.float32).reshape(-1)
         if vec.shape[0] != self.state_dim:
-            raise ValueError(
-                f"current_state must be {self.state_dim}-dim, got {vec.shape[0]}")
+            raise ValueError(f'current_state must be {self.state_dim}-dim, got {vec.shape[0]}')
         return [float(v) for v in vec]
 
-    # -- protocol steps --------------------------------------------------
-    def reset(self, prompt: Optional[str] = None,
-              seed: Optional[int] = None) -> None:
+    def reset(self, prompt: Optional[str]=None, seed: Optional[int]=None) -> None:
         """Start a new episode: clear the server's KV cache and re-encode the prompt.
 
         ``seed`` makes the diffusion noise reproducible for that episode
@@ -498,114 +374,35 @@ class TwamClient:
         """
         if prompt is not None:
             self.prompt = prompt
-        request = {"reset": True, "prompt": self.prompt}
+        request = {'reset': True, 'prompt': self.prompt}
         if seed is not None:
-            request["seed"] = int(seed)
+            request['seed'] = int(seed)
         self._client.infer(request)
         self._cold_chunk = True
 
-    def infer_chunk(
-        self,
-        cams: Dict,
-        tactile: Dict,
-        current_state,
-        *,
-        rgb_motion: Optional[Dict] = None,
-        rgb_motion_inputs: Optional[Dict] = None,
-    ) -> ActionChunk:
-        """Request one action chunk for the current observation.
-
-        Sends a single (current) frame per camera and tactile sensor: the
-        server's cold seed takes exactly one frame, and more would break its
-        streaming VAE shortcut. Multi-frame history goes through
-        :meth:`commit_kv_cache` instead.
-
-        ``rgb_motion`` is an optional precomputed canonical sidecar;
-        ``rgb_motion_inputs`` is an optional raw RGB-D payload following the
-        server's schema. Both are forwarded unchanged. If both are supplied,
-        the server uses the precomputed sidecar and ignores raw preprocessing;
-        the client deliberately does not choose or rewrite either payload.
-        Camera poses and intrinsics must come from the camera calibration/pose
-        source, never from ``current_state`` (the robot end effector).
-        Prefer to omit ``anchor_indices``: the server derives ``[0]`` for the
-        cold one-frame seed and causal chunk-end anchors such as ``[3, 7]`` for
-        a warm eight-frame call at WAN temporal stride 4.
-        """
-        request = {
-            "obs": self.pack_images(cams, self.cam_names, "camera"),
-            "tactile": self.pack_images(tactile, self.tactile_names, "tactile"),
-            "current_state": self._as_state_list(current_state),
-            "prompt": self.prompt,
-        }
-        if rgb_motion is not None:
-            request["rgb_motion"] = rgb_motion
-        if rgb_motion_inputs is not None:
-            request["rgb_motion_inputs"] = rgb_motion_inputs
+    def infer_chunk(self, cams: Dict, tactile: Dict, current_state) -> ActionChunk:
+        """Send synchronized full RGB observations and optional tactile inputs."""
+        request = {'obs': self.pack_images(cams, self.cam_names, 'camera'), 'tactile': self.pack_images(tactile, self.tactile_names, 'tactile'), 'current_state': self._as_state_list(current_state), 'prompt': self.prompt}
         response = self._client.infer(request)
-        if "action" not in response:
-            raise RuntimeError(
-                f"server returned no 'action' field (keys: {sorted(response)})")
-        raw = np.asarray(response["action"], dtype=np.float32)
+        if 'action' not in response:
+            raise RuntimeError(f"server returned no 'action' field (keys: {sorted(response)})")
+        raw = np.asarray(response['action'], dtype=np.float32)
         if raw.ndim != 3:
-            raise RuntimeError(
-                f"expected action shape (C, F, H), got {raw.shape}")
+            raise RuntimeError(f'expected action shape (C, F, H), got {raw.shape}')
         if raw.shape[0] < self.num_arms * self.arm_dim:
-            raise RuntimeError(
-                f"action has {raw.shape[0]} channels, too few for "
-                f"{self.num_arms} arm(s) (need {self.num_arms * self.arm_dim})")
-        return ActionChunk(raw=raw, num_arms=self.num_arms,
-                           server_timing=response.get("server_timing"),
-                           arm_dim=self.arm_dim)
+            raise RuntimeError(f'action has {raw.shape[0]} channels, too few for {self.num_arms} arm(s) (need {self.num_arms * self.arm_dim})')
+        return ActionChunk(raw=raw, num_arms=self.num_arms, server_timing=response.get('server_timing'), arm_dim=self.arm_dim)
 
-    def commit_kv_cache(self, video_keyframes: List[Dict],
-                        tactile_keyframes: List[Dict], action: np.ndarray,
-                        current_state, *,
-                        rgb_motion: Optional[Dict] = None,
-                        rgb_motion_inputs: Optional[Dict] = None) -> None:
-        """Re-ground the KV cache on what was actually observed and executed.
-
-        This is what closes the loop. Skipping it — or swallowing its failure —
-        leaves the model running on its own imagined future, i.e. open-loop,
-        with no error raised anywhere. Any failure therefore propagates: treat
-        the episode as invalid rather than continuing.
-
-        This request advances the server's ``frame_st_id``. The bundled
-        transport does not retry, which is exactly the semantics needed: a
-        replay after a lost response would double-count the time axis. **If you
-        add retries to** ``WebsocketClientPolicy``, exempt this call.
-
-        ``rgb_motion`` forwards a precomputed canonical sidecar and
-        ``rgb_motion_inputs`` forwards raw RGB-D by reference, without
-        normalization or inferred calibration fields. If both are present the
-        server gives ``rgb_motion`` precedence; the client retains both
-        objects unchanged. Raw input must describe ``video_keyframes``. In
-        particular, do not reuse the offline whole-video anchor schedule here;
-        omit ``anchor_indices`` so the server derives the warm streaming-VAE
-        causal ends, or provide exactly those derived values.
-        """
+    def commit_kv_cache(self, video_keyframes: List[Dict], tactile_keyframes: List[Dict], action: np.ndarray, current_state) -> None:
+        """Send synchronized full RGB observations and optional tactile inputs."""
         if self.tactile_keyframes > 0:
             tactile_keyframes = tactile_keyframes[-self.tactile_keyframes:]
         try:
-            request = {
-                "obs": video_keyframes,
-                "tactile": tactile_keyframes,
-                "state": np.asarray(action, dtype=np.float32),
-                "current_state": self._as_state_list(current_state),
-                "compute_kv_cache": True,
-                "imagine": False,
-                "prompt": self.prompt,
-            }
-            if rgb_motion is not None:
-                request["rgb_motion"] = rgb_motion
-            if rgb_motion_inputs is not None:
-                request["rgb_motion_inputs"] = rgb_motion_inputs
+            request = {'obs': video_keyframes, 'tactile': tactile_keyframes, 'state': np.asarray(action, dtype=np.float32), 'current_state': self._as_state_list(current_state), 'compute_kv_cache': True, 'imagine': False, 'prompt': self.prompt}
             self._client.infer(request)
         except Exception as e:
-            raise RuntimeError(
-                f"compute_kv_cache commit failed ({type(e).__name__}: {e}); "
-                "the episode is now open-loop and must be discarded") from e
+            raise RuntimeError(f'compute_kv_cache commit failed ({type(e).__name__}: {e}); the episode is now open-loop and must be discarded') from e
 
-    # -- orchestration hooks ---------------------------------------------
     def is_keyframe_slot(self, slot: int, slots_per_frame: int) -> bool:
         """Whether to sample an observation right after executing ``slot``.
 
@@ -626,243 +423,90 @@ class TwamClient:
         """
         return 1 if self._cold_chunk else 0
 
-    # -- orchestration ---------------------------------------------------
-    def run_chunk(
-        self,
-        cams: Dict,
-        tactile: Dict,
-        current_state,
-        execute: Callable[[List[EEPose], SlotContext], Optional[bool]],
-        observe: Callable[[], Tuple[Dict, Dict]],
-        *,
-        make_infer_rgb_motion: Optional[
-            Callable[[Dict], Optional[Dict]]
-        ] = None,
-        make_commit_rgb_motion: Optional[
-            Callable[[List[Dict]], Optional[Dict]]
-        ] = None,
-        make_infer_rgb_motion_inputs: Optional[
-            Callable[[Dict], Optional[Dict]]
-        ] = None,
-        make_commit_rgb_motion_inputs: Optional[
-            Callable[[List[Dict]], Optional[Dict]]
-        ] = None,
-    ) -> ChunkResult:
-        """One full closed-loop bracket: infer -> execute -> re-ground.
-
-        ``execute(poses, ctx)`` receives one :class:`EEPose` per arm and returns
-        truthy to abort the chunk (task solved, step budget exhausted, ...).
-        ``observe()`` returns the current ``(cams, tactile)`` dicts and is called
-        at each keyframe to collect what the arm actually saw.
-
-        On abort the KV cache is deliberately **not** committed: the executed
-        prefix does not correspond to a complete chunk, and grounding on it
-        would desynchronize the server's time axis from the robot's.
-
-        The optional builders preserve the long-standing
-        ``observe() -> (cams, tactile)`` contract. ``make_*_rgb_motion`` builds
-        precomputed canonical sidecars; ``make_*_rgb_motion_inputs`` builds raw
-        RGB-D payloads. Infer builders receive the current short-name camera
-        dict, while commit builders receive the ordered camera dicts sampled at
-        keyframe slots. Each returns the exact object to forward or ``None``.
-        The raw infer builder runs only for the cold seed because warm infer is
-        imagination and the server does not consume raw observations there;
-        the canonical infer builder runs for every chunk so callers may provide
-        explicit future support. If both kinds are returned, both are sent and
-        the server gives the canonical sidecar precedence. Builders remain
-        responsible for synchronized depth, camera poses and intrinsics; robot
-        end-effector state is never passed as camera geometry.
-        """
-        infer_rgb_motion = (
-            make_infer_rgb_motion(cams)
-            if make_infer_rgb_motion is not None
-            else None
-        )
-        infer_rgb_motion_inputs = (
-            make_infer_rgb_motion_inputs(cams)
-            if make_infer_rgb_motion_inputs is not None and self._cold_chunk
-            else None
-        )
-        chunk = self.infer_chunk(
-            cams,
-            tactile,
-            current_state,
-            rgb_motion=infer_rgb_motion,
-            rgb_motion_inputs=infer_rgb_motion_inputs,
-        )
-        # Freeze the chunk-start state: the commit must carry the SAME anchor
-        # the inference used, or the server's delta<->absolute round-trip on
-        # pi05_delta channels no longer cancels.
+    def run_chunk(self, cams: Dict, tactile: Dict, current_state, execute: Callable[[List[EEPose], SlotContext], Optional[bool]], observe: Callable[[], Tuple[Dict, Dict]]) -> ChunkResult:
+        """Send synchronized full RGB observations and optional tactile inputs."""
+        chunk = self.infer_chunk(cams, tactile, current_state)
         anchor_state = self._as_state_list(current_state)
-
-        slots = (min(chunk.slots_per_frame, self.exec_slots)
-                 if self.exec_slots > 0 else chunk.slots_per_frame)
+        slots = min(chunk.slots_per_frame, self.exec_slots) if self.exec_slots > 0 else chunk.slots_per_frame
         start_frame = self.first_frame_index()
         self._cold_chunk = False
-
         video_keyframes: List[Dict] = []
         raw_video_keyframes: List[Dict] = []
         tactile_keyframes: List[Dict] = []
         executed = 0
-
         for frame in range(start_frame, chunk.num_frames):
             for slot in range(slots):
-                ctx = SlotContext(
-                    frame=frame, slot=slot, slot_index=executed,
-                    is_keyframe=self.is_keyframe_slot(slot,
-                                                      chunk.slots_per_frame))
+                ctx = SlotContext(frame=frame, slot=slot, slot_index=executed, is_keyframe=self.is_keyframe_slot(slot, chunk.slots_per_frame))
                 if execute(chunk.poses_at(frame, slot), ctx):
-                    return ChunkResult(chunk=chunk, executed_slots=executed + 1,
-                                       stopped=True, committed=False,
-                                       keyframes=video_keyframes)
+                    return ChunkResult(chunk=chunk, executed_slots=executed + 1, stopped=True, committed=False, keyframes=video_keyframes)
                 executed += 1
                 if ctx.is_keyframe:
                     k_cams, k_tactile = observe()
                     raw_video_keyframes.append(k_cams)
-                    video_keyframes.append(
-                        self.pack_images(k_cams, self.cam_names, "camera"))
-                    tactile_keyframes.append(
-                        self.pack_images(k_tactile, self.tactile_names,
-                                         "tactile"))
-
+                    video_keyframes.append(self.pack_images(k_cams, self.cam_names, 'camera'))
+                    tactile_keyframes.append(self.pack_images(k_tactile, self.tactile_names, 'tactile'))
         committed = False
         if video_keyframes:
-            commit_rgb_motion = (
-                make_commit_rgb_motion(raw_video_keyframes)
-                if make_commit_rgb_motion is not None
-                else None
-            )
-            commit_rgb_motion_inputs = (
-                make_commit_rgb_motion_inputs(raw_video_keyframes)
-                if make_commit_rgb_motion_inputs is not None
-                else None
-            )
-            self.commit_kv_cache(video_keyframes, tactile_keyframes, chunk.raw,
-                                 anchor_state,
-                                 rgb_motion=commit_rgb_motion,
-                                 rgb_motion_inputs=commit_rgb_motion_inputs)
+            self.commit_kv_cache(video_keyframes, tactile_keyframes, chunk.raw, anchor_state)
             committed = True
-        return ChunkResult(chunk=chunk, executed_slots=executed,
-                           stopped=False, committed=committed,
-                           keyframes=video_keyframes)
+        return ChunkResult(chunk=chunk, executed_slots=executed, stopped=False, committed=committed, keyframes=video_keyframes)
 
-    def run_episode(
-        self,
-        observe: Callable[[], Tuple[Dict, Dict]],
-        get_state: Callable[[], np.ndarray],
-        execute: Callable[[List[EEPose], SlotContext], Optional[bool]],
-        max_chunks: int = 1000,
-        seed: Optional[int] = None,
-        *,
-        make_infer_rgb_motion: Optional[
-            Callable[[Dict], Optional[Dict]]
-        ] = None,
-        make_commit_rgb_motion: Optional[
-            Callable[[List[Dict]], Optional[Dict]]
-        ] = None,
-        make_infer_rgb_motion_inputs: Optional[
-            Callable[[Dict], Optional[Dict]]
-        ] = None,
-        make_commit_rgb_motion_inputs: Optional[
-            Callable[[List[Dict]], Optional[Dict]]
-        ] = None,
-    ) -> int:
-        """Reset, then loop :meth:`run_chunk` until ``execute`` aborts.
-
-        Returns the number of chunks run. Thin convenience wrapper — drive
-        :meth:`run_chunk` yourself when you need per-chunk bookkeeping. The
-        optional RGB-motion builders have the same contract as
-        :meth:`run_chunk` and are invoked afresh for every chunk.
-        """
+    def run_episode(self, observe: Callable[[], Tuple[Dict, Dict]], get_state: Callable[[], np.ndarray], execute: Callable[[List[EEPose], SlotContext], Optional[bool]], max_chunks: int=1000, seed: Optional[int]=None) -> int:
+        """Send synchronized full RGB observations and optional tactile inputs."""
         self.reset(seed=seed)
         for i in range(max_chunks):
             cams, tactile = observe()
-            if self.run_chunk(
-                cams,
-                tactile,
-                get_state(),
-                execute,
-                observe,
-                make_infer_rgb_motion=make_infer_rgb_motion,
-                make_commit_rgb_motion=make_commit_rgb_motion,
-                make_infer_rgb_motion_inputs=make_infer_rgb_motion_inputs,
-                make_commit_rgb_motion_inputs=make_commit_rgb_motion_inputs,
-            ).stopped:
+            if self.run_chunk(cams, tactile, get_state(), execute, observe).stopped:
                 return i + 1
         return max_chunks
 
-
-# --------------------------------------------------------------------------
-# standalone smoke test
-# --------------------------------------------------------------------------
 def _load_example_frames(cam_names, size=256):
     """Bundled example frames; zeros for anything missing."""
     from PIL import Image
-
-    img_dir = REPO / "example_client" / "twam"
+    img_dir = REPO / 'example_client' / 'twam'
     frames = {}
     for name in cam_names:
-        p = img_dir / f"{IMAGE_KEY_PREFIX}{name}.png"
+        p = img_dir / f'{IMAGE_KEY_PREFIX}{name}.png'
         if p.is_file():
-            frames[name] = np.array(
-                Image.open(p).convert("RGB").resize((size, size)))
+            frames[name] = np.array(Image.open(p).convert('RGB').resize((size, size)))
         else:
-            print(f"warn: {p} not found, sending zeros")
+            print(f'warn: {p} not found, sending zeros')
             frames[name] = np.zeros((size, size, 3), np.uint8)
     return frames
 
-
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=29601)
-    ap.add_argument("--prompt", default="pick up the object",
-                    help="MUST be the training instruction verbatim")
-    ap.add_argument("--num-arms", type=int, default=1, choices=(1, 2))
-    ap.add_argument("--chunks", type=int, default=2)
-    ap.add_argument("--seed", type=int, default=0)
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--host', default='127.0.0.1')
+    ap.add_argument('--port', type=int, default=29601)
+    ap.add_argument('--prompt', default='pick up the object', help='MUST be the training instruction verbatim')
+    ap.add_argument('--num-arms', type=int, default=1, choices=(1, 2))
+    ap.add_argument('--chunks', type=int, default=2)
+    ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
-
-    client = TwamClient(args.host, args.port, prompt=args.prompt,
-                        num_arms=args.num_arms)
-    print("connected:", client.server_metadata)
-    print("cameras:", list(client.cam_names))
-    print("tactile:", list(client.tactile_names))
-
-    # No robot here: replay the bundled frames, zero tactile, identity pose.
+    client = TwamClient(args.host, args.port, prompt=args.prompt, num_arms=args.num_arms)
+    print('connected:', client.server_metadata)
+    print('cameras:', list(client.cam_names))
+    print('tactile:', list(client.tactile_names))
     cams = _load_example_frames(client.cam_names)
-    tactile = {n: np.zeros((256, 256, 3), np.uint8)
-               for n in client.tactile_names}
+    tactile = {n: np.zeros((256, 256, 3), np.uint8) for n in client.tactile_names}
     identity = EEPose(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]), 0.0)
     state = client.encode_state([identity] * args.num_arms)
 
     def execute(poses, ctx):
         if ctx.slot_index == 0:
             p = poses[0]
-            print(f"    slot0 pose: xyz={np.round(p.xyz, 4).tolist()} "
-                  f"quat={np.round(p.quat_wxyz, 4).tolist()} "
-                  f"grip={p.gripper:+.4f}")
-        return False        # a real robot would move here and may abort
+            print(f'    slot0 pose: xyz={np.round(p.xyz, 4).tolist()} quat={np.round(p.quat_wxyz, 4).tolist()} grip={p.gripper:+.4f}')
+        return False
 
     def observe():
-        return cams, tactile
-
+        return (cams, tactile)
     client.reset(seed=args.seed)
-    print(f"reset (seed={args.seed})")
-
+    print(f'reset (seed={args.seed})')
     for i in range(args.chunks):
         t0 = time.time()
         r = client.run_chunk(cams, tactile, state, execute, observe)
         a = r.chunk.raw
-        print(f"chunk {i}: action {a.shape} "
-              f"range [{a.min():+.4f}, {a.max():+.4f}] "
-              f"finite={np.isfinite(a).all()} | "
-              f"executed {r.executed_slots} slots, "
-              f"{len(r.keyframes)} keyframes, committed={r.committed} | "
-              f"{time.time() - t0:.1f}s", flush=True)
-
-    print("done — closed loop ran, KV cache was re-grounded each chunk")
-
-
-if __name__ == "__main__":
+        print(f'chunk {i}: action {a.shape} range [{a.min():+.4f}, {a.max():+.4f}] finite={np.isfinite(a).all()} | executed {r.executed_slots} slots, {len(r.keyframes)} keyframes, committed={r.committed} | {time.time() - t0:.1f}s', flush=True)
+    print('done — closed loop ran, KV cache was re-grounded each chunk')
+if __name__ == '__main__':
     main()

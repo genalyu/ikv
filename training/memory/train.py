@@ -20,46 +20,41 @@ from torch.utils.data import DataLoader, DistributedSampler
 from easydict import EasyDict
 from .sidecar import verify_binding, sha256
 
-
 def configure_memory(cfg, spec):
     cfg.memory_plan_root = None
-    cfg.memory_task_alias = spec.get("task_alias", {})
-    if spec["mode"] == "scorer":
+    cfg.memory_task_alias = spec.get('task_alias', {})
+    if spec['mode'] == 'scorer':
         binding = verify_binding(spec)
-        if binding.get("chunk_size") != 2:
-            raise ValueError("Scorer plan must match native two-frame serving")
-        cfg.memory_plan_root = binding["plan_root"]
-        cfg.memory_binding_sha256 = sha256(spec["binding"])
-        cfg.memory_scorer_sha256 = binding["scorer_sha256"]
-        cfg.memory_budgets = binding["budgets"]
+        if binding.get('chunk_size') != 2:
+            raise ValueError('Scorer plan must match native two-frame serving')
+        cfg.memory_plan_root = binding['plan_root']
+        cfg.memory_binding_sha256 = sha256(spec['binding'])
+        cfg.memory_scorer_sha256 = binding['scorer_sha256']
+        cfg.memory_budgets = binding['budgets']
         if cfg.memory_budgets != [3584, 512]:
-            raise ValueError("This fixed-budget recipe requires video3584/action512")
-    elif spec["mode"] != "baseline":
-        raise ValueError("Choose baseline or scorer explicitly")
+            raise ValueError('This fixed-budget recipe requires video3584/action512')
+    elif spec['mode'] != 'baseline':
+        raise ValueError('Choose baseline or scorer explicitly')
     cfg.require_selected_episodes = True
     cfg.memory_chunk_size = 2
     cfg.memory_seed_observation = True
     cfg.max_latent_frames = 0
     cfg.batch_size = 1
     cfg.num_init_worker = 1
-    cfg.use_rgb_motion_tokens = False
     cfg.ikv_index_root_name = None
     cfg.tactile_keys = []
     cfg.tactile_optional = True
     cfg.use_local_tactile = False
     cfg.tactile_global_zero = True
-    cfg.seed = int(spec.get("seed", 42))
+    cfg.seed = int(spec.get('seed', 42))
     cfg.save_training_state = True
-    cfg.task_mode = spec["mode"]
+    cfg.task_mode = spec['mode']
     cfg.memory_experiment = copy.deepcopy(spec)
-    selections={str(p):sha256(p) for p in sorted(Path(cfg.dataset_path).glob("*/episode_selection.json"))}
+    selections = {str(p): sha256(p) for p in sorted(Path(cfg.dataset_path).glob('*/episode_selection.json'))}
     from .selection import VERSION
-    identity=dict(protocol=VERSION,chunk_size=cfg.memory_chunk_size,action_seed="measured-observation-v1",spec=spec,normalization=cfg.norm_stat,cameras=list(cfg.obs_cam_keys),
-        action_channels=list(cfg.used_action_channel_ids),episode_selections=selections,
-        binding_sha256=getattr(cfg,"memory_binding_sha256",None))
-    cfg.task_fingerprint = hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
+    identity = dict(protocol=VERSION, chunk_size=cfg.memory_chunk_size, action_seed='measured-observation-v1', spec=spec, normalization=cfg.norm_stat, cameras=list(cfg.obs_cam_keys), action_channels=list(cfg.used_action_channel_ids), episode_selections=selections, binding_sha256=getattr(cfg, 'memory_binding_sha256', None))
+    cfg.task_fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cfg.enable_wandb = False
-
 
 def memory_input(original, batch, cfg):
     result = original(batch)
@@ -74,7 +69,6 @@ def memory_input(original, batch, cfg):
             compact_attention=False, sample_capacity=False,
             causal_memory_plan=batch["memory_plan"])
     return result
-
 
 def make_n0(spec, rank, local_rank, world):
     from n0_twam.task_pipeline.config import load_task, training_config
@@ -126,7 +120,6 @@ def make_n0(spec, rank, local_rank, world):
                 dist.barrier()
     return MemoryN0(cfg)
 
-
 def import_lingbot(root):
     directory = Path(root)/"wan_va"
     sys.path.insert(0, str(directory))
@@ -140,7 +133,6 @@ def import_lingbot(root):
     from n0_twam.dataset.lerobot_latent_dataset import MultiLatentLeRobotDataset
     module.MultiLatentLeRobotDataset = MultiLatentLeRobotDataset
     return module
-
 
 def make_lingbot(spec, rank, local_rank, world):
     upstream = import_lingbot(spec["source_root"])
@@ -158,7 +150,6 @@ def make_lingbot(spec, rank, local_rank, world):
         cfg.resume_from = str(Path(spec["resume"]).parent)
     from .lingbot import trainer_class
     return trainer_class(upstream)(cfg)
-
 
 def main():
     import logging
@@ -188,7 +179,5 @@ def main():
     trainer.train()
     if dist.is_initialized():
         dist.destroy_process_group()
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

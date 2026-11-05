@@ -244,7 +244,7 @@ class SharedSelfAttention(nn.Module):
             "mask": torch.zeros((total_tolen,), dtype=torch.bool, device=device),
             "is_pred": torch.zeros((total_tolen,), dtype=torch.bool, device=device),
             # Optional per-video-token semantic sidecar.  It is allocated lazily
-            # on the first RGB-motion update because DINO/NeoForce dimensions
+            # on the first RGB index update because DINO/NeoForce dimensions
             # belong to the data contract, not to the attention K/V width.
             "semantic": None,
         }
@@ -1678,7 +1678,7 @@ class WanMoTTransformer3DModel(WanTransformer3DModel):
                     v2 and cache_context.get("selected_indices") is not None)):
                 if cache_context.get("index") is not None:
                     if not v2:
-                        raise ValueError("sparse global mode expects selected motion metadata, not dense kv_index")
+                        raise ValueError("sparse global mode expects selected token metadata, not dense kv_index")
                     selected = cache_context["selected_indices"][0]
                     dense = cache_context["index"]
                     cache_context["index"] = {}

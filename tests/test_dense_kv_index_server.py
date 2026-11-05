@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from test_rgb_motion_server_helpers import _server, TWAMServer
+from server_test_helpers import _server, TWAMServer
 from n0_twam.models.global_kv_retention import GlobalKVRetention, token_rows
 from n0_twam.utils.utils import get_mesh_id
 

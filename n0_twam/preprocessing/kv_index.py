@@ -1,10 +1,7 @@
 """Dense RGB index helpers: no motion filtering and no prediction feedback."""
 from __future__ import annotations
-
 import torch
-
-from n0_twam.models.rgb_motion import pool_dino_to_grid
-
+from n0_twam.models.rgb_tokens import pool_dino_to_grid
 
 def observed_index(payload, count, device):
     """Validate externally aligned features. Exact zero denotes unavailable.
@@ -47,7 +44,6 @@ def observed_index(payload, count, device):
     result["observation_flag"] = torch.ones(count, dtype=torch.bool, device=device)
     return result
 
-
 @torch.no_grad()
 def encode_dense_dino(videos, anchors, target_size, encoder):
     """[cameras,3,raw_T,H,W] in [0,1] -> [WAN_tokens,D].
@@ -61,7 +57,6 @@ def encode_dense_dino(videos, anchors, target_size, encoder):
         features = encoder(rgb).tokens
         cameras.append(pool_dino_to_grid(features, target_size))
     return torch.cat(cameras, dim=2).flatten(0, 2).detach()
-
 
 def prediction_index(count, device, seed=None):
     """Unknown predicted features stay zero; only the real cold seed is copied."""
@@ -82,7 +77,6 @@ def prediction_index(count, device, seed=None):
             if name in seed:
                 result[name][:seed_count] = seed[name].to(device)
     return result
-
 
 def concat_indices(first, second):
     if first is None:
@@ -114,7 +108,6 @@ def concat_indices(first, second):
                 b = b.new_zeros(len(b), width)
         result[name] = torch.cat((a, b))
     return result
-
 
 @torch.no_grad()
 def route_contact_index(visual_index, contact_features, response, visual_rows,
@@ -171,7 +164,6 @@ def route_contact_index(visual_index, contact_features, response, visual_rows,
         'dino': tactile_dino,
         'neoforce': tactile_neoforce,
     }, paired
-
 
 @torch.no_grad()
 def encode_dense_semantic(videos, anchors, target_size, encoder):

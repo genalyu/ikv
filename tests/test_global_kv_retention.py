@@ -133,7 +133,7 @@ def tiny_model(global_policy=True):
         patch_size=(1, 2, 2), num_attention_heads=1, attention_head_dim=4,
         in_channels=2, out_channels=2, action_dim=3, text_dim=8, freq_dim=4,
         ffn_dim=8, num_layers=2, rope_max_seq_len=32, attn_mode='torch',
-        use_local_tactile=False, use_rgb_motion_tokens=False).eval()
+        use_local_tactile=False).eval()
     model.create_empty_cache('test', 2, 16, 8, torch.device('cpu'), torch.float32, 1)
     for attention in model.mot.shared_attn:
         attention.attn_caches['test']['k'].zero_()

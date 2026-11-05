@@ -14,8 +14,7 @@ def main():
         patch_size=(1, 2, 2), num_attention_heads=1, attention_head_dim=32,
         in_channels=2, out_channels=2, action_dim=3, text_dim=8, freq_dim=4,
         ffn_dim=32, num_layers=2, rope_max_seq_len=32, attn_mode="torch",
-        use_local_tactile=False, use_rgb_motion_tokens=False
-    ).to(device="cuda", dtype=torch.bfloat16).train()
+        use_local_tactile=False,     ).to(device="cuda", dtype=torch.bfloat16).train()
     packed = deepcopy(model)
     model.mot.gradient_checkpointing = True
     packed.mot.gradient_checkpointing = True

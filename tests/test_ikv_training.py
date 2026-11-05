@@ -110,31 +110,7 @@ def test_query_usage_is_all_layer_and_policy_is_reset_per_sample(monkeypatch):
     assert counts and all(n==model.num_layers for n in counts)
 
 
-def test_motion_support_is_causal_and_keeps_observed_branch():
-    from n0_twam.models.motion_training import prepare_causal_motion
-    indices=torch.tensor([[[0,1],[1,2],[2,3],[3,0]]])
-    grid=torch.zeros(1,4,16)
-    grid[:,0]=torch.arange(4).repeat_interleave(4)
-    original=dict(rgb_motion_patch_indices=indices,
-                  rgb_motion_valid_mask=torch.ones_like(indices,dtype=torch.bool),grid_id=grid)
-    changed=deepcopy(original);changed["rgb_motion_patch_indices"][:,2:]=0
-    prepare_causal_motion(original,2);prepare_causal_motion(changed,2)
-    assert (original["rgb_motion_patch_indices"][:,:2]==-1).all()
-    assert original["rgb_motion_patch_indices"][0,2:].tolist()==[[1,2],[1,2]]
-    assert torch.equal(original["condition_motion"]["rgb_motion_patch_indices"],indices)
-    assert torch.equal(original["rgb_motion_patch_indices"],changed["rgb_motion_patch_indices"])
 
-def test_motion_accepts_canonical_loader_indices():
-    from n0_twam.models.motion_training import prepare_causal_motion
-    indices = torch.tensor([[[0, 1], [1, 2], [2, 3]]])
-    grid = torch.arange(3).repeat_interleave(4)[None]
-    latent = dict(motion_indices=indices,
-                  motion_valid_mask=torch.ones_like(indices, dtype=torch.bool),
-                  grid_id=grid)
-    prepare_causal_motion(latent, 1)
-    assert torch.equal(latent["condition_motion"]["rgb_motion_patch_indices"], indices)
-    assert latent["rgb_motion_patch_indices"][0].tolist() == [[-1, -1], [0, 1], [1, 2]]
-    assert latent["rgb_motion_valid_mask"].shape == indices.shape
 
 
 def test_sparse_noisy_and_clean_validity_are_independent():
@@ -164,9 +140,8 @@ def test_same_phase_clean_features_do_not_select_noisy_history():
     torch.testing.assert_close(a[:,target_noisy],b[:,target_noisy],rtol=1e-5,atol=2e-6)
 
 
-def training_input(device="cpu",motion=False):
+def training_input(device="cpu"):
     from n0_twam.utils.utils import get_mesh_id
-    from n0_twam.models.motion_training import prepare_causal_motion
     torch.manual_seed(45)
     def stream(c,h,w,action=False):
         x=torch.randn(1,c,3,h,w,device=device,dtype=torch.bfloat16)
@@ -183,15 +158,11 @@ def training_input(device="cpu",motion=False):
     a["tactile_sensor_ids"]=torch.zeros(1,1,dtype=torch.long,device=device)
     a["tactile_global_timesteps"]=a["timesteps"]
     a["tactile_global_cond_timesteps"]=a["cond_timesteps"]
-    if motion:
-        v["rgb_motion_patch_indices"]=torch.tensor([[[0,-1],[1,2],[0,3]]],device=device)
-        v["rgb_motion_valid_mask"]=v["rgb_motion_patch_indices"]>=0
-        prepare_causal_motion(v,1)
     return dict(latent_dict=v,action_dict=a,chunk_size=1,window_size=100)
 
 def original_loss():
     from types import SimpleNamespace
-    from test_rgb_motion_model_integration import _load_trainer_class
+    from trainer_test_helpers import _load_trainer_class
     from n0_twam.utils.scheduler import FlowMatchScheduler
     cls=_load_trainer_class()
     trainer=cls.__new__(cls)
@@ -204,8 +175,8 @@ def original_loss():
         s.set_timesteps(1000,training=True)
     return trainer
 
-@pytest.mark.parametrize("motion,ikv",[(False,False),(True,False),(False,True),(True,True)])
-def test_full_original_train_and_loss_all_modes(monkeypatch,motion,ikv):
+@pytest.mark.parametrize("ikv", [False, True])
+def test_full_original_train_and_loss_baseline_and_ikv(monkeypatch,ikv):
     from types import SimpleNamespace
     from n0_twam.models.model import custom_sdpa
     # Use original mask_mod in an eager backend; no Flex compilation needed for
@@ -221,10 +192,9 @@ def test_full_original_train_and_loss_all_modes(monkeypatch,motion,ikv):
     monkeypatch.setattr(FlexAttnFunc,"compiled_create_block_mask",staticmethod(make))
     monkeypatch.setattr(FlexAttnFunc,"forward",attention)
     model=tiny_model(False).to(torch.bfloat16).train()
-    model.use_rgb_motion_tokens=motion;model.rgb_motion_require_index=False
     model.mot.gradient_checkpointing=True
-    data=training_input(motion=motion)
-    if ikv:data["ikv_training"]=dict(capacity=12,retention=dict(top_k=2))
+    data=training_input()
+    if ikv:data["ikv_training"]=dict(capacity=16,retention=dict(version=2,top_k=2,video_capacity=8,action_capacity=4,tactile_capacity=4,persistence_weight=0.,class_recency_weight=0.))
     outputs=model(data,train_mode=True)
     losses=original_loss().compute_loss(data,outputs)
     losses["total_loss"].backward()
@@ -234,29 +204,6 @@ def test_full_original_train_and_loss_all_modes(monkeypatch,motion,ikv):
     assert sum(float(g.abs().sum()) for g in gradients)>0
 
 
-def test_semantic_motion_joint_training_and_tactile_only_support():
-    model=tiny_model(False).to(torch.bfloat16).train()
-    model.use_rgb_motion_tokens=True
-    model.rgb_motion_require_index=True
-    data=training_input(motion=True)
-    latent=data['latent_dict']
-    latent.update(latent.pop('condition_motion'))
-    idx=latent['rgb_motion_patch_indices'];valid=idx>=0
-    visual=valid.clone();visual[:,1,0]=False
-    latent.update(world_time_id=torch.arange(3)[None,:,None].expand_as(idx).clone(),
-                  dino_features=torch.randn(*idx.shape,2),
-                  neoforce_features=torch.randn(*idx.shape,2),
-                  observation_flag=valid.long(),visual_valid=visual,
-                  tactile_valid=valid & ~visual)
-    from n0_twam.models.motion_training import prepare_causal_motion
-    prepare_causal_motion(latent,1)
-    assert not latent['rgb_motion_valid_mask'][0,2,0]
-    assert latent['condition_motion']['rgb_motion_valid_mask'][0,1,0]
-    data['ikv_training']=dict(capacity=12,retention=dict(top_k=2))
-    output=model(data,train_mode=True)
-    loss=original_loss().compute_loss(data,output)['total_loss']
-    loss.backward()
-    assert torch.isfinite(loss)
 
 
 def test_condition_mask_uses_own_frame_addresses():
@@ -266,33 +213,6 @@ def test_condition_mask_uses_own_frame_addresses():
     assert layout['phase'][:8].tolist()==[0,0,2,2,2,2,4,4]
 
 
-@torch.no_grad()
-def test_sparse_global_serving_compacts_padding_and_uses_selected_features():
-    from test_global_kv_retention import model_input,cache_snapshot,assert_cache_equal
-    model=tiny_model(False)
-    model.use_rgb_motion_tokens=True
-    model.rgb_motion_require_index=True
-    model.configure_global_retention('test',top_k=3)
-    for time in range(5):
-        data=model_input(time)
-        data.update(rgb_motion_patch_indices=torch.tensor([[[1,-1,3]]]),
-                    rgb_motion_valid_mask=torch.tensor([[[True,False,True]]]),
-                    world_time_id=torch.full((1,1,3),time),
-                    dino_features=torch.tensor([[[[1.,2.],[999.,999.],[3.,4.]]]]),
-                    neoforce_features=torch.empty(1,1,3,0),
-                    observation_flag=torch.ones(1,1,3,dtype=torch.long),
-                    visual_valid=torch.tensor([[[True,False,True]]]),
-                    tactile_valid=torch.zeros(1,1,3,dtype=torch.bool))
-        output=model(data,update_cache=2,cache_name='test')
-        assert all(torch.isfinite(x).all() for x in output)
-    state=model.get_global_retention('test')
-    assert len(state['token_uid'])==24
-    assert state['t0']==4
-    assert not (state['dino']==999).any()
-    assert ((state['dino']==torch.tensor([1.,2.])).all(-1)).any()
-    before=cache_snapshot(model)
-    model(data,update_cache=0,cache_name='test')
-    assert_cache_equal(before,cache_snapshot(model))
 
 
 def test_dense_sidecar_alignment_and_temporal_crop(tmp_path):
@@ -321,20 +241,6 @@ def test_dense_sidecar_alignment_and_temporal_crop(tmp_path):
     with pytest.raises(ValueError,match='finite'):
         load_dense_index(path,**args)
 
-@pytest.mark.parametrize('chunk_size',[2,4])
-def test_motion_cold_chunk_has_finite_original_loss(chunk_size):
-    from n0_twam.models.motion_training import prepare_causal_motion
-    model=tiny_model(False).to(torch.bfloat16).train()
-    model.use_rgb_motion_tokens=True;model.rgb_motion_require_index=False
-    data=training_input(motion=True)
-    latent=data['latent_dict'];latent.update(latent.pop('condition_motion'))
-    prepare_causal_motion(latent,chunk_size)
-    data['chunk_size']=chunk_size
-    data['ikv_training']=dict(capacity=32)
-    output=model(data,train_mode=True)
-    loss=original_loss().compute_loss(data,output)['total_loss']
-    loss.backward()
-    assert torch.isfinite(loss)
 
 
 @pytest.mark.parametrize('override,match',[
@@ -344,15 +250,15 @@ def test_motion_cold_chunk_has_finite_original_loss(chunk_size):
 ])
 def test_training_config_rejects_unusable_ikv(override,match):
     from types import SimpleNamespace
-    from test_rgb_motion_model_integration import Trainer
+    from trainer_test_helpers import Trainer
     config=dict(use_mot=True,use_ikv_training=True,ikv_train_capacity=32)
     config.update(override)
     with pytest.raises(ValueError,match=match):
-        Trainer._validate_rgb_motion_training_config(SimpleNamespace(**config))
+        Trainer._validate_training_config(SimpleNamespace(**config))
 
 
 def test_serve_rejects_ikv_checkpoint_capacity_and_policy_mismatch(tmp_path):
-    from test_rgb_motion_server_helpers import _consistency_server
+    from server_test_helpers import _consistency_server
     metadata=dict(use_ikv_training=True,ikv_train_capacity=32,kv_retention={'top_k':2})
     server=_consistency_server(tmp_path,enabled=False,live_cameras=['top'],metadata=metadata)
     config=server.job_config

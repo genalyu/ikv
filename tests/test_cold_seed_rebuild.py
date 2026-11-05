@@ -3,7 +3,7 @@ import pytest
 import torch
 from test_global_kv_retention import (tiny_model, model_input, cache_snapshot,
     assert_cache_equal, assert_snapshot_equal)
-from test_rgb_motion_server_helpers import _kv_lifecycle_server
+from server_test_helpers import _kv_lifecycle_server
 from test_contact_pair_server import inputs
 
 @pytest.mark.parametrize("global_policy",[False,True])

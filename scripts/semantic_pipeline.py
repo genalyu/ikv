@@ -5,11 +5,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contextlib import contextmanager
 import os
-
 import torch
 import torch.distributed as dist
 from torch import nn
-
 from n0_twam import n0_twam_server as server
 from models.mot import MoTBackbone, WanMoTTransformer3DModel, SharedSelfAttention
 try:
@@ -17,24 +15,17 @@ try:
 except ImportError:
     RetentionConfig = GlobalKVRetention = None
 import models.utils as model_utils
-
-# Rank 0 currently uses NumPy 2 while rank 1 uses NumPy 1. Install aliases
-# only after the scientific/model stack is fully imported; doing it earlier
-# interferes with binary-extension feature detection in SciPy/diffusers.
 import sys
 import numpy as np
 try:
     import numpy.core as _numpy_core
     import numpy.core.multiarray as _numpy_multiarray
-    sys.modules.setdefault("numpy._core", _numpy_core)
-    sys.modules.setdefault("numpy._core.multiarray", _numpy_multiarray)
+    sys.modules.setdefault('numpy._core', _numpy_core)
+    sys.modules.setdefault('numpy._core.multiarray', _numpy_multiarray)
 except ImportError:
     pass
-
-
-SPLIT_LAYER = int(os.environ.get("TWAM_PP_SPLIT", "15"))
+SPLIT_LAYER = int(os.environ.get('TWAM_PP_SPLIT', '15'))
 CONTROL_GROUP = None
-
 
 def _cpu_tree(value):
     if isinstance(value, torch.Tensor):
@@ -46,7 +37,6 @@ def _cpu_tree(value):
         return type(value)(items)
     return value
 
-
 def _gpu_tree(value):
     if isinstance(value, torch.Tensor):
         return value.to("cuda:0")
@@ -57,18 +47,15 @@ def _gpu_tree(value):
         return type(value)(items)
     return value
 
-
 def _remote(op, *args, **kwargs):
     if dist.get_rank() == 0:
         dist.broadcast_object_list([{"op": op, "args": _cpu_tree(args),
                                      "kwargs": _cpu_tree(kwargs)}], src=0,
                                    group=CONTROL_GROUP, device=torch.device("cpu"))
 
-
 def _owned_range(backbone):
     rank = dist.get_rank()
     return range(0, SPLIT_LAYER) if rank == 0 else range(SPLIT_LAYER, backbone.num_layers)
-
 
 @torch.no_grad()
 def _sync_retention_usage(policy, measurements):
@@ -90,7 +77,6 @@ def _sync_retention_usage(policy, measurements):
         policy.data["query_mass"].add_(totals[:capacity] / totals[-1])
         policy.data["query_exposure"].add_(totals[capacity:2 * capacity] / totals[-1])
 
-
 def pp_set_masks(self, self_block_mask=None, dense_self_mask=None, cross_masks=None):
     if dist.get_rank() == 0:
         _remote("masks", self_block_mask, dense_self_mask, cross_masks)
@@ -101,7 +87,6 @@ def pp_set_masks(self, self_block_mask=None, dense_self_mask=None, cross_masks=N
             self.shared_attn[layer].set_dense_mask(None)
             self.shared_attn[layer].set_block_mask(self_block_mask)
     self._cross_masks = dict(cross_masks or {})
-
 
 def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
                rotary_emb, slices, collect_cache=False, update_cache=0,
@@ -299,7 +284,6 @@ def pp_forward(self, hidden_states, encoder_hidden_states, timestep_proj, temb,
     return torch.cat([self.experts[name].embed_out(streams[name])
                       for name, _s, _e in slices], dim=1)
 
-
 def pp_share_semantic_sidecar(self, cache_name):
     owned = list(_owned_range(self))
     first = self.shared_attn[owned[0]].attn_caches.get(cache_name)
@@ -308,12 +292,9 @@ def pp_share_semantic_sidecar(self, cache_name):
             cache = self.shared_attn[layer].attn_caches.get(cache_name)
             if cache is not None:
                 cache['semantic'] = first.get('semantic')
-
-
 MoTBackbone._share_semantic_sidecar = pp_share_semantic_sidecar
 MoTBackbone.set_masks = pp_set_masks
 MoTBackbone.forward = pp_forward
-
 
 def pp_clear_cache(self, cache_name):
     if dist.get_rank() == 0:
@@ -327,7 +308,6 @@ def pp_clear_cache(self, cache_name):
     torch.cuda.empty_cache()  # Return inactive allocator blocks before NeoSim resets.
     print(f"[pp_reset] rank={dist.get_rank()} released_mib="
           f"{(reserved_before - torch.cuda.memory_reserved()) // 1048576}", flush=True)
-
 
 def pp_clear_pred_cache(self, cache_name, *, include_observed=False):
     if dist.get_rank() == 0:
@@ -348,7 +328,6 @@ def pp_clear_pred_cache(self, cache_name, *, include_observed=False):
     for layer in owned:
         self.mot.shared_attn[layer].clear_pred_cache(cache_name, include_observed=include_observed)
 
-
 def pp_create_empty_cache(self, cache_name, attn_window,
                           latent_token_per_chunk, action_token_per_chunk,
                           device, dtype, batch_size):
@@ -365,16 +344,10 @@ def pp_create_empty_cache(self, cache_name, attn_window,
     old_policy = self.mot.retention_policies.pop(cache_name, None)
     if getattr(old_policy, "archive", None) is not None:
         old_policy.archive.close()
-
-
 WanMoTTransformer3DModel.clear_cache = pp_clear_cache
 WanMoTTransformer3DModel.clear_pred_cache = pp_clear_pred_cache
 WanMoTTransformer3DModel.create_empty_cache = pp_create_empty_cache
-
-
-# Grounding/inference transactions must bracket BOTH pipeline stages.
 _original_cache_transaction = getattr(WanMoTTransformer3DModel, 'cache_transaction', None)
-
 
 @contextmanager
 def pp_cache_transaction(self, cache_name):
@@ -387,34 +360,26 @@ def pp_cache_transaction(self, cache_name):
         raise
     else:
         _remote('commit_transaction')
-
-
 if _original_cache_transaction is not None:
     WanMoTTransformer3DModel.cache_transaction = pp_cache_transaction
 
-
 def pp_configure_global_retention(self, cache_name, **config):
     if dist.get_rank() == 0:
-        _remote("configure_retention", cache_name, **config)
-    if self.use_rgb_motion_tokens and config.get("version", 1) != 2:
-        raise ValueError("sparse global retention requires version 2")
+        _remote('configure_retention', cache_name, **config)
     owned = list(_owned_range(self.mot))
     caches = [self.mot.shared_attn[i].attn_caches[cache_name] for i in owned]
-    if not caches or any(c["mask"].any() for c in caches):
-        raise ValueError("configure retention on a new, empty local-stage KV cache")
+    if not caches or any((c['mask'].any() for c in caches)):
+        raise ValueError('configure retention on a new, empty local-stage KV cache')
     cfg = RetentionConfig(**config)
     from n0_twam.models.multimodal_kv_retention import make_retention_policy
-    self.mot.retention_policies[cache_name] = make_retention_policy(
-        caches[0]["mask"].numel(), caches[0]["mask"].device, cfg)
+    self.mot.retention_policies[cache_name] = make_retention_policy(caches[0]['mask'].numel(), caches[0]['mask'].device, cfg)
     for cache in caches:
-        cache["cpu_archive"] = cfg.history_storage == "cpu_archive"
-        cache["action_fifo_capacity"] = cfg.action_capacity
-
+        cache['cpu_archive'] = cfg.history_storage == 'cpu_archive'
+        cache['action_fifo_capacity'] = cfg.action_capacity
 
 def _pp_retention_mask(self, cache_name):
     layer = next(iter(_owned_range(self.mot)))
     return self.mot.shared_attn[layer].attn_caches[cache_name]["mask"]
-
 
 def pp_get_global_retention(self, cache_name):
     policy = self.mot.retention_policies.get(cache_name)
@@ -428,13 +393,11 @@ def pp_get_global_retention(self, cache_name):
             "components": {k: v.detach().clone()
                            for k, v in policy.components(slots).items()}}
 
-
 def pp_video_index_handle(self, cache_name, since_uid):
     if dist.get_rank() == 0:
         _remote("video_handle", cache_name, since_uid)
     policy = self.mot.retention_policies[cache_name]
     return policy.video_handle(_pp_retention_mask(self, cache_name), since_uid)
-
 
 def pp_annotate_video_dino(self, cache_name, handle, features):
     if dist.get_rank() == 0:
@@ -448,23 +411,16 @@ def pp_annotate_video_dino(self, cache_name, handle, features):
         if not mask[handle["slots"]].all():
             raise ValueError("video index handle addresses removed local-stage KV")
     return policy.annotate_video_dino(mask, handle, features)
-
-
 WanMoTTransformer3DModel.configure_global_retention = pp_configure_global_retention
 WanMoTTransformer3DModel.get_global_retention = pp_get_global_retention
 WanMoTTransformer3DModel.video_index_handle = pp_video_index_handle
 WanMoTTransformer3DModel.annotate_video_dino = pp_annotate_video_dino
-
 _load_mot = model_utils.load_mot_checkpoint
-
 
 def load_mot_cpu(*args, **kwargs):
     kwargs["torch_device"] = "cpu"
     return _load_mot(*args, **kwargs)
-
-
 model_utils.load_mot_checkpoint = load_mot_cpu
-
 
 def pipeline_place(model):
     global CONTROL_GROUP
@@ -484,12 +440,8 @@ def pipeline_place(model):
             model.mot.shared_attn[layer] = nn.Identity()
     model.eval().requires_grad_(False)
     return model.to(device=torch.device("cuda:0"), dtype=torch.bfloat16)
-
-
 server.shard_model = pipeline_place
-
 from utils import server_utils as _server_utils
-
 
 class _PipelinePolicy:
     def __init__(self, model):
@@ -497,7 +449,6 @@ class _PipelinePolicy:
 
     def infer(self, obs):
         return self.model.infer(obs)
-
 
 def _pipeline_worker(model):
     transformer = model.transformer
@@ -546,7 +497,6 @@ def _pipeline_worker(model):
         else:
             raise RuntimeError(f"unknown pipeline command: {op}")
 
-
 def _pipeline_serve(model, local_rank, host, port):
     if dist.get_rank() == 0:
         policy = _PipelinePolicy(model)
@@ -554,14 +504,10 @@ def _pipeline_serve(model, local_rank, host, port):
         _remote("stop")
     else:
         _pipeline_worker(model)
-
-
 server.run_async_server_mode = _pipeline_serve
-
 _server_init = server.TWAM_Server.__init__
 _encode_prompt = server.TWAM_Server.encode_prompt
 _prompt_cache = {}
-
 
 def cached_encode_prompt(self, *args, **kwargs):
     prompt = kwargs.get("prompt", args[0] if args else None)
@@ -573,19 +519,13 @@ def cached_encode_prompt(self, *args, **kwargs):
     if key not in _prompt_cache:
         _prompt_cache[key] = _encode_prompt(self, *args, **kwargs)
     return _prompt_cache[key]
-
-
 server.TWAM_Server.encode_prompt = cached_encode_prompt
-
 
 def init_with_gpu_vae(self, cfg):
     _server_init(self, cfg)
     if dist.get_rank() == 0:
         self.vae.to(device=self.device, dtype=self.dtype)
-
-
 server.TWAM_Server.__init__ = init_with_gpu_vae
-
 
 def main():
     import json
@@ -607,7 +547,5 @@ def main():
         port=int(os.environ.get("TWAM_WS_PORT", "29960")),
         save_root=os.environ["TWAM_SERVE_OUT"],
     ))
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

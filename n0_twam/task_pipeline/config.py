@@ -1,34 +1,12 @@
 """Task overlays; optimizer/model defaults stay in the official posttrain config."""
-
 from copy import deepcopy
 import hashlib
 import json
 import os
 from pathlib import Path
-
-OFFICIAL_REVISION = "cdd87b6a141667123ad2c25f452478afdb71e287"
-MODES = {
-    "baseline": (False, False),
-    "motion": (True, False),
-    "ikv": (False, True),
-    "motion_ikv": (True, True),
-}
-RECIPE = dict(
-    batch_size=1,
-    num_steps=2000,
-    save_interval=500,
-    gc_interval=50,
-    learning_rate=1e-4,
-    lr_schedule="cosine",
-    lr_min_ratio=0.1,
-    warmup_steps=20,
-    weight_decay=0.1,
-    max_latent_frames=0,
-    max_tactile_frames=0,
-    load_worker=4,
-    num_init_worker=1,
-)
-
+OFFICIAL_REVISION = 'cdd87b6a141667123ad2c25f452478afdb71e287'
+MODES = {'baseline': False, 'ikv': True}
+RECIPE = dict(batch_size=1, num_steps=2000, save_interval=500, gc_interval=50, learning_rate=0.0001, lr_schedule='cosine', lr_min_ratio=0.1, warmup_steps=20, weight_decay=0.1, max_latent_frames=0, max_tactile_frames=0, load_worker=4, num_init_worker=1)
 
 def fingerprint(value):
     # A byte-identical frozen model may move without invalidating derived features
@@ -52,7 +30,6 @@ def fingerprint(value):
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, default=str).encode()
     ).hexdigest()
-
 
 def load_task(path):
     path = Path(path).resolve()
@@ -130,7 +107,6 @@ def load_task(path):
         raise ValueError("Camera destination keys must be unique")
     return task
 
-
 def paths(task):
     root = Path(task["runtime"]["work_root"]) / task["name"]
     return dict(
@@ -141,155 +117,121 @@ def paths(task):
         runs=root / "runs",
     )
 
-
 def accumulation(world_size):
     if world_size not in (1, 2, 4, 8):
         raise ValueError("Supported GPU/process counts: 1, 2, 4, 8")
     return 32 // world_size
 
-
 def training_config(task, mode, world_size, *, require_ready=True):
     from n0_twam.configs.twam_posttrain_cfg import twam_posttrain_cfg
-
-    if task.get("prepared_tasks"):
-        children = [load_task(path) for path in task["prepared_tasks"]]
+    if mode not in MODES:
+        raise ValueError('Supported training modes are baseline and ikv')
+    if task.get('prepared_tasks'):
+        children = [load_task(path) for path in task['prepared_tasks']]
         configs = [training_config(child, mode, world_size, require_ready=require_ready) for child in children]
         cfg = deepcopy(configs[0])
         p = paths(task)
-        cfg.dataset_path = str(p["pool"] / "train")
-        cfg.val_dataset_path = str(p["pool"] / "val")
-        if not task.get("validation", {}).get("enabled", False):
+        cfg.dataset_path = str(p['pool'] / 'train')
+        cfg.val_dataset_path = str(p['pool'] / 'val')
+        if not task.get('validation', {}).get('enabled', False):
             cfg.val_dataset_path = None
-        cfg.val_interval = int(task.get("validation", {}).get("interval", 1000000000))
-        cfg.save_root = str(p["runs"] / mode)
-        cfg.per_repo_norm_stat = {child["name"]: item.norm_stat for child, item in zip(children, configs)}
-        cfg.per_repo_semantic_provenance = {child["name"]: item.kv_semantic_provenance for child, item in zip(children, configs)}
-        cfg.per_repo_obs_cam_keys = {child["name"]: item.obs_cam_keys for child, item in zip(children, configs)}
-        cfg.per_repo_tactile_keys = {child["name"]: item.tactile_keys for child, item in zip(children, configs)}
-        cfg.per_repo_used_action_channel_ids = {child["name"]: item.used_action_channel_ids for child, item in zip(children, configs)}
+        cfg.val_interval = int(task.get('validation', {}).get('interval', 1000000000))
+        cfg.save_root = str(p['runs'] / mode)
+        cfg.per_repo_norm_stat = {child['name']: item.norm_stat for child, item in zip(children, configs)}
+        cfg.per_repo_semantic_provenance = {child['name']: item.kv_semantic_provenance for child, item in zip(children, configs)}
+        cfg.per_repo_obs_cam_keys = {child['name']: item.obs_cam_keys for child, item in zip(children, configs)}
+        cfg.per_repo_tactile_keys = {child['name']: item.tactile_keys for child, item in zip(children, configs)}
+        cfg.per_repo_used_action_channel_ids = {child['name']: item.used_action_channel_ids for child, item in zip(children, configs)}
         cfg.expected_dataset_count = len(children)
         cfg.task_fingerprint = fingerprint(task)
-        cfg.update(task.get("training", {}))
+        cfg.update(task.get('training', {}))
         return cfg
     cfg = deepcopy(twam_posttrain_cfg)
     cfg.update(RECIPE)
     cfg.gradient_accumulation_steps = accumulation(world_size)
-    motion, ikv = MODES[mode]
+    ikv = MODES[mode]
     p = paths(task)
-    runtime, robot = task["runtime"], task["robot"]
-    cfg.dataset_path = str(p["pool"] / "train")
-    cfg.val_dataset_path = str(p["pool"] / "val")
+    runtime, robot = (task['runtime'], task['robot'])
+    cfg.dataset_path = str(p['pool'] / 'train')
+    cfg.val_dataset_path = str(p['pool'] / 'val')
     cfg.val_interval = 9999
-    cfg.obs_cam_keys = list(robot["cameras"].values())
-    cfg.tactile_keys = list(robot["tactile"].values())
-    if task.get("rgb_only", False):
+    cfg.obs_cam_keys = list(robot['cameras'].values())
+    cfg.tactile_keys = list(robot['tactile'].values())
+    if task.get('rgb_only', False):
         if cfg.tactile_keys:
-            raise ValueError("rgb_only requires empty tactile mapping")
+            raise ValueError('rgb_only requires empty tactile mapping')
         cfg.use_local_tactile = False
         cfg.tactile_optional = True
         cfg.tactile_global_zero = True
     cfg.tactile_sensor_id_map = {k: i for i, k in enumerate(cfg.tactile_keys)}
-    cfg.used_action_channel_ids = list(range(10 * robot.get("arms", 1)))
+    cfg.used_action_channel_ids = list(range(10 * robot.get('arms', 1)))
     cfg.inverse_used_action_channel_ids = [len(cfg.used_action_channel_ids)] * 20
     for i in cfg.used_action_channel_ids:
         cfg.inverse_used_action_channel_ids[i] = i
-    cfg.use_rgb_motion_tokens, cfg.use_ikv_training = motion, ikv
-    cfg.kv_cache_policy = "global" if ikv else "fifo"
-    cfg.ikv_train_capacity = int(task.get("features", {}).get("ikv_capacity", 4096))
-    # Sparse mask granularity is independent of the attention matmul tile sizes.
-    cfg.ikv_train_block_size = int(task.get("features", {}).get("ikv_block_size", 64))
-    # Runtime override permits switching kernels without invalidating prepared
-    # task-data fingerprints, which include every field in the task JSON.
-    cfg.ikv_train_compact_attention = bool(ikv and (
-        task.get("features", {}).get("ikv_compact_attention", False)
-        or os.environ.get("IKV_COMPACT_ATTENTION") == "1"))
-    cfg.ikv_train_compact_max_packed_keys = int(os.environ.get(
-        "IKV_COMPACT_MAX_PACKED_KEYS",
-        task.get("features", {}).get("ikv_compact_max_packed_keys", 65536)))
+    cfg.use_ikv_training = ikv
+    cfg.kv_cache_policy = 'global' if ikv else 'fifo'
+    cfg.ikv_train_capacity = int(task.get('features', {}).get('ikv_capacity', 4096))
+    cfg.ikv_train_block_size = int(task.get('features', {}).get('ikv_block_size', 64))
+    cfg.ikv_train_compact_attention = bool(ikv and (task.get('features', {}).get('ikv_compact_attention', False) or os.environ.get('IKV_COMPACT_ATTENTION') == '1'))
+    cfg.ikv_train_compact_max_packed_keys = int(os.environ.get('IKV_COMPACT_MAX_PACKED_KEYS', task.get('features', {}).get('ikv_compact_max_packed_keys', 65536)))
     if cfg.ikv_train_compact_max_packed_keys < 1:
-        raise ValueError("ikv_compact_max_packed_keys must be positive")
+        raise ValueError('ikv_compact_max_packed_keys must be positive')
     if cfg.ikv_train_block_size not in (64, 128):
-        raise ValueError("ikv_block_size must be 64 or 128 for the current attention kernels")
-    cfg.ikv_train_execution = (task.get("features", {}).get("ikv_training_execution", "masked")
-                               if ikv else "recurrent")
-    cfg.ikv_train_sample_capacity = bool(ikv and cfg.ikv_train_execution == "masked"
-        and task.get("features", {}).get("ikv_sample_capacity", True))
-    cfg.ikv_train_min_capacity = (int(task.get("features", {}).get("ikv_min_capacity",
-                                           (cfg.ikv_train_capacity + 1) // 2)) if ikv else 0)
+        raise ValueError('ikv_block_size must be 64 or 128 for the current attention kernels')
+    cfg.ikv_train_execution = task.get('features', {}).get('ikv_training_execution', 'masked') if ikv else 'recurrent'
+    cfg.ikv_train_sample_capacity = bool(ikv and cfg.ikv_train_execution == 'masked' and task.get('features', {}).get('ikv_sample_capacity', True))
+    cfg.ikv_train_min_capacity = int(task.get('features', {}).get('ikv_min_capacity', (cfg.ikv_train_capacity + 1) // 2)) if ikv else 0
     if ikv:
         cfg.kv_retention = dict(cfg.kv_retention)
-        cfg.kv_retention.update(query_weight=0.0, action_query_weight=0.0,
-                                tactile_query_weight=0.0)
-        for field in ("history_storage", "archive_max_bytes", "archive_overflow", "archive_directory", "score_backend", "sys2_endpoint", "sys2_task", "sys2_timeout", "ikv_interval_frames", "formula_variant", "random_weight"):
-            if field in task.get("features", {}):
-                cfg.kv_retention[field] = task["features"][field]
-    cfg.ikv_index_root_name = "ikv_index" if ikv else None
-    cfg.rgb_motion_root_name = "rgb_motion"
-    cfg.rgb_motion_input_mode = "rgb"
-    cfg.rgb_motion_max_tokens = (
-        cfg.height
-        // (16 * cfg.patch_size[1])
-        * cfg.width
-        // (16 * cfg.patch_size[2])
-        * len(cfg.obs_cam_keys)
-    )
-    cfg.kv_semantic_encoder = dict(runtime.get("semantic_encoder", {}) or {})
-    semantic_enabled = cfg.kv_semantic_encoder.get("backend", "dinov3") != "dinov3"
+        cfg.kv_retention.update(query_weight=0.0, action_query_weight=0.0, tactile_query_weight=0.0)
+        for field in ('history_storage', 'archive_max_bytes', 'archive_overflow', 'archive_directory', 'score_backend', 'sys2_endpoint', 'sys2_task', 'sys2_timeout', 'ikv_interval_frames', 'formula_variant', 'random_weight'):
+            if field in task.get('features', {}):
+                cfg.kv_retention[field] = task['features'][field]
+    cfg.ikv_index_root_name = 'ikv_index' if ikv else None
+    cfg.kv_semantic_encoder = dict(runtime.get('semantic_encoder', {}) or {})
+    semantic_enabled = cfg.kv_semantic_encoder.get('backend', 'dinov3') != 'dinov3'
     if semantic_enabled and ikv:
-        if cfg.kv_retention.get("version", 2) != 2:
-            raise ValueError("semantic patch scoring requires IKV retention version 2")
-        cfg.kv_retention["task_weight"] = float(task.get("features", {}).get("task_weight", 1.))
-        cfg.kv_retention["content_threshold"] = float(task.get("features", {}).get("content_threshold", .9))
-        manifest_path = paths(task)["dataset"] / "features.json"
+        if cfg.kv_retention.get('version', 2) != 2:
+            raise ValueError('semantic patch scoring requires IKV retention version 2')
+        cfg.kv_retention['task_weight'] = float(task.get('features', {}).get('task_weight', 1.0))
+        cfg.kv_retention['content_threshold'] = float(task.get('features', {}).get('content_threshold', 0.9))
+        manifest_path = paths(task)['dataset'] / 'features.json'
         if not manifest_path.is_file():
-            raise FileNotFoundError("Build semantic features before training")
+            raise FileNotFoundError('Build semantic features before training')
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("task_fingerprint") != fingerprint(task):
-            raise ValueError("Semantic feature manifest differs from task configuration")
-        cfg.kv_semantic_provenance = manifest.get("semantic_provenance")
+        if manifest.get('task_fingerprint') != fingerprint(task):
+            raise ValueError('Semantic feature manifest differs from task configuration')
+        cfg.kv_semantic_provenance = manifest.get('semantic_provenance')
         if not cfg.kv_semantic_provenance:
-            raise ValueError("Feature manifest lacks semantic provenance")
+            raise ValueError('Feature manifest lacks semantic provenance')
         from n0_twam.preprocessing.semantic_patch import _identity
-        if cfg.kv_semantic_provenance.get("assets") != _identity(cfg.kv_semantic_encoder):
-            raise ValueError("Semantic model assets changed since feature build; regenerate features")
-    cfg.rgb_motion_dino_model_name_or_path = runtime.get("dino_model", "")
-    cfg.rgb_motion_rgb_threshold = float(
-        task.get("features", {}).get("motion_threshold", 0.02)
-    )
-    cfg.wan22_pretrained_model_name_or_path = runtime.get(
-        "model_path", runtime["base_checkpoint"]
-    )
-    cfg.empty_emb_path = str(
-        Path(cfg.wan22_pretrained_model_name_or_path) / "empty_emb.pt"
-    )
-    cfg.resume_from = runtime["base_checkpoint"]
-    cfg.save_root = str(p["runs"] / mode)
-    cfg.eval_prompt = task["prompt"]
-    cfg.seed = int(task.get("seed", 42))
-    cfg.norm_stat_path = str(p["pool"] / "norm_stat_absee.json")
+        if cfg.kv_semantic_provenance.get('assets') != _identity(cfg.kv_semantic_encoder):
+            raise ValueError('Semantic model assets changed since feature build; regenerate features')
+    cfg.wan22_pretrained_model_name_or_path = runtime.get('model_path', runtime['base_checkpoint'])
+    cfg.empty_emb_path = str(Path(cfg.wan22_pretrained_model_name_or_path) / 'empty_emb.pt')
+    cfg.resume_from = runtime['base_checkpoint']
+    cfg.save_root = str(p['runs'] / mode)
+    cfg.eval_prompt = task['prompt']
+    cfg.seed = int(task.get('seed', 42))
+    cfg.norm_stat_path = str(p['pool'] / 'norm_stat_absee.json')
     norm = Path(cfg.norm_stat_path)
-    if require_ready and not norm.is_file():
-        raise FileNotFoundError(f"Run prepare --stage pool first: {norm}")
+    if require_ready and (not norm.is_file()):
+        raise FileNotFoundError(f'Run prepare --stage pool first: {norm}')
     if norm.exists():
         cfg.norm_stat = json.loads(norm.read_text())
     cfg.per_repo_norm_stat = {}
     cfg.task_fingerprint = fingerprint(task)
     cfg.task_mode = mode
-    cfg.enable_wandb = bool(task.get("monitoring", {}).get("wandb", False))
+    cfg.enable_wandb = bool(task.get('monitoring', {}).get('wandb', False))
     cfg.official_revision = OFFICIAL_REVISION
-    allowed = {"num_steps", "save_interval", "learning_rate", "warmup_steps", "gradient_accumulation_steps", "max_latent_frames", "load_worker"}
-    overrides = task.get("training", {})
+    allowed = {'num_steps', 'save_interval', 'learning_rate', 'warmup_steps', 'gradient_accumulation_steps', 'max_latent_frames', 'load_worker'}
+    overrides = task.get('training', {})
     if set(overrides) - allowed:
-        raise ValueError("Unsupported training overrides")
+        raise ValueError('Unsupported training overrides')
     cfg.update(overrides)
-    if task.get("rgb_only", False) and ikv:
-        cfg.kv_retention.update(video_capacity=3584, action_capacity=512, tactile_capacity=0,
-            score_backend=task.get("features", {}).get("score_backend", "formula"),
-            persistence_weight=1.0, contact_weight=0.0,
-            class_recency_weight=1.0, time_weight=0.0, visual_weight=0.0,
-            query_weight=0.0, task_weight=1.0 if semantic_enabled else 0.0)
+    if task.get('rgb_only', False) and ikv:
+        cfg.kv_retention.update(video_capacity=3584, action_capacity=512, tactile_capacity=0, score_backend=task.get('features', {}).get('score_backend', 'formula'), persistence_weight=1.0, contact_weight=0.0, class_recency_weight=1.0, time_weight=0.0, visual_weight=0.0, query_weight=0.0, task_weight=1.0 if semantic_enabled else 0.0)
     return cfg
-
 
 def source_inventory(source):
     if isinstance(source, list):
@@ -316,7 +258,6 @@ def source_inventory(source):
             entry["sha256"] = h.hexdigest()
         result.append(entry)
     return result
-
 
 def conversion_identity(task):
     fields = {

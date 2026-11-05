@@ -7,7 +7,7 @@
   temporal indexing and real-observation grounding otherwise equivalent.
 - First grounding must rewrite KV0 with real observations, not preserve its
   imagination-time representation. Do not add task-specific action heuristics.
-- Motion detection remains disabled by default. RGB frame-difference is opt-in.
+- Motion detection and sparse motion-token paths are removed. Support only full-RGB baseline and IKV.
 - A100 is the development checkout; GitHub main is the published source of truth.
   The two 4090 installations are deployments of a recorded core commit plus
   separate pipeline-parallel adapters. Never copy a deployment tree over main.

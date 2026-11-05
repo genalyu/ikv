@@ -11,18 +11,13 @@ for every latent-frame anchor t. The first action frame is reserved as the
 streaming condition slot and masked out, matching n0_twam_server.py's
 action_cond=0 behavior at frame_st_id == 0.
 """
-
 import logging
 from functools import partial
 from multiprocessing import Pool
-
 import numpy as np
 import torch
-
 from .lerobot_latent_dataset import LatentLeRobotDataset, recursive_find_file
 
-
-# ───────── 6D rotation (first two columns of R, Zhou et al.) <-> matrix ─────────
 def sixd_to_R(m6):
     """(...,6)=[col0(3),col1(3)] -> (...,3,3) via Gram-Schmidt (columns)."""
     a1 = m6[..., 0:3]; a2 = m6[..., 3:6]
@@ -32,11 +27,9 @@ def sixd_to_R(m6):
     b3 = np.cross(b1, b2)
     return np.stack([b1, b2, b3], axis=-1)
 
-
 def R_to_sixd(R):
     """(...,3,3) -> (...,6) first two COLUMNS."""
     return np.concatenate([R[..., :, 0], R[..., :, 1]], axis=-1)
-
 
 def ee_arm_groups(action_dim, dims_per_arm=10, rot_offset=3):
     """For a dual/single-arm action laid out [pos3, rot6d, grip1] per 10-dim arm,
@@ -47,7 +40,6 @@ def ee_arm_groups(action_dim, dims_per_arm=10, rot_offset=3):
         if rot[-1] < action_dim:
             groups.append(([a, a + 1, a + 2], rot))
     return groups
-
 
 def construct_lerobot_pi05_delta(repo_id, config):
     # Skip broken/in-flight repos (interrupted conversion, missing parquet)
@@ -76,7 +68,6 @@ def construct_lerobot_pi05_delta(repo_id, config):
                     repo_id, attempts, last_exc)
     return None
 
-
 def construct_lerobot_pi05_delta_multi_processor(config, num_init_worker=8):
     construct_func = partial(
         construct_lerobot_pi05_delta,
@@ -97,7 +88,6 @@ def construct_lerobot_pi05_delta_multi_processor(config, num_init_worker=8):
     if skipped:
         logging.warning("pi05 construct: skipped %d unusable repos", skipped)
     return [d for d in out if d is not None]
-
 
 class MultiLatentLeRobotPi05DeltaDataset(torch.utils.data.Dataset):
     def __init__(
@@ -172,7 +162,6 @@ class MultiLatentLeRobotPi05DeltaDataset(torch.utils.data.Dataset):
                 logging.warning("pi05 getitem idx=%s failed (%s); stepping to neighbour",
                                 idx, last)
         raise last
-
 
 class Pi05DeltaLatentLeRobotDataset(LatentLeRobotDataset):
     """LatentLeRobotDataset with OpenPI/pi0.5 action target construction."""
@@ -375,127 +364,56 @@ class Pi05DeltaLatentLeRobotDataset(LatentLeRobotDataset):
     def __getitem__(self, idx) -> dict:
         idx = idx % len(self.new_metas)
         cur_meta = self.new_metas[idx]
-        episode_index = cur_meta["episode_index"]
-        start_frame = cur_meta["start_frame"]
-        end_frame = cur_meta["end_frame"]
+        episode_index = cur_meta['episode_index']
+        start_frame = cur_meta['start_frame']
+        end_frame = cur_meta['end_frame']
         local_start_frame = start_frame
         local_end_frame = end_frame
-
         ori_data_dict = self._get_range_latent_data(start_frame, end_frame, episode_index)
-        camera_wan_grid_shapes = (
-            self._camera_wan_grid_shapes(ori_data_dict)
-            if self.use_rgb_motion_tokens
-            else None
-        )
-
-        latent_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
-        num_latent_frames = ori_data_dict[f"{self.used_video_keys[0]}.latent_num_frames"]
-        # Preserve full-segment WAN-step ordinals before this variant applies
-        # its random latent crop. The sidecar receives the same crop below, so
-        # cropped samples are not renumbered from zero.
-        latent_world_time_ids = (
-            self._latent_world_time_ids(latent_frame_ids, int(num_latent_frames))
-            if self.use_rgb_motion_tokens
-            else None
-        )
-
+        camera_wan_grid_shapes = None
+        latent_frame_ids = ori_data_dict[f'{self.used_video_keys[0]}.frame_ids']
+        num_latent_frames = ori_data_dict[f'{self.used_video_keys[0]}.latent_num_frames']
+        latent_world_time_ids = None
         start_lat = None
         end_lat = None
-        max_latent_frames = int(getattr(self.config, "max_latent_frames", 0))
+        max_latent_frames = int(getattr(self.config, 'max_latent_frames', 0))
         if max_latent_frames > 0 and num_latent_frames > max_latent_frames:
             start_lat = torch.randint(0, num_latent_frames - max_latent_frames + 1, (1,)).item()
             end_lat = start_lat + max_latent_frames
             for key in self.used_video_keys:
-                f_num = ori_data_dict[f"{key}.latent_num_frames"]
-                height = ori_data_dict[f"{key}.latent_height"]
-                width = ori_data_dict[f"{key}.latent_width"]
-                latent = ori_data_dict[f"{key}.latent"].reshape(f_num, height * width, -1)
-                ori_data_dict[f"{key}.latent"] = latent[start_lat:end_lat].reshape(
-                    -1,
-                    latent.shape[-1],
-                )
-                ori_data_dict[f"{key}.latent_num_frames"] = max_latent_frames
+                f_num = ori_data_dict[f'{key}.latent_num_frames']
+                height = ori_data_dict[f'{key}.latent_height']
+                width = ori_data_dict[f'{key}.latent_width']
+                latent = ori_data_dict[f'{key}.latent'].reshape(f_num, height * width, -1)
+                ori_data_dict[f'{key}.latent'] = latent[start_lat:end_lat].reshape(-1, latent.shape[-1])
+                ori_data_dict[f'{key}.latent_num_frames'] = max_latent_frames
             needed_vid_frames = (max_latent_frames - 1) * 4 + 1
             vid_start = start_lat * 4
             vid_start = min(vid_start, max(0, len(latent_frame_ids) - needed_vid_frames))
             vid_end = vid_start + needed_vid_frames
             latent_frame_ids = latent_frame_ids[vid_start:vid_end]
-
         start_frame = self._get_global_idx(episode_index, start_frame)
         end_frame = self._get_global_idx(episode_index, end_frame)
-
         hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
-        self._maybe_load_rgb_motion(
-            out_dict,
-            episode_index=episode_index,
-            local_start_frame=local_start_frame,
-            local_end_frame=local_end_frame,
-            expected_full_frames=int(num_latent_frames),
-            latent_world_time_ids=latent_world_time_ids,
-            latent_frame_ids=ori_data_dict[
-                f"{self.used_video_keys[0]}.frame_ids"
-            ],
-            camera_wan_grid_shapes=camera_wan_grid_shapes,
-            truncate_start=start_lat,
-            truncate_end=end_lat,
-        )
-
         if self.has_tactile_condition and self.used_tactile_keys:
-            tactile_payload = self._load_tactile_latents(
-                episode_index=episode_index,
-                local_start_frame=local_start_frame,
-                local_end_frame=local_end_frame,
-                latent_frame_ids=latent_frame_ids,
-                truncate_start=start_lat,
-                truncate_end=end_lat,
-                # tactile is frame-aligned with video — full lengths must match
-                expected_full_frames=int(num_latent_frames),
-            )
-            if tactile_payload is None and not self.tactile_optional:
-                raise FileNotFoundError(
-                    "Missing tactile latents for cond branch: "
-                    f"repo={self.repo_id} episode={episode_index} "
-                    f"frames={local_start_frame}:{local_end_frame} "
-                    f"keys={self.used_tactile_keys}"
-                )
-
+            tactile_payload = self._load_tactile_latents(episode_index=episode_index, local_start_frame=local_start_frame, local_end_frame=local_end_frame, latent_frame_ids=latent_frame_ids, truncate_start=start_lat, truncate_end=end_lat, expected_full_frames=int(num_latent_frames))
+            if tactile_payload is None and (not self.tactile_optional):
+                raise FileNotFoundError(f'Missing tactile latents for cond branch: repo={self.repo_id} episode={episode_index} frames={local_start_frame}:{local_end_frame} keys={self.used_tactile_keys}')
             if tactile_payload is None:
-                # tactile_optional: fall back to the CFG-drop path.
-                out_dict["tactile_cond_drop"] = torch.tensor(True, dtype=torch.bool)
+                out_dict['tactile_cond_drop'] = torch.tensor(True, dtype=torch.bool)
             else:
-                # Keep the real tensors in the sample so missing files are still
-                # caught above. The model uses this explicit flag to skip tactile
-                # tokens entirely for CFG drop, so tactile modules get no gradient.
-                tactile_cfg_prob = float(getattr(self.config, "tactile_cfg_prob", 0.1))
+                tactile_cfg_prob = float(getattr(self.config, 'tactile_cfg_prob', 0.1))
                 tactile_cond_drop = torch.rand(1).item() < tactile_cfg_prob
-
-                out_dict["tactile_global_latent"] = tactile_payload["global"]
-                out_dict["tactile_local_latent"] = tactile_payload["local"]
-                out_dict["tactile_sensor_ids"] = tactile_payload["sensor_ids"]
-                out_dict["tactile_cond_drop"] = torch.tensor(
-                    tactile_cond_drop, dtype=torch.bool)
+                out_dict['tactile_global_latent'] = tactile_payload['global']
+                out_dict['tactile_local_latent'] = tactile_payload['local']
+                out_dict['tactile_sensor_ids'] = tactile_payload['sensor_ids']
+                out_dict['tactile_cond_drop'] = torch.tensor(tactile_cond_drop, dtype=torch.bool)
         else:
-            # Repo with no tactile sensors (per_repo_tactile_keys = []).
-            out_dict["tactile_cond_drop"] = torch.tensor(True, dtype=torch.bool)
-
+            out_dict['tactile_cond_drop'] = torch.tensor(True, dtype=torch.bool)
         state = ori_data_dict[self.pi05_state_column]
-        out_dict["actions"], out_dict["actions_mask"] = self._action_post_process(
-            local_start_frame,
-            local_end_frame,
-            latent_frame_ids,
-            ori_data_dict["action"],
-            state,
-        )
-
-        out_dict["latents"] = out_dict["latents"].permute(3, 0, 1, 2)
+        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'], state)
+        out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         return out_dict
-
-
-__all__ = [
-    "Pi05DeltaLatentLeRobotDataset",
-    "MultiLatentLeRobotPi05DeltaDataset",
-    "construct_lerobot_pi05_delta",
-    "construct_lerobot_pi05_delta_multi_processor",
-]
+__all__ = ['Pi05DeltaLatentLeRobotDataset', 'MultiLatentLeRobotPi05DeltaDataset', 'construct_lerobot_pi05_delta', 'construct_lerobot_pi05_delta_multi_processor']

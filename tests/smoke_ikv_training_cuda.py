@@ -20,7 +20,7 @@ from test_ikv_training import training_input, original_loss
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--retention-version", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--retention-version", type=int, choices=(2,), default=2)
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This smoke requires one CUDA GPU")
@@ -33,18 +33,18 @@ def main():
             dist.destroy_process_group()
 
 
-def run(retention_version=1):
+def run(retention_version=2):
     trainer = original_loss()
     trainer.gradient_accumulation_steps = 2
-    for motion, ikv in [(False, False), (True, False), (False, True), (True, True)]:
+    for ikv in [False, True]:
         torch.manual_seed(123)
         # 32 is compatible with both WAN's 3-axis RoPE and FlexAttention CUDA.
         model = WanMoTTransformer3DModel(
             patch_size=(1, 2, 2), num_attention_heads=1, attention_head_dim=32,
             in_channels=2, out_channels=2, action_dim=3, text_dim=8, freq_dim=4,
             ffn_dim=32, num_layers=2, rope_max_seq_len=32, attn_mode='torch',
-            use_local_tactile=False, use_rgb_motion_tokens=motion,
-            rgb_motion_require_index=False).to(device='cuda', dtype=torch.bfloat16).train()
+            use_local_tactile=False,
+            ).to(device='cuda', dtype=torch.bfloat16).train()
         apply_ac(model)
         reference = deepcopy(model)
         model = shard_model(model)
@@ -54,7 +54,7 @@ def run(retention_version=1):
             optimizer.zero_grad(set_to_none=True)
             ref_optimizer.zero_grad(set_to_none=True)
             for micro in range(2):
-                data = training_input('cuda', motion)
+                data = training_input('cuda')
                 if ikv:
                     retention = dict(top_k=2)
                     if retention_version == 2:
@@ -86,7 +86,7 @@ def run(retention_version=1):
             assert torch.isfinite(loss) and torch.isfinite(norm)
             optimizer.step()
             ref_optimizer.step()
-            print(f'motion={motion} ikv={ikv} step={step}: '
+            print(f'ikv={ikv} step={step}: '
                   f'loss={loss.detach().item():.6f}, gradients match reference', flush=True)
         del model, reference, optimizer, ref_optimizer
         torch.cuda.empty_cache()

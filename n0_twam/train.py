@@ -4,50 +4,25 @@ import os
 import sys
 from pathlib import Path
 import wandb
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    set_optimizer_state_dict,
-    StateDictOptions,
-)
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_optimizer_state_dict, StateDictOptions
 from safetensors.torch import save_file
 import json
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
 from configs import TWAM_CONFIGS
 from distributed.fsdp import shard_model, apply_ac
-from distributed.util import (
-    _configure_model, 
-    init_distributed, 
-    dist_mean, 
-    dist_mean_and_max,
-)
+from distributed.util import _configure_model, init_distributed, dist_mean, dist_mean_and_max
 from einops import rearrange
-from models.utils import (
-    load_transformer,
-    load_mot_transformer,
-    load_mot_checkpoint,
-)
-from utils import (
-    init_logger, 
-    logger, 
-    get_mesh_id, 
-    sample_timestep_id,
-    data_seq_to_patch,
-    warmup_constant_lambda,
-    FlowMatchScheduler
-)
-
+from models.utils import load_transformer, load_mot_transformer, load_mot_checkpoint
+from utils import init_logger, logger, get_mesh_id, sample_timestep_id, data_seq_to_patch, warmup_constant_lambda, FlowMatchScheduler
 from dataset import MultiLatentLeRobotDataset, BucketedDistributedBatchSampler
-from dataset.bucket_sampler import WithinUpdateDistributedSampler
 import gc
 
+from dataset.bucket_sampler import WithinUpdateDistributedSampler
 
 def _make_train_sampler(dataset, config, grouped, accumulation_steps):
     if config.world_size == 1 and not getattr(config, "save_training_state", False):
@@ -57,10 +32,10 @@ def _make_train_sampler(dataset, config, grouped, accumulation_steps):
     return cls(dataset, num_replicas=config.world_size, rank=config.rank,
                shuffle=True, seed=getattr(config, "seed", 42), **options)
 
-
 class Trainer:
+
     @staticmethod
-    def _validate_rgb_motion_training_config(config):
+    def _validate_training_config(config):
         """Reject RGB-motion training configurations that cannot be served.
 
         Sparse video padding and the semantic K/V sidecar are implemented by
@@ -68,197 +43,83 @@ class Trainer:
         with sparse RGB tokens would produce a checkpoint that the server must
         reject later, after an expensive training run.
         """
-        if bool(getattr(config, "use_ikv_training", False)):
+        from n0_twam.input_contract import validate_dense_rgb_config
+        validate_dense_rgb_config(config)
+        if bool(getattr(config, 'use_ikv_training', False)):
             from n0_twam.models.global_kv_retention import RetentionConfig
-            if not bool(getattr(config, "use_mot", False)):
-                raise ValueError("use_ikv_training requires use_mot=True")
-            capacity = getattr(config, "ikv_train_capacity", 0)
+            if not bool(getattr(config, 'use_mot', False)):
+                raise ValueError('use_ikv_training requires use_mot=True')
+            capacity = getattr(config, 'ikv_train_capacity', 0)
             if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
-                raise ValueError("ikv_train_capacity must be a positive integer")
-            retention = RetentionConfig(**dict(getattr(config, "kv_retention", {})))
-            if retention.version == 2 and capacity != (
-                    retention.video_capacity + retention.action_capacity + retention.tactile_capacity):
-                raise ValueError("ikv_train_capacity must equal the three v2 modality capacities")
-        if (bool(getattr(config, 'use_rgb_motion_tokens', False))
-                and not bool(getattr(config, 'use_mot', False))):
-            raise ValueError(
-                "use_rgb_motion_tokens=True requires use_mot=True: the RGB "
-                "path relies on the Video/Tactile/Action experts and their "
-                "shared-attention semantic KV sidecar."
-            )
+                raise ValueError('ikv_train_capacity must be a positive integer')
+            retention = RetentionConfig(**dict(getattr(config, 'kv_retention', {})))
+            if retention.version == 2 and capacity != retention.video_capacity + retention.action_capacity + retention.tactile_capacity:
+                raise ValueError('ikv_train_capacity must equal the three v2 modality capacities')
 
     def __init__(self, config, inference_only=False):
-        self._validate_rgb_motion_training_config(config)
-        if config.enable_wandb and config.rank == 0 and not inference_only:
-            # self-hosted wandb via WANDB_BASE_URL/WANDB_API_KEY; else standard wandb.ai
+        self._validate_training_config(config)
+        if config.enable_wandb and config.rank == 0 and (not inference_only):
             if os.getenv('WANDB_BASE_URL') and os.getenv('WANDB_API_KEY'):
                 wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
-            self.wandb.init(
-                entity=os.getenv("WANDB_TEAM_NAME") or None,
-                project=os.getenv("WANDB_PROJECT", "twam-pretrain"),
-                config=config,
-                mode="online",
-                name=os.getenv("WANDB_RUN_NAME", "twam-train")
-            )
-            logger.info("WandB logging enabled")
+            self.wandb.init(entity=os.getenv('WANDB_TEAM_NAME'), project=os.getenv('WANDB_PROJECT', 'twam-pretrain'), config=config, mode='online', name=os.getenv('WANDB_RUN_NAME', 'twam-train'))
+            logger.info('WandB logging enabled')
         self.step = 0
         self.config = config
-        self.device = torch.device(f"cuda:{config.local_rank}")
+        self.device = torch.device(f'cuda:{config.local_rank}')
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
-
-        # FlowMatch schedulers — needed by _add_noise / _prepare_input_dict and by
-        # inference sampling, so set them up before the (training-only) heavy setup.
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_action.set_timesteps(1000, training=True)
-        # symdiff: GlobalTactile becomes a diffusion target. Re-use video snr_shift.
         self.train_scheduler_tactile = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_tactile.set_timesteps(1000, training=True)
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
-
         if inference_only:
-            # Lean setup for rendering / denoising-consistency checks: the caller
-            # assigns self.transformer (e.g. via load_mot_checkpoint) and builds
-            # any dataset it needs. No FSDP / optimizer / dataloaders / wandb here,
-            # so all the _prepare_input_dict / _add_noise / compute_loss machinery
-            # is reused EXACTLY (the inference must match training, not re-derive it).
             return
-
-        # Refuse placeholder norm stats (mirror of the server-side guard).
         _ns = getattr(config, 'norm_stat', None) or {}
         _q01 = [float(v) for v in _ns.get('q01', [])]
         _q99 = [float(v) for v in _ns.get('q99', [])]
-        if _q01 and _q01 == [-1.0] * len(_q01) and _q99 == [1.0] * len(_q99):
-            raise RuntimeError(
-                'norm_stat is the [-1, 1] placeholder — the stats file was '
-                f'missing when the config was imported '
-                f'(norm_stat_path={getattr(config, "norm_stat_path", None)!r}). '
-                'Compute the norm stats (script/build_task_pool.py) before training.')
-
-        # Load models
-        logger.info("Loading models...")
-
-        # Load and shard transformer with FSDP
-        logger.info("Loading transformer...")
-
+        if _q01 and _q01 == [-1.0] * len(_q01) and (_q99 == [1.0] * len(_q99)):
+            raise RuntimeError(f'norm_stat is the [-1, 1] placeholder — the stats file was missing when the config was imported (norm_stat_path={getattr(config, 'norm_stat_path', None)!r}). Compute the norm stats (script/build_task_pool.py) before training.')
+        logger.info('Loading models...')
+        logger.info('Loading transformer...')
         if hasattr(config, 'resume_from') and config.resume_from:
             transformer_path = os.path.join(config.resume_from, 'transformer')
             if config.rank == 0:
-                logger.info(f"Resuming from checkpoint: {transformer_path}")
+                logger.info(f'Resuming from checkpoint: {transformer_path}')
         else:
             transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
-
-        _loader_kwargs = dict(
-            torch_dtype=torch.float32,
-            torch_device='cpu',
-            attn_mode="flex",
-            target_action_dim=int(getattr(config, 'action_dim', 30)),
-            max_tactile_streams=config.max_tactile_streams,
-            # LocalTactile cross-attn branch. The released pretrain checkpoint has
-            # it OFF; the post-train config flips it True (built zero-init on
-            # resume). Default False = match the released checkpoint.
-            use_local_tactile=bool(getattr(config, 'use_local_tactile', False)),
-            # opt-in predictive-contact gate (defaults OFF -> base ckpts unchanged;
-            # passed as from_pretrained kwarg so it overrides the ckpt config when
-            # resuming a checkpoint whose config predates the gate).
-            use_contact_gate=bool(getattr(config, 'use_contact_gate', False)),
-            contact_gate_layers=int(getattr(config, 'contact_gate_layers', 2)),
-            contact_gate_heads=int(getattr(config, 'contact_gate_heads', 8)),
-            contact_gate_stop_grad=bool(getattr(config, 'contact_gate_stop_grad', True)),
-            use_rgb_motion_tokens=bool(getattr(config, 'use_rgb_motion_tokens', False)),
-            rgb_motion_require_index=bool(getattr(
-                config, 'rgb_motion_require_index', True)),
-        )
+        _loader_kwargs = dict(torch_dtype=torch.float32, torch_device='cpu', attn_mode='flex', target_action_dim=int(getattr(config, 'action_dim', 30)), max_tactile_streams=config.max_tactile_streams, use_local_tactile=bool(getattr(config, 'use_local_tactile', False)), use_contact_gate=bool(getattr(config, 'use_contact_gate', False)), contact_gate_layers=int(getattr(config, 'contact_gate_layers', 2)), contact_gate_heads=int(getattr(config, 'contact_gate_heads', 8)), contact_gate_stop_grad=bool(getattr(config, 'contact_gate_stop_grad', True)))
         if bool(getattr(config, 'use_mot', False)):
-            # Mixture-of-Transformers: 3 per-modality experts warm-started from the
-            # shared backbone. Cross-attn / warm-start experts are config-overridable.
-            # Built in bf16: an fp32 3-expert build on every rank OOMs the container
-            # memory cgroup. (Proper fp32-master via meta-init is a later optimization.)
             _mot_kwargs = dict(_loader_kwargs)
             _mot_kwargs['torch_dtype'] = torch.bfloat16
             if hasattr(config, 'resume_from') and config.resume_from:
-                # Resuming: transformer_path is a SAVED MoT checkpoint (is_mot in its
-                # config.json). Load it directly (rebuild saved expert structure +
-                # strict weights) — do NOT warm-start from a legacy backbone.
                 if config.rank == 0:
-                    logger.info(f"Resuming MoT via load_mot_checkpoint: {transformer_path}")
-                # Post-training may flip on modules the pretrain ckpt config lacks
-                # (use_local_tactile / use_contact_gate): pass them as overrides so
-                # the branch is built (zero-init) and its absent-in-ckpt weights are
-                # tolerated, instead of rebuilding purely from the local-off ckpt
-                # config. Matches the load_mot_transformer (non-resume) path, which
-                # already receives these via **_mot_kwargs.
-                _mot_overrides = {
-                    k: _mot_kwargs[k]
-                    for k in ('use_local_tactile', 'use_contact_gate',
-                              'contact_gate_layers', 'contact_gate_heads',
-                              'contact_gate_stop_grad', 'use_rgb_motion_tokens',
-                              'rgb_motion_require_index')
-                    if k in _mot_kwargs
-                }
-                self.transformer = load_mot_checkpoint(
-                    transformer_path, torch_dtype=torch.bfloat16,
-                    torch_device='cpu', attn_mode='flex',
-                    config_overrides=_mot_overrides)
+                    logger.info(f'Resuming MoT via load_mot_checkpoint: {transformer_path}')
+                _mot_overrides = {k: _mot_kwargs[k] for k in ('use_local_tactile', 'use_contact_gate', 'contact_gate_layers', 'contact_gate_heads', 'contact_gate_stop_grad') if k in _mot_kwargs}
+                self.transformer = load_mot_checkpoint(transformer_path, torch_dtype=torch.bfloat16, torch_device='cpu', attn_mode='flex', config_overrides=_mot_overrides)
             else:
                 if config.rank == 0:
-                    logger.info("Building Mixture-of-Transformers (MoT) model (bf16).")
-                self.transformer = load_mot_transformer(
-                    transformer_path,
-                    mot_expert_ffn_dim=getattr(config, 'mot_expert_ffn_dim', None),
-                    mot_expert_hidden_dim=getattr(config, 'mot_expert_hidden_dim', None),
-                    mot_cross_attn_experts=tuple(getattr(
-                        config, 'mot_cross_attn_experts', ("video", "action"))),
-                    mot_warmstart_experts=tuple(getattr(
-                        config, 'mot_warmstart_experts', ("video", "action", "tactile"))),
-                    **_mot_kwargs,
-                )
+                    logger.info('Building Mixture-of-Transformers (MoT) model (bf16).')
+                self.transformer = load_mot_transformer(transformer_path, mot_expert_ffn_dim=getattr(config, 'mot_expert_ffn_dim', None), mot_expert_hidden_dim=getattr(config, 'mot_expert_hidden_dim', None), mot_cross_attn_experts=tuple(getattr(config, 'mot_cross_attn_experts', ('video', 'action'))), mot_warmstart_experts=tuple(getattr(config, 'mot_warmstart_experts', ('video', 'action', 'tactile'))), **_mot_kwargs)
         else:
             self.transformer = load_transformer(transformer_path, **_loader_kwargs)
-
-        logger.info("Setting up activation checkpointing ...")
+        logger.info('Setting up activation checkpointing ...')
         apply_ac(self.transformer)
-
-        logger.info("Setting up FSDP...")
+        logger.info('Setting up FSDP...')
         shard_fn = shard_model
-        self.transformer = _configure_model(
-            model=self.transformer,
-            shard_fn=shard_fn,
-            param_dtype=self.dtype,
-            device=self.device,
-            eval_mode=False,
-        )
+        self.transformer = _configure_model(model=self.transformer, shard_fn=shard_fn, param_dtype=self.dtype, device=self.device, eval_mode=False)
         self.transformer.train()
         self.transformer.requires_grad_(True)
-
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.transformer.parameters() if p.requires_grad],
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            eps=1e-8,
-            weight_decay=config.weight_decay,
-            fused=True,
-            foreach=False,
-        )
-
+        self.optimizer = torch.optim.AdamW([p for p in self.transformer.parameters() if p.requires_grad], lr=config.learning_rate, betas=(config.beta1, config.beta2), eps=1e-08, weight_decay=config.weight_decay, fused=True, foreach=False)
         if str(getattr(config, 'lr_schedule', 'constant')) == 'cosine':
             from utils import warmup_cosine_lambda
-            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer,
-                lr_lambda=lambda step: warmup_cosine_lambda(
-                    step, warmup_steps=config.warmup_steps,
-                    total_steps=config.num_steps,
-                    min_ratio=float(getattr(config, 'lr_min_ratio', 0.1))))
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: warmup_cosine_lambda(step, warmup_steps=config.warmup_steps, total_steps=config.num_steps, min_ratio=float(getattr(config, 'lr_min_ratio', 0.1))))
         else:
-            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer,
-                lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
-
-        # Setup dataloaders
-        logger.info("Setting up datasets...")
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
+        logger.info('Setting up datasets...')
         train_dataset = MultiLatentLeRobotDataset(config=config)
         _bs = int(getattr(config, 'batch_size', 1))
         grouped = os.environ.get("IKV_GROUP_WITHIN_UPDATE") == "1"
@@ -268,53 +129,15 @@ class Trainer:
             f"within_update_v1_accum{self.gradient_accumulation_steps}" if grouped else "standard"
         )
         if _bs > 1:
-            # Per-GPU batch>1: the pool is shape-heterogeneous (cameras 1/3,
-            # tactile streams 0/2/4) so default_collate cannot stack arbitrary
-            # samples. Bucket same-signature samples into batches and shard them
-            # equally across ranks (each rank gets the same #batches => no FSDP
-            # step desync). Requires the dataset to expose per-sample signatures.
             if not hasattr(train_dataset, 'sample_signatures'):
-                raise RuntimeError(
-                    "batch_size>1 needs a dataset exposing .sample_signatures "
-                    "for shape bucketing (only the pi05-delta dataset does)."
-                )
-            train_batch_sampler = BucketedDistributedBatchSampler(
-                train_dataset.sample_signatures,
-                batch_size=_bs,
-                num_replicas=config.world_size,
-                rank=config.rank,
-                shuffle=True,
-                seed=getattr(config, 'seed', 42),
-                drop_last=True,
-            )
-            self.train_loader = DataLoader(
-                train_dataset,
-                batch_sampler=train_batch_sampler,
-                num_workers=config.load_worker,
-                pin_memory=bool(getattr(config, "pin_memory", True)),
-            )
+                raise RuntimeError('batch_size>1 needs a dataset exposing .sample_signatures for shape bucketing (only the pi05-delta dataset does).')
+            train_batch_sampler = BucketedDistributedBatchSampler(train_dataset.sample_signatures, batch_size=_bs, num_replicas=config.world_size, rank=config.rank, shuffle=True, seed=getattr(config, 'seed', 42), drop_last=True)
+            self.train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, num_workers=config.load_worker, pin_memory=bool(getattr(config, 'pin_memory', True)))
             if config.rank == 0:
-                logger.info(
-                    f"Bucketed batch_size={_bs}: {len(train_batch_sampler)} "
-                    f"batches/rank across {config.world_size} ranks."
-                )
+                logger.info(f'Bucketed batch_size={_bs}: {len(train_batch_sampler)} batches/rank across {config.world_size} ranks.')
         else:
-            train_sampler = _make_train_sampler(
-                train_dataset, config, grouped, self.gradient_accumulation_steps
-            )
-            self.train_loader = DataLoader(
-                train_dataset,
-                batch_size=config.batch_size,
-                shuffle=(train_sampler is None),
-                num_workers=config.load_worker,
-                pin_memory=bool(getattr(config, "pin_memory", True)),
-                sampler=train_sampler,
-                generator=(torch.Generator().manual_seed(getattr(config, 'seed', 42))
-                           if getattr(config, 'save_training_state', False) else None),
-            )
-
-        # Optional validation set: episode-level held-out repos. Loss-only —
-        # never touches the optimizer. Sharded across ranks like training.
+            train_sampler = _make_train_sampler(train_dataset, config, grouped, self.gradient_accumulation_steps)
+            self.train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=train_sampler is None, num_workers=config.load_worker, pin_memory=bool(getattr(config, 'pin_memory', True)), sampler=train_sampler, generator=torch.Generator().manual_seed(getattr(config, 'seed', 42)) if getattr(config, 'save_training_state', False) else None)
         self.val_loader = None
         val_path = getattr(config, 'val_dataset_path', None)
         if val_path:
@@ -322,32 +145,17 @@ class Trainer:
             val_config = _copy.copy(config)
             val_config.dataset_path = val_path
             val_dataset = MultiLatentLeRobotDataset(config=val_config)
-            val_sampler = DistributedSampler(
-                val_dataset,
-                num_replicas=config.world_size,
-                rank=config.rank,
-                shuffle=False,
-            ) if config.world_size > 1 else None
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=config.batch_size,
-                shuffle=False,
-                num_workers=2,
-                pin_memory=bool(getattr(config, "pin_memory", True)),
-                sampler=val_sampler,
-            )
+            val_sampler = DistributedSampler(val_dataset, num_replicas=config.world_size, rank=config.rank, shuffle=False) if config.world_size > 1 else None
+            self.val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2, pin_memory=bool(getattr(config, 'pin_memory', True)), sampler=val_sampler)
             self.val_interval = int(getattr(config, 'val_interval', 100))
             if config.rank == 0:
-                logger.info(f"Validation set: {len(val_dataset)} segments, "
-                            f"every {self.val_interval} steps")
-
-        self.save_dir = Path(config.save_root) / "checkpoints"
+                logger.info(f'Validation set: {len(val_dataset)} segments, every {self.val_interval} steps')
+        self.save_dir = Path(config.save_root) / 'checkpoints'
         self.save_dir.mkdir(parents=True, exist_ok=True)
-
         self.train_loader_iter = None
         self.data_epoch = 0
         self.data_offset = 0
-    
+
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
         if self.train_loader_iter is None:
@@ -427,130 +235,50 @@ class Trainer:
     @torch.no_grad()
     def _prepare_input_dict(self, batch_dict):
         """Prepare input dict following infer code pattern from n0_twam_server.py."""
-        # Generate grid_id following infer code (no batch dimension yet)
-        # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
-        latent_dict = self._add_noise(
-            latent=batch_dict['latents'], 
-            train_scheduler=self.train_scheduler_latent, 
-            action_mask=None, 
-            action_mode=False,
-            noisy_cond_prob=0.5)
-        
-        action_dict = self._add_noise(
-            latent=batch_dict['actions'], 
-            train_scheduler=self.train_scheduler_action, 
-            action_mask=batch_dict['actions_mask'], 
-            action_mode=True,
-            noisy_cond_prob=0.0)
-
+        from n0_twam.input_contract import validate_dense_rgb_payload
+        validate_dense_rgb_payload(batch_dict)
+        latent_dict = self._add_noise(latent=batch_dict['latents'], train_scheduler=self.train_scheduler_latent, action_mask=None, action_mode=False, noisy_cond_prob=0.5)
+        action_dict = self._add_noise(latent=batch_dict['actions'], train_scheduler=self.train_scheduler_action, action_mask=batch_dict['actions_mask'], action_mode=True, noisy_cond_prob=0.0)
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
-        # RGB-motion sidecar.  These tensors remain metadata; the transformer
-        # only uses the indices/valid mask to gather the *existing* WAN content
-        # embeddings.  DINO/NeoForce/source are retained independently for
-        # semantic cache management and are never folded into the value tensor.
-        for key in (
-            'rgb_motion_patch_indices', 'rgb_motion_indices',
-            'rgb_motion_valid_mask', 'motion_indices', 'motion_valid_mask',
-            'world_time_id', 'dino_features', 'neoforce_features',
-            'dense_dino_features', 'frame_neoforce_features', 'task_relevance',
-            'tactile_dino_features', 'frame_contact_duration', 'tactile_contact_duration',
-            'observation_flag', 'visual_valid', 'tactile_valid',
-            'motion_scores', 'camera_ids', 'patch_uv',
-        ):
+        for key in ('world_time_id', 'dino_features', 'neoforce_features', 'dense_dino_features', 'frame_neoforce_features', 'task_relevance', 'tactile_dino_features', 'frame_contact_duration', 'tactile_contact_duration', 'observation_flag', 'visual_valid', 'tactile_valid', 'camera_ids', 'patch_uv'):
             if key in batch_dict:
                 latent_dict[key] = batch_dict[key]
-        # Tactile inputs (shared CFG-drop mechanism):
-        #   - tactile_cond_drop is explicit CFG dropout; when set, no tactile
-        #     tensors are passed to the model so tactile modules get no grad
-        #     (the model's tactile_zero_anchor keeps their params in the graph).
-        #   - LocalTactile + sensor_ids are a clean cross-attention condition.
-        # The CFG-drop decision is made ONCE in convert_input_format (which runs
-        # immediately before this in both _train_step and _validate) and stashed
-        # on self, so device movement there and the target/forward path here use
-        # the SAME flag — no independent re-draw that could disagree (the old
-        # double-decision built a target from a CPU latent -> device crash).
         tactile_cond_drop = getattr(self, '_tactile_cond_drop', False)
-        action_dict['tactile_cond_drop'] = torch.tensor(
-            tactile_cond_drop, dtype=torch.bool, device=self.device)
+        action_dict['tactile_cond_drop'] = torch.tensor(tactile_cond_drop, dtype=torch.bool, device=self.device)
         if not tactile_cond_drop:
             for key in ('tactile_local_latent', 'tactile_sensor_ids'):
                 if key in batch_dict:
                     action_dict[key] = batch_dict[key]
-            # symdiff: noise the GlobalTactile latent so the dedicated
-            # tactile_proj_out head can predict the velocity. Treat each sensor as
-            # an independent diffusion sample by folding S into the batch dim.
-            # GlobalTactile is a diffusion target here, not a clean condition, so
-            # the raw tactile_global_latent is consumed via the noised tensors below.
             if 'tactile_global_latent' in batch_dict:
-                g = batch_dict['tactile_global_latent']                # (B, S, C, F, H, W)
+                g = batch_dict['tactile_global_latent']
                 if getattr(self.config, 'tactile_global_zero', False):
-                    # global-ablation: zero the GlobalTactile latent so the noisy
-                    # segment (= pure noise) and clean condition carry no contact
-                    # info; sequence/loss structure stays identical to full model.
                     if not getattr(self, '_tgz_logged', False):
                         self._tgz_logged = True
-                        logger.info(
-                            "tactile_global_zero ACTIVE: zeroing global latent "
-                            "(incoming max=%.4f)", g.abs().max().item())
+                        logger.info('tactile_global_zero ACTIVE: zeroing global latent (incoming max=%.4f)', g.abs().max().item())
                     g = torch.zeros_like(g)
                 B, S, C, F, H, W = g.shape
                 g_flat = g.reshape(B * S, C, F, H, W).contiguous()
-                tdict = self._add_noise(
-                    latent=g_flat,
-                    train_scheduler=self.train_scheduler_tactile,
-                    action_mask=None,
-                    action_mode=False,
-                    noisy_cond_prob=getattr(self.config, 'noisy_cond_prob_tactile', 0.5),
-                )
-                action_dict['tactile_global_noisy_latent'] = (
-                    tdict['noisy_latents'].reshape(B, S, C, F, H, W))
-                action_dict['tactile_global_clean_latent'] = (
-                    tdict['latent'].reshape(B, S, C, F, H, W))
-                action_dict['tactile_global_targets'] = (
-                    tdict['targets'].reshape(B, S, C, F, H, W))
-                # timesteps from _add_noise are (B*S, F); collapse the S dim by
-                # taking the first sensor's schedule (per-frame timestep is shared).
-                action_dict['tactile_global_timesteps'] = (
-                    tdict['timesteps'].reshape(B, S, F)[:, 0])         # (B, F)
-                action_dict['tactile_global_cond_timesteps'] = (
-                    tdict['cond_timesteps'].reshape(B, S, F)[:, 0])    # (B, F)
-
-        input_dict = {
-            'latent_dict': latent_dict,
-            'action_dict': action_dict,
-            'chunk_size': torch.randint(1, 5, (1,)).item(),
-            'window_size': torch.randint(4, 65, (1,)).item(),
-        }
-        if (bool(getattr(self.config, "use_ikv_training", False))
-                and getattr(self.config, "ikv_train_execution", "recurrent") == "recurrent"
-                and dist.is_initialized()):
-            # Recurrent IKV invokes FSDP once per phase. Share the phase width
-            # across ranks; variable trajectory lengths are padded below.
-            shared_chunk = torch.tensor(input_dict["chunk_size"], device=self.device)
+                tdict = self._add_noise(latent=g_flat, train_scheduler=self.train_scheduler_tactile, action_mask=None, action_mode=False, noisy_cond_prob=getattr(self.config, 'noisy_cond_prob_tactile', 0.5))
+                action_dict['tactile_global_noisy_latent'] = tdict['noisy_latents'].reshape(B, S, C, F, H, W)
+                action_dict['tactile_global_clean_latent'] = tdict['latent'].reshape(B, S, C, F, H, W)
+                action_dict['tactile_global_targets'] = tdict['targets'].reshape(B, S, C, F, H, W)
+                action_dict['tactile_global_timesteps'] = tdict['timesteps'].reshape(B, S, F)[:, 0]
+                action_dict['tactile_global_cond_timesteps'] = tdict['cond_timesteps'].reshape(B, S, F)[:, 0]
+        input_dict = {'latent_dict': latent_dict, 'action_dict': action_dict, 'chunk_size': torch.randint(1, 5, (1,)).item(), 'window_size': torch.randint(4, 65, (1,)).item()}
+        if bool(getattr(self.config, 'use_ikv_training', False)) and getattr(self.config, 'ikv_train_execution', 'recurrent') == 'recurrent' and dist.is_initialized():
+            shared_chunk = torch.tensor(input_dict['chunk_size'], device=self.device)
             dist.broadcast(shared_chunk, src=0)
-            input_dict["chunk_size"] = int(shared_chunk.item())
-        if bool(getattr(self.config, "use_rgb_motion_tokens", False)):
-            from n0_twam.models.motion_training import prepare_causal_motion
-            prepare_causal_motion(latent_dict, input_dict["chunk_size"])
-        if bool(getattr(self.config, "use_ikv_training", False)):
-            retention = dict(getattr(self.config, "kv_retention", {}))
-            execution = getattr(self.config, "ikv_train_execution", "recurrent")
-            input_dict["ikv_training"] = dict(
-                capacity=self.config.ikv_train_capacity,
-                retention=retention, execution=execution,
-                block_size=int(getattr(self.config, "ikv_train_block_size", 128)),
-                compact_attention=bool(getattr(self.config, "ikv_train_compact_attention", False)),
-                compact_max_packed_keys=int(getattr(self.config, "ikv_train_compact_max_packed_keys", 65536)),
-                sample_capacity=bool(getattr(self.config, "ikv_train_sample_capacity", False)),
-                min_capacity=int(getattr(self.config, "ikv_train_min_capacity",
-                                         (self.config.ikv_train_capacity + 1) // 2)))
-            if os.getenv("IKV_HISTORY_PLAN_CACHE", "0") == "1":
-                if int(getattr(self.config, "max_latent_frames", 0)) > 0:
-                    raise ValueError("IKV history decision cache requires full trajectories")
-                input_dict["ikv_training"]["history_cache_key"] = int(
-                    batch_dict["_ikv_sample_index"].reshape(-1)[0].item())
+            input_dict['chunk_size'] = int(shared_chunk.item())
+        if bool(getattr(self.config, 'use_ikv_training', False)):
+            retention = dict(getattr(self.config, 'kv_retention', {}))
+            execution = getattr(self.config, 'ikv_train_execution', 'recurrent')
+            input_dict['ikv_training'] = dict(capacity=self.config.ikv_train_capacity, retention=retention, execution=execution, block_size=int(getattr(self.config, 'ikv_train_block_size', 128)), compact_attention=bool(getattr(self.config, 'ikv_train_compact_attention', False)), compact_max_packed_keys=int(getattr(self.config, 'ikv_train_compact_max_packed_keys', 65536)), sample_capacity=bool(getattr(self.config, 'ikv_train_sample_capacity', False)), min_capacity=int(getattr(self.config, 'ikv_train_min_capacity', (self.config.ikv_train_capacity + 1) // 2)))
+            if os.getenv('IKV_HISTORY_PLAN_CACHE', '0') == '1':
+                if int(getattr(self.config, 'max_latent_frames', 0)) > 0:
+                    raise ValueError('IKV history decision cache requires full trajectories')
+                input_dict['ikv_training']['history_cache_key'] = int(batch_dict['_ikv_sample_index'].reshape(-1)[0].item())
         return input_dict
 
     def convert_input_format(self, input_dict):
@@ -583,138 +311,16 @@ class Trainer:
     def _compute_latent_loss(self, input_dict, latent_pred):
         latent_target = input_dict['latent_dict']['targets']
         latent_dict = input_dict['latent_dict']
-        motion_local = latent_dict.get('rgb_motion_patch_indices')
-        if motion_local is None:
-            motion_local = latent_dict.get('motion_indices')
-        motion_flat = latent_dict.get('rgb_motion_indices')
-        if motion_local is not None or motion_flat is not None:
-            # Sparse RGB supervision.  proj_out still emits the original WAN
-            # patch payload (one C-vector per p_t*p_h*p_w latent cell); compare
-            # it only with the gathered dense FlowMatch targets.  DINO,
-            # NeoForce and observed/predicted remain index metadata and are not
-            # mixed into this content loss.
-            B, C, F_lat, H_lat, W_lat = latent_target.shape
-            p_t, p_h, p_w = self.patch_size
-            Fp, Hp, Wp = F_lat // p_t, H_lat // p_h, W_lat // p_w
-            spatial = Hp * Wp
-            patch_volume = p_t * p_h * p_w
-
-            if motion_flat is None:
-                idx = motion_local
-                if idx.dim() == 2 and B == 1:
-                    idx = idx.unsqueeze(0)
-                valid = latent_dict.get('rgb_motion_valid_mask')
-                if valid is None:
-                    valid = latent_dict.get('motion_valid_mask')
-                valid = ((idx >= 0) if valid is None else
-                         valid.to(torch.bool) & (idx >= 0))
-                bad = valid & ((idx < 0) | (idx >= spatial))
-                if bad.any():
-                    raise IndexError(
-                        f"RGB-motion spatial index out of range [0,{spatial}): "
-                        f"{idx[bad][:8].tolist()}")
-                frame = torch.arange(Fp, device=idx.device)[None, :, None].expand_as(idx)
-                safe_idx = torch.where(valid, idx, torch.zeros_like(idx))
-                flat_idx = (frame * spatial + safe_idx).reshape(B, -1)
-                frame = frame.reshape(B, -1)
-                valid = valid.reshape(B, -1)
-            else:
-                flat_idx = motion_flat
-                if flat_idx.dim() == 1 and B == 1:
-                    flat_idx = flat_idx.unsqueeze(0)
-                valid = latent_dict.get('rgb_motion_valid_mask')
-                if valid is None:
-                    valid = latent_dict.get('motion_valid_mask')
-                valid = ((flat_idx >= 0) if valid is None else
-                         valid.reshape_as(flat_idx).to(torch.bool) & (flat_idx >= 0))
-                total = Fp * spatial
-                bad = valid & ((flat_idx < 0) | (flat_idx >= total))
-                if bad.any():
-                    raise IndexError(
-                        f"RGB-motion flattened index out of range [0,{total}): "
-                        f"{flat_idx[bad][:8].tolist()}")
-                flat_idx = torch.where(
-                    valid, flat_idx, torch.zeros_like(flat_idx))
-                frame = flat_idx // spatial
-
-            target_patches = rearrange(
-                latent_target,
-                'b c (f pt) (h ph) (w pw) -> b (f h w) (pt ph pw) c',
-                pt=p_t, ph=p_h, pw=p_w)
-            gather_idx = flat_idx[:, :, None, None].expand(
-                -1, -1, patch_volume, C)
-            target_patches = torch.gather(target_patches, 1, gather_idx)
-            pred_patches = latent_pred.reshape(B, flat_idx.shape[1],
-                                               patch_volume, C)
-            if pred_patches.shape != target_patches.shape:
-                raise ValueError(
-                    "Sparse RGB prediction/target mismatch: "
-                    f"pred={tuple(pred_patches.shape)} "
-                    f"target={tuple(target_patches.shape)}")
-
-            per_element = F.mse_loss(
-                pred_patches.float(), target_patches.float().detach(),
-                reduction='none')
-            per_patch = per_element.mean(dim=(-1, -2))
-            Bn, Fn = latent_dict['timesteps'].shape
-            frame_weight = self.train_scheduler_latent.training_weight(
-                latent_dict['timesteps'].flatten()).reshape(Bn, Fn)
-            if not bool(valid.any()):
-                return latent_pred.sum().float() * 0.0
-
-            # Preserve the legacy loss scale: first average selected patches
-            # inside each (batch, frame), multiply by that frame's scheduler
-            # weight, then average the active frames.  Consequently selecting
-            # every WAN patch is exactly the dense objective; normalising by
-            # the *sum of weights* would silently change that objective.
-            frame = frame.clamp(min=0, max=Fn - 1)
-            linear_frame = (
-                torch.arange(B, device=frame.device)[:, None] * Fn + frame
-            ).reshape(-1)
-            flat_valid = valid.reshape(-1)
-            frame_error_sum = per_patch.new_zeros(B * Fn)
-            frame_patch_count = per_patch.new_zeros(B * Fn)
-            frame_error_sum.scatter_add_(
-                0, linear_frame[flat_valid], per_patch.reshape(-1)[flat_valid])
-            frame_patch_count.scatter_add_(
-                0, linear_frame[flat_valid],
-                torch.ones_like(per_patch.reshape(-1)[flat_valid]))
-            active = frame_patch_count > 0
-            frame_error = frame_error_sum / frame_patch_count.clamp_min(1)
-            weighted = frame_error * frame_weight.reshape(-1)
-            return weighted[active].mean()
-
-        # Transformer video output is a patch sequence:
-        #   latent_pred_seq: [B, N_video_tokens, C_patch]
-        # Convert it back to dense FlowMatch target layout:
-        #   latent_pred/latent_target: [B, C_latent, F_video, H_latent, W_latent]
-        latent_pred = data_seq_to_patch(
-            self.patch_size, latent_pred,
-            latent_target.shape[-3],
-            latent_target.shape[-2],
-            latent_target.shape[-1],
-            batch_size=latent_pred.shape[0])
-        # timesteps: [B, F_video], one sampled diffusion/flow timestep per frame.
+        latent_pred = data_seq_to_patch(self.patch_size, latent_pred, latent_target.shape[-3], latent_target.shape[-2], latent_target.shape[-1], batch_size=latent_pred.shape[0])
         Bn, Fn = input_dict['latent_dict']['timesteps'].shape
-        # latent_loss_weight: [B, F_video], broadcast over C/H/W below.
-        latent_loss_weight = self.train_scheduler_latent.training_weight(
-            input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
-
-        # Per-element MSE:
-        #   latent_loss: [B, C_latent, F_video, H_latent, W_latent]
-        latent_loss = F.mse_loss(
-            latent_pred.float(),
-            latent_target.float().detach(),
-            reduction='none')
+        latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
+        latent_loss = F.mse_loss(latent_pred.float(), latent_target.float().detach(), reduction='none')
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
-        # Move frame next to batch and flatten all non-frame dimensions:
-        #   [B, C, F, H, W] -> [B, F, H, W, C] -> [B*F, H*W*C]
         latent_loss = latent_loss.permute(0, 2, 3, 4, 1)
         latent_loss = latent_loss.flatten(0, 1).flatten(1)
-        # Normalize each frame by its element count, then average over B*F.
         latent_loss_per_frame = latent_loss.sum(dim=1)
         latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)
-        return (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+        return (latent_loss_per_frame / (latent_mask_per_frame + 1e-06)).mean()
 
     def _compute_action_loss(self, input_dict, action_pred):
         action_target = input_dict['action_dict']['targets']
@@ -888,128 +494,48 @@ class Trainer:
             out[name] = dist_mean(local).item()
         return out
 
-    def save_checkpoint(self,):
+    def save_checkpoint(self):
         """Save model checkpoint in the same format as pretrained model."""
         try:
-            state_dict = get_model_state_dict(
-                self.transformer,
-                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            )
+            state_dict = get_model_state_dict(self.transformer, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
-
-            # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
-                checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
+                checkpoint_dir = self.save_dir / f'checkpoint_step_{self.step}'
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-                # Save transformer in the same format as pretrained model
-                transformer_dir = checkpoint_dir / "transformer"
+                transformer_dir = checkpoint_dir / 'transformer'
                 transformer_dir.mkdir(parents=True, exist_ok=True)
-
-                logger.info(f"Saving transformer to {transformer_dir}")
-
-                # Manually save in diffusers format (outside FSDP context to avoid deadlock)
-                # Save model weights
-                model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
+                logger.info(f'Saving transformer to {transformer_dir}')
+                model_file = transformer_dir / 'diffusion_pytorch_model.safetensors'
                 save_file(state_dict_bf16, model_file)
-
-                # Save config (copy from original transformer config and update _name_or_path)
-                config_file = transformer_dir / "config.json"
+                config_file = transformer_dir / 'config.json'
                 config_dict = dict(self.transformer.config)
                 config_dict.pop('_name_or_path', None)
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
-
-                # train/serve consistency snapshot (cross-checked at serve startup)
                 _c = self.config
-                meta = {
-                    'step': self.step,
-                    'norm_stat': {k: list(v) for k, v in dict(_c.norm_stat).items()
-                                  if isinstance(v, (list, tuple))},
-                    'norm_stat_path': getattr(_c, 'norm_stat_path', None),
-                    'action_norm_method': getattr(_c, 'action_norm_method', None),
-                    'action_delta_mode': getattr(_c, 'action_delta_mode', None),
-                    'action_dim': int(getattr(_c, 'action_dim', 0)),
-                    'pi05_action_horizon': int(getattr(_c, 'pi05_action_horizon', 0)),
-                    'action_per_frame': int(getattr(_c, 'action_per_frame', 0)),
-                    'used_action_channel_ids': [int(v) for v in getattr(_c, 'used_action_channel_ids', [])],
-                    'use_local_tactile': bool(getattr(_c, 'use_local_tactile', False)),
-                    'local_tactile_mode': getattr(_c, 'local_tactile_mode', None),
-                    'tactile_global_zero': bool(getattr(_c, 'tactile_global_zero', False)),
-                    'kv_cache_policy': getattr(_c, 'kv_cache_policy', 'fifo'),
-                    'rgb_motion_input_mode': getattr(_c, 'rgb_motion_input_mode', 'rgb'),
-                    'rgb_motion_rgb_threshold': float(getattr(_c, 'rgb_motion_rgb_threshold', .02)),
-                    'use_ikv_training': bool(getattr(_c, 'use_ikv_training', False)),
-                    'ikv_train_capacity': int(getattr(_c, 'ikv_train_capacity', 0)),
-                    'ikv_train_execution': getattr(_c, 'ikv_train_execution', 'recurrent'),
-                    'ikv_train_block_size': int(getattr(_c, 'ikv_train_block_size', 128)),
-                    'ikv_train_compact_attention': bool(getattr(_c, 'ikv_train_compact_attention', False)),
-                    'ikv_train_compact_max_packed_keys': int(getattr(_c, 'ikv_train_compact_max_packed_keys', 65536)),
-                    'ikv_train_sample_capacity': bool(getattr(_c, 'ikv_train_sample_capacity', False)),
-                    'ikv_train_min_capacity': int(getattr(_c, 'ikv_train_min_capacity', 0)),
-                    'kv_retention': dict(getattr(_c, 'kv_retention', {})),
-                    'kv_semantic_encoder': dict(getattr(_c, 'kv_semantic_encoder', {}) or {}),
-                    'kv_semantic_provenance': getattr(_c, 'kv_semantic_provenance', None),
-                    'use_rgb_motion_tokens': bool(getattr(
-                        _c, 'use_rgb_motion_tokens', False)),
-                    'rgb_motion_require_index': bool(getattr(
-                        _c, 'rgb_motion_require_index', True)),
-                    'rgb_motion_max_tokens': int(getattr(
-                        _c, 'rgb_motion_max_tokens', 32)),
-                    'patch_size': [int(v) for v in getattr(
-                        _c, 'patch_size', (1, 2, 2))],
-                    'obs_cam_keys': list(getattr(_c, 'obs_cam_keys', [])),
-                    'tactile_keys': list(getattr(_c, 'tactile_keys', [])),
-                    'eval_prompt': getattr(_c, 'eval_prompt', None),
-                }
-                with open(checkpoint_dir / "train_meta.json", 'w') as f:
+                meta = {'step': self.step, 'norm_stat': {k: list(v) for k, v in dict(_c.norm_stat).items() if isinstance(v, (list, tuple))}, 'norm_stat_path': getattr(_c, 'norm_stat_path', None), 'action_norm_method': getattr(_c, 'action_norm_method', None), 'action_delta_mode': getattr(_c, 'action_delta_mode', None), 'action_dim': int(getattr(_c, 'action_dim', 0)), 'pi05_action_horizon': int(getattr(_c, 'pi05_action_horizon', 0)), 'action_per_frame': int(getattr(_c, 'action_per_frame', 0)), 'used_action_channel_ids': [int(v) for v in getattr(_c, 'used_action_channel_ids', [])], 'use_local_tactile': bool(getattr(_c, 'use_local_tactile', False)), 'local_tactile_mode': getattr(_c, 'local_tactile_mode', None), 'tactile_global_zero': bool(getattr(_c, 'tactile_global_zero', False)), 'kv_cache_policy': getattr(_c, 'kv_cache_policy', 'fifo'), 'use_ikv_training': bool(getattr(_c, 'use_ikv_training', False)), 'ikv_train_capacity': int(getattr(_c, 'ikv_train_capacity', 0)), 'ikv_train_execution': getattr(_c, 'ikv_train_execution', 'recurrent'), 'ikv_train_block_size': int(getattr(_c, 'ikv_train_block_size', 128)), 'ikv_train_compact_attention': bool(getattr(_c, 'ikv_train_compact_attention', False)), 'ikv_train_compact_max_packed_keys': int(getattr(_c, 'ikv_train_compact_max_packed_keys', 65536)), 'ikv_train_sample_capacity': bool(getattr(_c, 'ikv_train_sample_capacity', False)), 'ikv_train_min_capacity': int(getattr(_c, 'ikv_train_min_capacity', 0)), 'kv_retention': dict(getattr(_c, 'kv_retention', {})), 'kv_semantic_encoder': dict(getattr(_c, 'kv_semantic_encoder', {}) or {}), 'kv_semantic_provenance': getattr(_c, 'kv_semantic_provenance', None), 'patch_size': [int(v) for v in getattr(_c, 'patch_size', (1, 2, 2))], 'obs_cam_keys': list(getattr(_c, 'obs_cam_keys', [])), 'tactile_keys': list(getattr(_c, 'tactile_keys', [])), 'eval_prompt': getattr(_c, 'eval_prompt', None)}
+                with open(checkpoint_dir / 'train_meta.json', 'w') as f:
                     json.dump(meta, f, indent=2)
-
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
-
-                logger.info(f"Checkpoint saved successfully at step {self.step}")
-
-            # Synchronize all processes after saving
+                logger.info(f'Checkpoint saved successfully at step {self.step}')
             if dist.is_initialized():
                 dist.barrier()
             save_error = None
-
         except Exception as e:
             save_error = e
             if self.config.rank == 0:
-                logger.error(f"Failed to save checkpoint: {e}")
+                logger.error(f'Failed to save checkpoint: {e}')
                 import traceback
                 logger.error(traceback.format_exc())
-            # Ensure all processes stay synchronized even on error
             if dist.is_initialized():
                 dist.barrier()
-
-        # A failed save must stop training on ALL ranks in sync — continuing
-        # produces a "successful" run with no usable weights.
-        _failed = torch.tensor(
-            [0 if save_error is None else 1],
-            device=self.device if torch.cuda.is_available() else 'cpu')
+        _failed = torch.tensor([0 if save_error is None else 1], device=self.device if torch.cuda.is_available() else 'cpu')
         if dist.is_initialized():
             dist.all_reduce(_failed, op=dist.ReduceOp.MAX)
         if int(_failed.item()):
-            raise RuntimeError(
-                f'checkpoint save failed at step {self.step} — refusing to '
-                'continue training with unsaved weights') from save_error
-
+            raise RuntimeError(f'checkpoint save failed at step {self.step} — refusing to continue training with unsaved weights') from save_error
         if getattr(self.config, 'save_training_state', False):
             from n0_twam.task_pipeline.checkpoint import save_training_state
-            save_training_state(self, self.save_dir / f"checkpoint_step_{self.step}" / "training_state")
+            save_training_state(self, self.save_dir / f'checkpoint_step_{self.step}' / 'training_state')
 
     def train(self):
         """Main training loop - train by steps instead of epochs."""
@@ -1149,109 +675,79 @@ class Trainer:
         progress_bar.close()
         logger.info("Training completed!")
 
-
 def run(args):
     """Main entry point."""
     import copy
     config = copy.deepcopy(TWAM_CONFIGS[args.config_name])
-    if getattr(args, 'resume_training', None) and not getattr(args, 'task_config', None):
-        raise ValueError("--resume-training requires --task-config")
-    if getattr(args, 'task_config', None) and any(
-        getattr(args, name, None) is not None
-        for name in ('motion', 'ikv', 'ikv_capacity', 'base_checkpoint', 'save_root')
-    ):
-        raise ValueError("Use task JSON and --mode instead of legacy overrides with --task-config")
+    if getattr(args, 'resume_training', None) and (not getattr(args, 'task_config', None)):
+        raise ValueError('--resume-training requires --task-config')
+    if getattr(args, 'task_config', None) and any((getattr(args, name, None) is not None for name in ('ikv', 'ikv_capacity', 'base_checkpoint', 'save_root'))):
+        raise ValueError('Use task JSON and --mode instead of legacy overrides with --task-config')
     if getattr(args, 'task_config', None):
         from n0_twam.task_pipeline.config import load_task, training_config
         config = training_config(load_task(args.task_config), args.mode, int(os.environ.get('WORLD_SIZE', 1)))
         config.save_training_state = True
         if args.resume_training:
             config.resume_from = str(Path(args.resume_training).parent)
-
-    rank = int(os.getenv("RANK", 0))
+    rank = int(os.getenv('RANK', 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
     init_distributed(world_size, local_rank, rank)
-
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
-
     if args.save_root is not None:
         config.save_root = args.save_root
-    if args.motion is not None:
-        config.use_rgb_motion_tokens = args.motion
     if args.ikv is not None:
         config.use_ikv_training = args.ikv
-        config.kv_cache_policy = "global" if args.ikv else "fifo"
+        config.kv_cache_policy = 'global' if args.ikv else 'fifo'
     if args.ikv_capacity is not None:
         config.ikv_train_capacity = args.ikv_capacity
-    modality_capacities = getattr(args, "ikv_modality_capacities", None)
+    modality_capacities = getattr(args, 'ikv_modality_capacities', None)
     if modality_capacities is not None:
-        config.kv_retention = dict(getattr(config, "kv_retention", {}))
-        config.kv_retention.update(version=2, **dict(zip(
-            ("video_capacity", "action_capacity", "tactile_capacity"), modality_capacities)))
+        config.kv_retention = dict(getattr(config, 'kv_retention', {}))
+        config.kv_retention.update(version=2, **dict(zip(('video_capacity', 'action_capacity', 'tactile_capacity'), modality_capacities)))
         total = sum(modality_capacities)
         if args.ikv_capacity is not None and args.ikv_capacity != total:
-            raise ValueError("--ikv-capacity must equal --ikv-modality-capacities sum")
+            raise ValueError('--ikv-capacity must equal --ikv-modality-capacities sum')
         config.ikv_train_capacity = total
     if args.base_checkpoint is not None:
         config.resume_from = args.base_checkpoint
-    if bool(getattr(config, "use_ikv_training", False)):
-        config.kv_cache_policy = "global"
-
+    if bool(getattr(config, 'use_ikv_training', False)):
+        config.kv_cache_policy = 'global'
     if rank == 0:
-        logger.info(f"Using config: {args.config_name}")
-        logger.info(f"World size: {world_size}, Local rank: {local_rank}")
-
+        logger.info(f'Using config: {args.config_name}')
+        logger.info(f'World size: {world_size}, Local rank: {local_rank}')
     if getattr(args, 'task_config', None):
         import random
         import numpy as np
-        random.seed(config.seed); np.random.seed(config.seed); torch.manual_seed(config.seed)
+        random.seed(config.seed)
+        np.random.seed(config.seed)
+        torch.manual_seed(config.seed)
     trainer = Trainer(config)
     if getattr(args, 'task_config', None):
-        random.seed(config.seed + rank); np.random.seed(config.seed + rank); torch.manual_seed(config.seed + rank)
+        random.seed(config.seed + rank)
+        np.random.seed(config.seed + rank)
+        torch.manual_seed(config.seed + rank)
     if getattr(args, 'resume_training', None):
         from n0_twam.task_pipeline.checkpoint import load_training_state
         load_training_state(trainer, args.resume_training)
     trainer.train()
 
-
 def main():
     """Parse arguments and run training."""
-    parser = argparse.ArgumentParser(description="Train WAN model for robotics")
-    parser.add_argument(
-        "--config-name",
-        type=str,
-        default='posttrain',
-        help="Config name",
-    )
-    parser.add_argument(
-        "--save-root",
-        type=str,
-        default=None,
-        help="Root directory for saving checkpoints",
-    )
-
-    parser.add_argument("--motion", action=argparse.BooleanOptionalAction, default=None,
-                        help="Enable/disable motion patches; retain original N0-TWAM loss")
-    parser.add_argument("--ikv", action=argparse.BooleanOptionalAction, default=None,
-                        help="Enable/disable IKV historical attention in teacher-forced training")
-    parser.add_argument("--ikv-modality-capacities", type=int, nargs=3, default=None,
-                        metavar=("VIDEO", "ACTION", "TACTILE"),
-                        help="Enable v2 with explicit per-modality token budgets")
-    parser.add_argument("--ikv-capacity", type=int, default=None,
-                        help="Maximum retained condition tokens, shared across all experts")
-    parser.add_argument("--base-checkpoint", default=None,
-                        help="Released MoT base directory with transformer/; initializes original trainer")
-    parser.add_argument("--task-config", default=None)
-    parser.add_argument("--mode", choices=["baseline","motion","ikv","motion_ikv"], default="baseline")
-    parser.add_argument("--resume-training", default=None, help="Complete checkpoint/training_state directory; same GPU count")
+    parser = argparse.ArgumentParser(description='Train WAN model for robotics')
+    parser.add_argument('--config-name', type=str, default='posttrain', help='Config name')
+    parser.add_argument('--save-root', type=str, default=None, help='Root directory for saving checkpoints')
+    parser.add_argument('--ikv', action=argparse.BooleanOptionalAction, default=None, help='Enable/disable IKV historical attention in teacher-forced training')
+    parser.add_argument('--ikv-modality-capacities', type=int, nargs=3, default=None, metavar=('VIDEO', 'ACTION', 'TACTILE'), help='Enable v2 with explicit per-modality token budgets')
+    parser.add_argument('--ikv-capacity', type=int, default=None, help='Maximum retained condition tokens, shared across all experts')
+    parser.add_argument('--base-checkpoint', default=None, help='Released MoT base directory with transformer/; initializes original trainer')
+    parser.add_argument('--task-config', default=None)
+    parser.add_argument('--mode', choices=['baseline', 'ikv'], default='baseline')
+    parser.add_argument('--resume-training', default=None, help='Complete checkpoint/training_state directory; same GPU count')
     args = parser.parse_args()
     run(args)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     init_logger()
     main()

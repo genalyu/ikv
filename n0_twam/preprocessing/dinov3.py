@@ -127,7 +127,7 @@ class FrozenDinoV3PatchEncoder(nn.Module):
     ``float_input_range`` and defaults to 0..1, avoiding value-range guessing.
 
     Images are resized directly to ``image_size`` with no crop. This property is
-    important for the RGB-D motion detector: the DINO grid continues to cover
+    important for the native RGB encoder: the DINO grid continues to cover
     the same complete field of view as depth and camera intrinsics.
 
     The wrapped model must follow the Hugging Face DINO convention and return a

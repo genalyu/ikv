@@ -259,6 +259,8 @@ def load_mot_checkpoint(checkpoint_dir, torch_dtype=torch.bfloat16,
         cfg = json.load(f)
     if not cfg.get("is_mot", False):
         raise ValueError(f"{tdir}/config.json is not a MoT checkpoint (is_mot missing).")
+    from n0_twam.input_contract import validate_dense_rgb_config
+    validate_dense_rgb_config(cfg)
     mot_ffn = cfg.get("mot_expert_ffn_dim")
     mot_hdim = cfg.get("mot_expert_hidden_dim")
     mot_cross = cfg.get("mot_cross_attn_experts", ("video", "action"))

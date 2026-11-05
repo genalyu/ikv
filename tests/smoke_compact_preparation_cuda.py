@@ -11,7 +11,7 @@ from n0_twam.models.compact_ikv_attention import build_compact_ikv_groups
 from test_ikv_training import training_input,original_loss
 
 torch.set_num_threads(1);torch.manual_seed(123)
-a=WanMoTTransformer3DModel(patch_size=(1,2,2),num_attention_heads=1,attention_head_dim=32,in_channels=2,out_channels=2,action_dim=3,text_dim=8,freq_dim=4,ffn_dim=32,num_layers=2,rope_max_seq_len=32,attn_mode="torch",use_local_tactile=False,use_rgb_motion_tokens=False).to(device="cuda",dtype=torch.bfloat16).train()
+a=WanMoTTransformer3DModel(patch_size=(1,2,2),num_attention_heads=1,attention_head_dim=32,in_channels=2,out_channels=2,action_dim=3,text_dim=8,freq_dim=4,ffn_dim=32,num_layers=2,rope_max_seq_len=32,attn_mode="torch",use_local_tactile=False).to(device="cuda",dtype=torch.bfloat16).train()
 b=deepcopy(a)
 a.mot.gradient_checkpointing=b.mot.gradient_checkpointing=True
 raw=training_input("cuda",False)

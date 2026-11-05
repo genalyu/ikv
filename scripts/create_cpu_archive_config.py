@@ -34,7 +34,7 @@ def main():
                          sys2_task=args.sys2_task,visual_weight=0.,persistence_weight=0.,
                          class_recency_weight=0.,task_weight=0.,contact_weight=0.)
         cfg.update(kv_index_dino_online=False,kv_index_predicted_dino=False,
-                   kv_neoforce_online=False,use_rgb_motion_tokens=False)
+                   kv_neoforce_online=False)
     RetentionConfig(**retention)
     cfg["kv_retention"] = retention
     args.output.parent.mkdir(parents=True, exist_ok=True)

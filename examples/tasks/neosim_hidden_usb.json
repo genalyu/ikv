@@ -38,7 +38,6 @@
     "dino_model": "${DINO_MODEL}"
   },
   "features": {
-    "motion_threshold": 0.02,
     "ikv_capacity": 4096
   }
 }

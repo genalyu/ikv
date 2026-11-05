@@ -357,7 +357,7 @@ class MultimodalKVRetention(GlobalKVRetention):
 
     @torch.no_grad()
     def observe_dense(self, features, times, durations):
-        """Caller supplies real pre-motion observations inside its transaction."""
+        """Caller supplies real full-grid observations inside its transaction."""
         self.history.observe(features, times, durations)
 
     @torch.no_grad()

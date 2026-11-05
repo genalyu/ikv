@@ -2,7 +2,7 @@
 
 This fork maintains the portable IKV core built on N0-TWAM. The supported
 input is native RGB (plus the checkpoint's tactile/action inputs), with no depth
-requirement. Motion detection is OFF by default. Two-machine pipeline-parallel
+requirement. Training supports full-RGB baseline and IKV modes only. Two-machine pipeline-parallel
 launchers are deployment adapters, not part of this core release.
 
 See [reproducibility and deployment versioning](docs/REPRODUCIBILITY.md).
@@ -102,7 +102,7 @@ n0-twam/
 ├── diagrams/ · example_client/     # figures, example observations,
 │                                   #   simple_client.py (open-loop smoke),
 │                                   #   closed_loop_client.py (drive your robot)
-├── docs/                           # INSTALL.md · POST_TRAINING.md · DEPLOY.md · RGB_MOTION.md
+├── docs/                           # INSTALL.md · POST_TRAINING.md · DEPLOY.md
 ├── requirements.txt · pyproject.toml · LICENSE
 ```
 

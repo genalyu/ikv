@@ -19,7 +19,7 @@ def test_tactile_metadata_is_sensor_major_and_uses_measured_durations():
         frame_contact_duration=torch.tensor([[0.,.5]]),
         tactile_contact_duration=torch.tensor([[[0.,.25],[.5,0.]]]))
     action=dict(latent=torch.zeros(1,10,2,1,1))
-    rows=training_metadata(grid,layout,[0,2,0,2,0,64,0],latent,action,None,version=2)
+    rows=training_metadata(grid,layout,[0,2,0,2,0,64,0],latent,action,version=2)
     torch.testing.assert_close(rows["neoforce"][4:],tactile[0].permute(1,0,2,3).reshape(-1,3))
     torch.testing.assert_close(rows["contact_duration"][:2],torch.tensor([0.,.5]))
     torch.testing.assert_close(rows["contact_duration"][4:],torch.tensor([0.]*16+[.5]*16+[.25]*16+[0.]*16))
