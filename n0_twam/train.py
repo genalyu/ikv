@@ -49,6 +49,15 @@ from dataset.bucket_sampler import WithinUpdateDistributedSampler
 import gc
 
 
+def _make_train_sampler(dataset, config, grouped, accumulation_steps):
+    if config.world_size == 1 and not getattr(config, "save_training_state", False):
+        return None
+    cls = WithinUpdateDistributedSampler if grouped else DistributedSampler
+    options = {"accumulation_steps": accumulation_steps} if grouped else {}
+    return cls(dataset, num_replicas=config.world_size, rank=config.rank,
+               shuffle=True, seed=getattr(config, "seed", 42), **options)
+
+
 class Trainer:
     @staticmethod
     def _validate_rgb_motion_training_config(config):
@@ -290,16 +299,9 @@ class Trainer:
                     f"batches/rank across {config.world_size} ranks."
                 )
         else:
-            sampler_class = WithinUpdateDistributedSampler if grouped else DistributedSampler
-            sampler_options = {"accumulation_steps": self.gradient_accumulation_steps} if grouped else {}
-            train_sampler = sampler_class(
-                train_dataset,
-                num_replicas=config.world_size,
-                rank=config.rank,
-                shuffle=True,
-                seed=getattr(config, 'seed', 42)
-                **sampler_options,
-            ) if config.world_size > 1 or getattr(config, 'save_training_state', False) else None
+            train_sampler = _make_train_sampler(
+                train_dataset, config, grouped, self.gradient_accumulation_steps
+            )
             self.train_loader = DataLoader(
                 train_dataset,
                 batch_size=config.batch_size,

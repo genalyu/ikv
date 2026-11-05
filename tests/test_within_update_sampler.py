@@ -52,3 +52,15 @@ def test_resume_rejects_different_layout_before_loading_shards(tmp_path):
     )))
     with pytest.raises(ValueError, match="ikv_sampler_layout mismatch"):
         load_training_state(SimpleNamespace(config=cfg), tmp_path)
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_trainer_builds_rank_sampler_with_requested_seed(grouped):
+    from n0_twam.train import _make_train_sampler
+    cfg = SimpleNamespace(world_size=8, rank=3, seed=17, save_training_state=True)
+    data = Pool(1059)
+    actual = _make_train_sampler(data, cfg, grouped, 4)
+    cls = WithinUpdateDistributedSampler if grouped else DistributedSampler
+    opts = {"accumulation_steps": 4} if grouped else {}
+    expected = cls(data, num_replicas=8, rank=3, seed=17, **opts)
+    assert list(actual) == list(expected)

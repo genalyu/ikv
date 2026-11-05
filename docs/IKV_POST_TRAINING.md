@@ -291,3 +291,5 @@ weights, retention formula and optimizer cadence stay unchanged. A complete
 checkpoint records the sampler layout and refuses an incompatible resume.
 This flag is independent of `IKV_COMPACT_ATTENTION`, which executes the same
 retained-key visibility with packed attention.
+
+The trainer passes the same configured shuffle seed to both sampler layouts.
