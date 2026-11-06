@@ -151,6 +151,8 @@ def prepare(task, stage, device, dry_run):
     ]
     if task["robot"].get("arms", 1) == 2:
         pool.append("--dual-arm")
+    if task["robot"].get("action_representation") == "absolute_eef_rot6d":
+        pool.append("--physical-rot6d")
     for name in ("convert", "rgb", "tactile", "features", "pool"):
         if name == "tactile" and task.get("rgb_only", False):
             continue
@@ -196,7 +198,12 @@ def snapshot(task, mode, world_size, destination):
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip()
     (dest / 'provenance.json').write_text(json.dumps(dict(core_commit=commit, hashes=hashes, official_revision=OFFICIAL_REVISION, effective_batch=world_size * cfg.batch_size * cfg.gradient_accumulation_steps, task_fingerprint=fingerprint(task)), indent=2))
     serve = dict(kv_cache_policy=cfg.kv_cache_policy, use_ikv_training=cfg.use_ikv_training, obs_cam_keys=cfg.obs_cam_keys, tactile_keys=cfg.tactile_keys, used_action_channel_ids=cfg.used_action_channel_ids, eval_prompt=cfg.eval_prompt, action_delta_mode='none', pi05_action_horizon=12, action_per_frame=12, use_local_tactile=True, local_tactile_mode='current', tactile_global_zero=False, norm_stat=cfg.norm_stat, ikv_train_capacity=cfg.ikv_train_capacity, kv_retention=dict(cfg.kv_retention), kv_index_dino_online=cfg.use_ikv_training, kv_semantic_encoder=dict(getattr(cfg, 'kv_semantic_encoder', {}) or {}), kv_semantic_provenance=getattr(cfg, 'kv_semantic_provenance', None), kv_index_dino_model_name_or_path=None, inverse_used_action_channel_ids=cfg.inverse_used_action_channel_ids, tactile_sensor_id_map=dict(cfg.tactile_sensor_id_map), action_norm_method=cfg.action_norm_method, norm_stat_path=cfg.norm_stat_path)
-    (dest / 'serve_overrides.json').write_text(json.dumps(serve, indent=2))
+    # Export the effective bounds, including upgrades of legacy percentile files.
+    effective_path = dest / "norm_stat_effective.json"
+    effective_path.write_text(json.dumps(cfg.norm_stat, indent=2))
+    serve.update(norm_stat_path=str(effective_path), per_repo_norm_stat=cfg.per_repo_norm_stat,
+                 per_repo_used_action_channel_ids=getattr(cfg, "per_repo_used_action_channel_ids", {}))
+    (dest / "serve_overrides.json").write_text(json.dumps(serve, indent=2))
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)

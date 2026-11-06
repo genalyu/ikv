@@ -81,6 +81,7 @@ def save_training_state(trainer, directory):
             ikv_train_sample_capacity=bool(getattr(trainer.config, "ikv_train_sample_capacity", False)),
             ikv_train_min_capacity=int(getattr(trainer.config, "ikv_train_min_capacity", 0)),
             ikv_sampler_layout=getattr(trainer.config, "ikv_sampler_layout", "standard"),
+            action_contract_fingerprint=getattr(trainer.config, "action_contract_fingerprint", None),
             step=trainer.step,
         )
         temp = directory / "complete.tmp"
@@ -101,6 +102,7 @@ def load_training_state(trainer, directory):
         ikv_train_sample_capacity=bool(getattr(trainer.config, "ikv_train_sample_capacity", False)),
         ikv_train_min_capacity=int(getattr(trainer.config, "ikv_train_min_capacity", 0)),
         ikv_sampler_layout=getattr(trainer.config, "ikv_sampler_layout", "standard"),
+        action_contract_fingerprint=getattr(trainer.config, "action_contract_fingerprint", None),
     )
     legacy_defaults = {"ikv_train_execution": "recurrent",
                        "ikv_train_sample_capacity": False,

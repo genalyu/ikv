@@ -540,6 +540,13 @@ class LatentLeRobotDataset(LeRobotDataset):
         required_action_num = latent_frame_num * frame_stride * 4
 
         action = action[:required_action_num]
+        # The inverse layout maps unused channels to the first padding column.
+        # Single-arm converters may already store a 20-column padded vector.
+        used = getattr(self, "used_action_channel_ids", None)
+        if used:
+            if action.shape[1] < len(used):
+                raise ValueError("Action vector is narrower than its configured channel layout")
+            action = action[:, :len(used)]
         action_mask = np.ones_like(action, dtype='bool')
         assert action.shape[0] == required_action_num
 

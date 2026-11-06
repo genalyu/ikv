@@ -31,3 +31,19 @@ def fit_eef20_bounds(actions):
                 rotation_ids=ROTATION_IDS, position_ids=POSITION_IDS,
                 gripper_ids=GRIPPER_IDS,
                 note="Bounds stored in legacy q01/q99 fields; these are physical/workspace bounds, not percentiles")
+
+
+def absolute_rotation_bounds(stats, arms):
+    """Use the physical range for rotation matrix entries of each active arm."""
+    if arms not in (1, 2):
+        raise ValueError("Expected one or two arms")
+    lower, upper = (np.array(stats[k], dtype=float, copy=True) for k in ("q01", "q99"))
+    if lower.shape != (20,) or upper.shape != (20,):
+        raise ValueError("Expected 20 action bounds")
+    for arm in range(arms):
+        rotation = slice(10 * arm + 3, 10 * arm + 9)
+        lower[rotation], upper[rotation] = -1., 1.
+    if not (np.isfinite(lower).all() and np.isfinite(upper).all() and (lower < upper).all()):
+        raise ValueError("Non-finite or degenerate action bounds")
+    return {**stats, "q01": lower.tolist(), "q99": upper.tolist(),
+            "rotation_normalization": "physical_rot6d_v1"}
