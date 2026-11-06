@@ -167,6 +167,9 @@ def training_config(task, mode, world_size, *, require_ready=True):
         cfg.per_repo_obs_cam_keys = {child["name"]: item.obs_cam_keys for child, item in zip(children, configs)}
         cfg.per_repo_tactile_keys = {child["name"]: item.tactile_keys for child, item in zip(children, configs)}
         cfg.per_repo_used_action_channel_ids = {child["name"]: item.used_action_channel_ids for child, item in zip(children, configs)}
+        cfg.action_contract_fingerprint = fingerprint({
+            child["name"]: item.action_contract_fingerprint for child, item in zip(children, configs)
+        })
         cfg.expected_dataset_count = len(children)
         cfg.task_fingerprint = fingerprint(task)
         cfg.update(task.get("training", {}))
@@ -272,6 +275,13 @@ def training_config(task, mode, world_size, *, require_ready=True):
         raise FileNotFoundError(f"Run prepare --stage pool first: {norm}")
     if norm.exists():
         cfg.norm_stat = json.loads(norm.read_text())
+        if robot.get("action_representation") == "absolute_eef_rot6d":
+            from .normalization import absolute_rotation_bounds
+            cfg.norm_stat = absolute_rotation_bounds(cfg.norm_stat, robot.get("arms", 1))
+    cfg.action_contract_fingerprint = fingerprint(dict(
+        layout="active_source_columns_v1", channels=cfg.used_action_channel_ids,
+        q01=list(cfg.norm_stat["q01"]), q99=list(cfg.norm_stat["q99"]),
+    ))
     cfg.per_repo_norm_stat = {}
     cfg.task_fingerprint = fingerprint(task)
     cfg.task_mode = mode

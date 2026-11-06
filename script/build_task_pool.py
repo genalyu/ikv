@@ -98,7 +98,11 @@ def main() -> None:
     ap.add_argument("--anchor-cam", default=None,
                     help="camera key whose latents define the anchor grid "
                          "(default: first non-tactile video key in meta/info.json)")
+    ap.add_argument("--physical-rot6d", action="store_true",
+                    help="Use physical rotation bounds for absolute EEF actions")
     args = ap.parse_args()
+    if args.physical_rot6d and args.mode != "absee":
+        ap.error("--physical-rot6d requires --mode absee")
 
     # resolve() is load-bearing: symlink_to() writes the given path verbatim, so a
     # relative dataset root would create dangling train/<repo> links (num_samples=0).
@@ -167,6 +171,10 @@ def main() -> None:
             f"channels floored to span 1e-3: {floored}; unused dims neutral [-1,1]."
         ),
     }
+    if args.physical_rot6d:
+        from n0_twam.task_pipeline.normalization import absolute_rotation_bounds
+        norm = absolute_rotation_bounds(norm, 2 if args.dual_arm else 1)
+        norm["note"] = "Active rot6d entries use physical [-1,1]; other channels retain fitted bounds."
     pool.mkdir(parents=True, exist_ok=True)
     (pool / f"{stem}.json").write_text(json.dumps(norm, indent=2))
     (pool / f"{stem}_per_robot.json").write_text(
@@ -183,6 +191,7 @@ def main() -> None:
         "floored_channels": floored,
         "source_action_dim": source_action_dim,
         "used_dim": used,
+        "physical_rot6d": args.physical_rot6d,
         "anchor_cam": anchor_cam,
     }
     (pool / f"{stem}_raw_report.json").write_text(json.dumps(report, indent=2))

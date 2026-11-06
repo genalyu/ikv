@@ -71,6 +71,8 @@ def _load_trainer_class():
     wandb.login = lambda *args, **kwargs: None
     wandb.init = lambda *args, **kwargs: None
 
+    from n0_twam.dataset import bucket_sampler
+
     stubs = {
         "configs": configs,
         "distributed": distributed,
@@ -80,6 +82,7 @@ def _load_trainer_class():
         "models.utils": models_utils,
         "utils": utils,
         "dataset": dataset,
+        "dataset.bucket_sampler": bucket_sampler,
         "wandb": wandb,
     }
     spec = importlib.util.spec_from_file_location(

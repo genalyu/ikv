@@ -212,6 +212,8 @@ def prepare(task, stage, device, dry_run):
     ]
     if task["robot"].get("arms", 1) == 2:
         pool.append("--dual-arm")
+    if task["robot"].get("action_representation") == "absolute_eef_rot6d":
+        pool.append("--physical-rot6d")
     for name in ("convert", "rgb", "tactile", "features", "pool"):
         if name == "tactile" and task.get("rgb_only", False):
             continue
@@ -319,6 +321,11 @@ def snapshot(task, mode, world_size, destination):
         action_norm_method=cfg.action_norm_method,
         norm_stat_path=cfg.norm_stat_path,
     )
+    # Export the effective bounds, including upgrades of legacy percentile files.
+    effective_path = dest / "norm_stat_effective.json"
+    effective_path.write_text(json.dumps(cfg.norm_stat, indent=2))
+    serve.update(norm_stat_path=str(effective_path), per_repo_norm_stat=cfg.per_repo_norm_stat,
+                 per_repo_used_action_channel_ids=getattr(cfg, "per_repo_used_action_channel_ids", {}))
     (dest / "serve_overrides.json").write_text(json.dumps(serve, indent=2))
 
 

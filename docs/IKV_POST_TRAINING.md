@@ -293,3 +293,17 @@ This flag is independent of `IKV_COMPACT_ATTENTION`, which executes the same
 retained-key visibility with packed attention.
 
 The trainer passes the same configured shuffle seed to both sampler layouts.
+
+
+### Absolute EEF action layout and normalized loss
+
+For absolute EEF rotation-6D tasks, the resolved training and serving configs
+use physical bounds [-1, 1] for the six rotation entries of each active arm.
+This also upgrades old percentile pool statistics in memory. Other dimensions
+retain the task's fitted bounds. Positions and grippers are not silently clipped.
+A single-arm trajectory supervises 10 packed source columns, even in a
+20-column Parquet file. Dual-arm trajectories supervise all 20. The same mask
+is applied to the measured cold seed and subsequent actions. Tensor losses now
+average over the actual active channels. The effective bounds and active
+channel layout are part of the checkpoint resume contract. Use a new run
+when either differs; compare task space metrics separately from normalized MSE.
