@@ -17,3 +17,7 @@ reference_logit_weight: 0.01
 epochs: 1
 max_updates: 1000
 seed: 42
+
+sensitivity_ema_decay: 0.95
+sensitivity_weight_min: 0.25
+sensitivity_weight_max: 4.0

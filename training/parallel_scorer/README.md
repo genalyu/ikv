@@ -348,3 +348,19 @@ and 1 / 2 / 3 heads (head dimension 64). Interaction counts are 66,752 /
 All-history attention, regression/ranking supervision, and resume semantics remain unchanged.
 Memory-only experiments must preserve episode splits and report per-task Top-k and
 early-evidence retention, not interpret teacher agreement as closed-loop success.
+
+
+## Sensitivity-weighted RL
+The four candidate rewards share target/noise/budgets. Query sensitivity is
+their population standard deviation (equivalently that of normalized FM loss).
+Within each actual accumulation batch, detached weights are
+clip(D / max(previous_EMA, 1e-4), 0.25, 4), then normalized to sum to one.
+The first batch uses its mean D as reference; after weighting, the reference
+updates with EMA decay 0.95. Policy losses use these fractions; centered-logit
+SFT anchors remain uniformly averaged. The runner collects rewards before
+recomputing one scorer graph at a time. This changes gradient contributions,
+not sampling frequency or trajectory horizon. With a one-query batch the
+weight cancels. Log fields: sensitivity, query_weight, query_fraction,
+sensitivity_ema and unique_sets. Checkpoints include sensitivity_reference;
+the existing runner still does not implement full optimizer/data resume.
+This is sensitivity under sampled noise, not proof of task-critical memory.

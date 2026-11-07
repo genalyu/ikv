@@ -51,3 +51,24 @@ def group_loss(logits,modalities,paths,old_logprob,rewards,clip=.2,std_floor=1e-
     ratio=(new-old_logprob).clamp(-20,20).exp()
     loss=-torch.minimum(ratio*advantage,ratio.clamp(1-clip,1+clip)*advantage).mean()
     return loss
+
+
+class SensitivityWeights:
+    """Detached query weighting; one shared pre-update EMA per frame batch."""
+    def __init__(self, decay=.95, minimum=.25, maximum=4., epsilon=1e-4):
+        if not 0 <= decay < 1 or not 0 < minimum <= maximum or epsilon <= 0:
+            raise ValueError("Invalid sensitivity weighting configuration")
+        self.decay, self.minimum, self.maximum, self.epsilon = decay, minimum, maximum, epsilon
+        self.reference = None
+
+    def weights(self, reward_groups):
+        with torch.no_grad():
+            rewards = torch.as_tensor(reward_groups, dtype=torch.float32)
+            if rewards.ndim != 2 or rewards.shape[0] == 0 or rewards.shape[1] < 2 or not torch.isfinite(rewards).all():
+                raise ValueError("Finite nonempty reward groups required")
+            spread = rewards.std(dim=1, unbiased=False)
+            mean = float(spread.mean())
+            reference = mean if self.reference is None else self.reference
+            weights = (spread / max(reference, self.epsilon)).clamp(self.minimum, self.maximum)
+            self.reference = mean if self.reference is None else self.decay*self.reference+(1-self.decay)*mean
+            return weights / weights.sum(), spread, weights

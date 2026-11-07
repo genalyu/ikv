@@ -10,7 +10,7 @@ from copy import deepcopy
 import torch
 from .model import load_scorer,save_scorer
 from .data import load_record,arguments
-from .rl import sample_modalities,path_logprob,group_loss
+from .rl import sample_modalities,path_logprob,group_loss,SensitivityWeights
 from training.qwen_scorer.grpo.train import build_reward
 
 def native_domain(packet,record,prepared,patch):
@@ -78,11 +78,16 @@ def main():
     accumulation=int(cfg.get("gradient_accumulation_frames",4))
     if accumulation<1:raise ValueError("Invalid accumulation")
     (out/"config.json").write_text(json.dumps(cfg,indent=2))
+    sensitivity=SensitivityWeights(
+        decay=cfg.get("sensitivity_ema_decay",.95),
+        minimum=cfg.get("sensitivity_weight_min",.25),
+        maximum=cfg.get("sensitivity_weight_max",4.))
     updates=0
     for epoch in range(cfg.get("epochs",1)):
         rng.shuffle(rows)
         for begin in range(0,len(rows),accumulation):
             group=rows[begin:begin+accumulation];optimizer.zero_grad(set_to_none=True)
+            pending=[]
             for r in group:
                 packet=load_record(r,info["encoder_revision"])
                 args=arguments(packet,device)
@@ -101,6 +106,10 @@ def main():
                     v,t=native_scores(path,maps)
                     value,detail,selected=reward.evaluate(prepared,v,budgets,t if len(t) else None)
                     rewards.append(value)
+                pending.append((r,packet,index,modes,paths,old,ref,rewards))
+            fractions,spreads,raw_weights=sensitivity.weights([item[-1] for item in pending])
+            for query_index,(r,packet,index,modes,paths,old,ref,rewards) in enumerate(pending):
+                args=arguments(packet,device)
                 model.train()
                 with torch.autocast("cuda",dtype=torch.bfloat16,enabled=device.startswith("cuda")):
                     new=model(**args).float()[index]
@@ -110,14 +119,17 @@ def main():
                 for m in (0,1):
                     x=new[modes==m];y=ref[modes==m]
                     if len(x):anchor=anchor+((x-x.mean())-(y-y.mean())).square().mean()
-                loss=loss+cfg.get("reference_logit_weight",.01)*anchor
-                (loss/len(group)).backward()
+                policy_loss=loss
+                loss=fractions[query_index].to(device)*policy_loss+cfg.get("reference_logit_weight",.01)*anchor/len(group)
+                loss.backward()
                 with (out/"metrics.jsonl").open("a") as f:
                     f.write(json.dumps(dict(id=r["id"],update=updates,rewards=rewards,
-                       loss=float(loss.detach()),unique_sets=len({tuple(sorted(torch.cat(p).tolist())) for p in paths})))+"\n")
+                       loss=float(loss.detach()),sensitivity=float(spreads[query_index]),
+                       query_weight=float(raw_weights[query_index]),query_fraction=float(fractions[query_index]),
+                       sensitivity_ema=sensitivity.reference,unique_sets=len({tuple(sorted(torch.cat(p).tolist())) for p in paths})))+"\n")
             norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.)
             if not torch.isfinite(norm):raise FloatingPointError("Nonfinite RL gradient")
             optimizer.step();updates+=1
-            save_scorer(model,out/f"scorer-{updates}.pt",encoder_revision=info["encoder_revision"])
+            save_scorer(model,out/f"scorer-{updates}.pt",encoder_revision=info["encoder_revision"],sensitivity_reference=sensitivity.reference)
             if updates>=cfg.get("max_updates",2**31):return
 if __name__=="__main__":main()
