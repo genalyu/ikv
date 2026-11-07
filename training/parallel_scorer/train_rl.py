@@ -189,8 +189,8 @@ def main():
                     summary['fm/'+modality]=sum(d[modality] for a in all_audits for d in a['fm'])/(4*len(all_audits))
                 with (out/"updates.jsonl").open("a") as f:f.write(json.dumps(summary)+"\n")
                 print(json.dumps(summary),flush=True)
-                if wb:wb.log(summary,step=updates)
-                if updates%cfg.get("save_every",10)==0 or updates==cfg.get("max_updates"):
+                if wb:wb.log(summary,step=updates,commit=True)
+                if updates==1 or updates%cfg.get("save_every",10)==0 or updates==cfg.get("max_updates"):
                     save_scorer(model,out/f"scorer-{updates}.pt",encoder_revision=info["encoder_revision"],
                         sensor_to_id=info.get("sensor_to_id"),sensitivity_reference=sensitivity.reference)
                     torch.save(dict(update=updates,optimizer=optimizer.state_dict(),
