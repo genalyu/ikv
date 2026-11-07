@@ -364,3 +364,45 @@ weight cancels. Log fields: sensitivity, query_weight, query_fraction,
 sensitivity_ema and unique_sets. Checkpoints include sensitivity_reference;
 the existing runner still does not implement full optimizer/data resume.
 This is sensitivity under sampled noise, not proof of task-critical memory.
+
+
+### NeoSim frozen-model RL
+
+`train_rl` accepts `n0_resolved_config` to reuse a trained N0 configuration,
+including its modality capacities and FM schedules. For a checkpoint with local
+ tactile enabled, explicitly set `local_tactile_reward_mode: last_observed`.
+The final action attends only the local tactile patches of the last observed
+frame; target local tactile is zeroed and excluded by the attention mask.
+Contact-gate checkpoints remain unsupported. This constraint prevents a direct
+future-touch shortcut and prevents the local branch from exposing all history.
+It does not turn offline FM improvement into demonstrated task success.
+
+Native maps may contain four scorer-row addresses per native token. Their logits
+are averaged before sampling: repeat one address four times for the matching
+video 8x8 grid; use the corresponding 2x2 scorer cells for tactile's 4x4 grid.
+Rows corresponding to the prediction target must contain only -1.
+`scorer_bank` records reuse a pinned SFT feature bank, with all stored raw frames
+through the query and the same sensor IDs, RGB preprocessing and text embedding.
+Prepare and verify bank hashes and causal latent anchor metadata before launching.
+
+Launch multiple GPUs using `torchrun --standalone --nproc_per_node=8 -m
+training.parallel_scorer.train_rl --config ...`. Each rank owns one frozen N0
+replica and one scorer, evaluates four candidates per query, and accumulates
+`gradient_accumulation_frames` queries. Gradients are averaged across ranks.
+Sensitivity weights are normalized across **all ranks' queries** before backward;
+its EMA is identical on every rank. Distributed incomplete batches are dropped.
+The reference-logit penalty remains an unweighted query average. W&B can be
+configured with `wandb: {enabled: true, project: ..., name: ...}`; supply credentials
+through the environment, never through a tracked config. Rank zero logs optimizer
+updates online and saves the scorer; each rank keeps detailed local JSONL metrics.
+
+Prepare with `python -m training.parallel_scorer.prepare_neosim_rl --sft-root
+SFT_RUN --n0-root N0_TASK_ROOT --output NEW_DIRECTORY`. The preparer verifies
+bank hashes, video source identity and stored causal latent anchors. It preserves
+SFT episode splits. `held_out_manifest` adds a train/validation episode-overlap
+check at launch; training does not automatically compute held-out metrics.
+The first distributed update records an exact all-rank parameter-hash check.
+Per-query logs include the shared noise seed, time index, modality losses and
+budget. W&B reports their all-rank aggregates. Scorer checkpoints retain sensor
+IDs; optimizer snapshots are saved alongside periodic checkpoints, but exact
+mid-epoch resume is not implemented.

@@ -58,6 +58,9 @@ def check_disjoint(train,validation):
 
 
 def load_record(record,revision=None):
+    if "scorer_bank" in record:
+        from .rl_bank import load_bank
+        return load_bank(record,revision)
     if "episode_features" in record:
         from .episode_cache import episode_packet
         return episode_packet(record,revision)

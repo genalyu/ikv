@@ -86,3 +86,33 @@ def test_submillion_scorers(name,width,heads,count):
     y.square().mean().backward()
     assert torch.isfinite(y).all()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())
+
+
+def test_native_tactile_area_mapping_backpropagates_to_four_cells():
+    from training.parallel_scorer.train_rl import native_domain
+    packet=dict(features=torch.zeros(6,2),modalities=torch.tensor([0,0,1,1,1,1]))
+    record=dict(query_frame=0,target_raw_frame=1,alignment_provenance='verified',
+        video_candidate_map=[0,-1],tactile_candidate_map=[[2,3,4,5],[-1]*4])
+    prepared=dict(latent_dict=dict(targets=torch.zeros(1,1,2,1,1)),
+        action_dict=dict(tactile_global_targets=torch.zeros(1,1,1,2,1,1)))
+    index,modes,_=native_domain(packet,record,prepared,(1,1,1))
+    logits=torch.arange(6,dtype=torch.float32,requires_grad=True)
+    native=logits[index].mean(-1)
+    assert native.tolist()==[0.,3.5]
+    native[modes==1].sum().backward()
+    torch.testing.assert_close(logits.grad,torch.tensor([0.,0.,.25,.25,.25,.25]))
+
+
+def test_distributed_sensitivity_gradient_matches_global_objective():
+    from training.parallel_scorer.rl import SensitivityWeights
+    rewards=[[0.,1.,2.,3.],[0.,.1,.2,.3],[2.,2.,2.,2.],[0.,2.,4.,6.]]
+    weights,_,_=SensitivityWeights().weights(rewards)
+    x=torch.tensor(2.,requires_grad=True)
+    losses=torch.tensor([1.,4.,2.,3.])*x*x
+    global_gradient=torch.autograd.grad((weights*losses).sum()+.01*losses.mean(),x,retain_graph=True)[0]
+    local=[]
+    for rank in range(2):
+        sl=slice(rank*2,(rank+1)*2)
+        objective=2*(weights[sl]*losses[sl]).sum()+.01*losses[sl].mean()
+        local.append(torch.autograd.grad(objective,x,retain_graph=True)[0])
+    torch.testing.assert_close(torch.stack(local).mean(),global_gradient)

@@ -502,14 +502,14 @@ class LatentLeRobotDataset(LeRobotDataset):
     def _cat_video_latents(self, data_dict):
         latent_lst = []
         reference_key = self.used_video_keys[0]
-        reference_frame_ids = None.flatten()
+        reference_frame_ids = torch.as_tensor(data_dict[f'{reference_key}.frame_ids']).flatten()
         reference_latent_frames = int(data_dict[f'{reference_key}.latent_num_frames'])
         for key in self.used_video_keys:
             latent = data_dict[f'{key}.latent']
             latent_num_frames = data_dict[f'{key}.latent_num_frames']
             if int(latent_num_frames) != reference_latent_frames:
                 raise ValueError(f'Video cameras must have identical WAN latent frame counts: {reference_key}={reference_latent_frames}, {key}={int(latent_num_frames)}')
-            camera_frame_ids = None.flatten()
+            camera_frame_ids = torch.as_tensor(data_dict[f'{key}.frame_ids']).flatten()
             if not torch.equal(camera_frame_ids, reference_frame_ids):
                 raise ValueError(f'Video camera latent frame_ids are not aligned: {key!r} differs from {reference_key!r}; width-concatenating them would pair different source times')
             latent_height = data_dict[f'{key}.latent_height']
@@ -693,6 +693,23 @@ class LatentLeRobotDataset(LeRobotDataset):
         hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
+        if getattr(self.config, 'use_ikv_training', False) and getattr(self.config, 'ikv_index_root_name', None):
+            from n0_twam.dataset.ikv_index import load_dense_index
+            patch = tuple(self.config.patch_size)
+            _, height, width, _ = out_dict['latents'].shape
+            index_path = (self.root / self.config.ikv_index_root_name /
+                          f"chunk-{episode_index // int(self.meta.info.get('chunks_size', 1000)):03d}" /
+                          f'episode_{episode_index:06d}_{local_start_frame}_{local_end_frame}.pth')
+            dense = load_dense_index(index_path, camera_keys=self.used_video_keys,
+                patch_size=patch, grid_shape=(height // patch[1], width // patch[2]),
+                latent_frame_ids=ori_data_dict[f'{self.used_video_keys[0]}.frame_ids'],
+                full_frames=int(num_latent_frames), start=start_lat, end=end_lat,
+                semantic_expected=(getattr(self.config, 'per_repo_semantic_provenance', {}) or {}).get(
+                    self.repo_name, getattr(self.config, 'kv_semantic_provenance', None)),
+                require_task=bool(dict(self.config.kv_retention).get('task_weight', 0)),
+                tactile_keys=self.used_tactile_keys)
+            out_dict.update(dense)
+            out_dict['dense_dino_features'] = dense['dino_features']
         if self.has_tactile_condition and self.used_tactile_keys:
             tactile_payload = self._load_tactile_latents(episode_index=episode_index, local_start_frame=local_start_frame, local_end_frame=local_end_frame, latent_frame_ids=latent_frame_ids, truncate_start=start_lat, truncate_end=end_lat, expected_full_frames=int(num_latent_frames))
             if tactile_payload is None and (not self.tactile_optional):

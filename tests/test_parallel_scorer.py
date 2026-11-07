@@ -110,7 +110,8 @@ def test_native_map_and_sampled_set_match():
     prepared=dict(latent_dict=dict(targets=torch.zeros(1,1,3,1,1)),
                   action_dict=dict(tactile_global_targets=torch.zeros(1,1,1,3,1,1)))
     index,mods,maps=native_domain(packet,record,prepared,(1,1,1))
-    assert index.tolist()==[0,1,2,3]
+    assert index[:,0].tolist()==[0,1,2,3]
+    assert torch.equal(index,index[:,:1].expand(-1,4))
     values=native_scores([torch.tensor([1]),torch.tensor([2])],maps)
     assert values[0].tolist()==[0,1,0] and values[1].tolist()==[1,0,0]
     record["video_candidate_map"]=[0,-1,-1]

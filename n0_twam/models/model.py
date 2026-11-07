@@ -1635,6 +1635,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             local_attn_mask = None
             if prepared.get('tactile_grid_shape') is not None:
                 local_attn_mask = self._local_tactile_causal_mask(action_dict['noisy_latents'].shape, prepared['tactile_grid_shape'], input_dict['chunk_size'], device=action_hidden_states.device)
+            scorer_query = (input_dict.get('ikv_training') or {}).get('scorer_query', {})
+            if 'local_tactile_observed_frame' in scorer_query:
+                from training.qwen_scorer.grpo.local_tactile import observed_local_mask
+                local_attn_mask = observed_local_mask(
+                    action_dict['noisy_latents'].shape, prepared['tactile_grid_shape'],
+                    scorer_query['local_tactile_observed_frame'], action_hidden_states.device)
             action_hidden_states = self._apply_local_tactile_cross_attn(action_hidden_states, prepared['local_tactile_tokens'], attn_mask=local_attn_mask)
         if prepared['tactile_zero_anchor'] is not None:
             action_hidden_states = action_hidden_states + prepared['tactile_zero_anchor'].to(action_hidden_states.dtype)

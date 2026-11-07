@@ -13,7 +13,7 @@ from test_global_kv_retention import tiny_model
 def test_query_support_is_causal_fixed_budget_and_changes_selection():
     *_, memory = case()
     memory["splits"] = [4,4,2,2,2,2,0]
-    memory["config"].update(capacity=4, retention=dict(
+    memory["config"].update(capacity=4, retention=dict(version=2,video_capacity=2,action_capacity=1,tactile_capacity=1,persistence_weight=0.,class_recency_weight=0.,
         query_weight=0.,action_query_weight=0.,tactile_query_weight=0.))
     plain = build_ikv_support_plan(deepcopy(memory),torch.device("cpu"))
     memory["config"]["scorer_query"] = dict(target_phase=2,video_scores=[1.,9.,0.,0.],
@@ -38,15 +38,16 @@ def test_four_candidates_real_frozen_n0_and_original_fm():
     trainer=original_loss()
     reward=FMReward(trainer,model)
     data=training_input()
+    data["chunk_size"]=1
     data["ikv_training"]=dict(capacity=24, execution="masked", sample_capacity=False,
-                             retention=dict(query_weight=0.,action_query_weight=0.,
+                             retention=dict(version=2,video_capacity=8,action_capacity=8,tactile_capacity=8,persistence_weight=0.,class_recency_weight=0.,query_weight=0.,action_query_weight=0.,
                                             tactile_query_weight=0.))
     before={n:p.detach().clone() for n,p in model.named_parameters()}
     rewards=[];selected=[]
     for candidate in range(4):
         scores=torch.zeros(12)
-        scores[candidate]=100
-        r,losses,mask=reward.evaluate(data,scores,[1,4,19])
+        scores[candidate:candidate+4]=100
+        r,losses,mask=reward.evaluate(data,scores,[4,4,16])
         rewards.append(r);selected.append(tuple(mask))
         assert all(torch.isfinite(torch.tensor(v)) for v in losses.values())
     assert len(set(selected))==4
@@ -54,7 +55,7 @@ def test_four_candidates_real_frozen_n0_and_original_fm():
     assert all(p.grad is None and not p.requires_grad for p in model.parameters())
     for name,p in model.named_parameters():
         torch.testing.assert_close(p,before[name],rtol=0,atol=0)
-    repeated=reward.evaluate(data,torch.tensor([100.]+[0.]*11),[1,4,19])[0]
+    repeated=reward.evaluate(data,torch.tensor([100.]+[0.]*11),[4,4,16])[0]
     assert repeated==rewards[0]
     # Preparation is immutable between candidates.
     assert "scorer_query" not in data["ikv_training"]
@@ -62,9 +63,10 @@ def test_four_candidates_real_frozen_n0_and_original_fm():
 
 def test_final_frame_loss_ignores_historical_targets():
     data=training_input()
+    data["chunk_size"]=1
     model=tiny_model(False).to(torch.bfloat16)
     data["ikv_training"]=dict(capacity=24,execution="masked",
-                             retention=dict(query_weight=0.,action_query_weight=0.,
+                             retention=dict(version=2,video_capacity=8,action_capacity=8,tactile_capacity=8,persistence_weight=0.,class_recency_weight=0.,query_weight=0.,action_query_weight=0.,
                                             tactile_query_weight=0.))
     with torch.no_grad():
         predictions=model(data,train_mode=True)
@@ -130,7 +132,7 @@ def test_fixed_time_preparation_reuses_real_trainer(monkeypatch):
     cfg.local_rank=0;cfg.enable_wandb=False;cfg.rank=0
     cfg.use_mot=True;cfg.use_ikv_training=True;cfg.ikv_train_capacity=24
     cfg.ikv_train_execution="masked";cfg.tactile_cfg_prob=0.
-    cfg.kv_retention=dict(query_weight=0.,action_query_weight=0.,tactile_query_weight=0.)
+    cfg.kv_retention=dict(version=2,video_capacity=8,action_capacity=8,tactile_capacity=8,persistence_weight=0.,class_recency_weight=0.,query_weight=0.,action_query_weight=0.,tactile_query_weight=0.)
     trainer=Trainer(cfg,inference_only=True)
     trainer.device=torch.device("cpu");trainer.dtype=torch.bfloat16
     trainer.patch_size=(1,2,2)
@@ -156,16 +158,17 @@ def test_clean_target_cannot_leak_into_reward():
     model=tiny_model(False).to(torch.bfloat16)
     reward=FMReward(original_loss(),model)
     data=training_input()
+    data["chunk_size"]=1
     data["ikv_training"]=dict(capacity=24, execution="masked",
-                             retention=dict(query_weight=0.,action_query_weight=0.,
+                             retention=dict(version=2,video_capacity=8,action_capacity=8,tactile_capacity=8,persistence_weight=0.,class_recency_weight=0.,query_weight=0.,action_query_weight=0.,
                                             tactile_query_weight=0.))
     scores=torch.arange(12).float()
-    before=reward.evaluate(data,scores,[1,4,19])[0]
+    before=reward.evaluate(data,scores,[4,4,16])[0]
     changed=deepcopy(data)
     changed["latent_dict"]["latent"][:,:,-1:]+=100
     changed["action_dict"]["latent"][:,:,-1:]-=100
     changed["action_dict"]["tactile_global_clean_latent"][:,:,:,-1:]+=100
-    after=reward.evaluate(changed,scores,[1,4,19])[0]
+    after=reward.evaluate(changed,scores,[4,4,16])[0]
     assert before==after
 
 

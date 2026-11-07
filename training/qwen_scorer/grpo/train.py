@@ -20,7 +20,11 @@ def load_symbol(value):
 def build_reward(config):
     from n0_twam.train import Trainer
     from n0_twam.models.utils import load_mot_checkpoint
-    cfg = deepcopy(load_symbol(config["n0_config"]))
+    if "n0_resolved_config" in config:
+        from easydict import EasyDict
+        cfg = EasyDict(json.loads(Path(config["n0_resolved_config"]).read_text()))
+    else:
+        cfg = deepcopy(load_symbol(config["n0_config"]))
     cfg.enable_wandb = False
     cfg.rank = 0
     cfg.local_rank = torch.device(config["n0_device"]).index or 0
@@ -35,9 +39,11 @@ def build_reward(config):
     trainer.device = torch.device(config["n0_device"])
     model = load_mot_checkpoint(config["n0_checkpoint"], torch_dtype=torch.bfloat16,
                                 torch_device=config["n0_device"], attn_mode="flex")
-    if getattr(model, "use_local_tactile", False) or getattr(model, "use_contact_gate", False):
-        raise ValueError("Initial final-frame reward path requires local tactile/contact gate OFF; "
+    if getattr(model, "use_contact_gate", False):
+        raise ValueError("Final-frame reward path requires contact gate OFF; "
                          "otherwise current expert tactile could bypass history masking")
+    if getattr(model, "use_local_tactile", False) and config.get("local_tactile_reward_mode") != "last_observed":
+        raise ValueError("Local tactile reward requires explicit last_observed mode")
     return FMReward(trainer, model, config["reward_weights"], config["reward_scales"])
 
 

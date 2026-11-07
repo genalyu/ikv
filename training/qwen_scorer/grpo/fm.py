@@ -95,6 +95,10 @@ class FMReward:
                 ("video_capacity","action_capacity","tactile_capacity"), budgets))
         config["scorer_query"] = dict(target_phase=2*(frames-1),
                                      video_scores=video_scores, budgets=list(budgets))
+        if getattr(self.model, "use_local_tactile", False):
+            config["scorer_query"]["local_tactile_observed_frame"] = frames - 2
+            # Defense in depth: no target local tactile reaches the encoder.
+            case["action_dict"]["tactile_local_latent"][:, :, :, -1:] = 0
         if tactile_scores is not None:
             config["scorer_query"]["tactile_scores"] = tactile_scores
         # Capacity belongs to the historical pool; simultaneous noisy tokens are
