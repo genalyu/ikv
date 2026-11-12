@@ -106,9 +106,11 @@ class CPUKVArchive:
         scorer = copy(policy)
         scorer.device, scorer.data = torch.device("cpu"), data
         scorer.reference_dino = policy.reference_dino.cpu()
-        scorer.history = copy(policy.history)
-        for name in ("features", "duration", "last_time"):
-            setattr(scorer.history, name, getattr(policy.history, name).cpu())
+        for history_name in ("history", "tactile_history"):
+            history = copy(getattr(policy, history_name))
+            for name in ("features", "duration", "last_time"):
+                setattr(history, name, getattr(history, name).cpu())
+            setattr(scorer, history_name, history)
         scorer.tactile_scorer = None
         anchor, reference = policy.anchor_for(rows)
         if policy.config.score_backend == "qwen_sys2":

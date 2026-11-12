@@ -197,7 +197,7 @@ def training_config(task, mode, world_size, *, require_ready=True):
         if cfg.kv_retention.get('version', 2) != 2:
             raise ValueError('semantic patch scoring requires IKV retention version 2')
         cfg.kv_retention['task_weight'] = float(task.get('features', {}).get('task_weight', 1.0))
-        cfg.kv_retention['content_threshold'] = float(task.get('features', {}).get('content_threshold', 0.9))
+        cfg.kv_retention['content_threshold'] = float(task.get('features', {}).get('content_threshold', 0.75))
         manifest_path = paths(task)['dataset'] / 'features.json'
         if not manifest_path.is_file():
             raise FileNotFoundError('Build semantic features before training')
@@ -240,7 +240,7 @@ def training_config(task, mode, world_size, *, require_ready=True):
         raise ValueError('Unsupported training overrides')
     cfg.update(overrides)
     if task.get('rgb_only', False) and ikv:
-        cfg.kv_retention.update(video_capacity=3584, action_capacity=512, tactile_capacity=0, score_backend=task.get('features', {}).get('score_backend', 'formula'), persistence_weight=1.0, contact_weight=0.0, class_recency_weight=1.0, time_weight=0.0, visual_weight=0.0, query_weight=0.0, task_weight=1.0 if semantic_enabled else 0.0)
+        cfg.kv_retention.update(video_capacity=3584, action_capacity=512, tactile_capacity=0, score_backend=task.get('features', {}).get('score_backend', 'formula'), persistence_weight=0.0, contact_weight=1.0, class_recency_weight=1.0, time_weight=1.0, visual_weight=0.0, query_weight=0.0, task_weight=1.0 if semantic_enabled else 0.0)
     return cfg
 
 def source_inventory(source):

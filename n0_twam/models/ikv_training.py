@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from .multimodal_kv_retention import make_retention_policy
 from .global_kv_retention import GlobalKVRetention, RetentionConfig
+from .heuristic_score import sample_training_weights
 _HISTORY_DECISION_CACHE = {}
 
 def training_metadata(grid, layout, splits, latent, action, version=2):
@@ -131,6 +132,7 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
             source = positions[clean_positions]
             incoming = {k: v[source] for k, v in rows.items()}
             with torch.no_grad():
+                set_training_heuristic(policy, config, hidden.device, batch, stage)
                 # Do not let same-phase clean DINO/labels determine which past
                 # the noisy prediction can see. The anchor is committed history.
                 if retention.version == 2:
@@ -223,6 +225,20 @@ def run_ikv_training(mot, hidden, text, timestep, temb, rope, memory):
             zero_anchor = zero_anchor + dummy.sum() * 0.0
         result = result + zero_anchor
     return result
+
+def set_training_heuristic(policy, config, device, batch, stage):
+    """Sample eta outside attention/checkpoint recomputation.
+
+    Trainer enables sampling. Low-level callers may disable it for native
+    parity tests and deterministic scorer-reward evaluation.
+    """
+    if not config.get("sample_heuristic_weights", False):
+        policy.training_weights = None
+        return
+    weights = sample_training_weights(device=device)
+    policy.training_weights = weights
+    config.setdefault("sampled_heuristic_weights", {})[(int(batch), int(stage))] = weights.detach().cpu().tolist()
+
 
 def sample_ikv_capacity(memory, device, retention):
     """Draw K without consulting future token counts or feature values."""
@@ -337,6 +353,7 @@ def build_ikv_support_plan(memory, device, *, return_groups=False):
         else:
             provisional = dict(incoming,
                                observation_flag=torch.zeros_like(incoming["observation_flag"]))
+        set_training_heuristic(policy, config, device, 0, stage)
         new_slots, victims = policy.plan(occupied, len(source), incoming)
         _, noisy_victims = policy.plan(occupied, len(noisy_source), provisional)
         clean_keep = ~torch.isin(slots, victims)

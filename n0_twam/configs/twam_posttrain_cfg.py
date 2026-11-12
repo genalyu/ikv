@@ -45,7 +45,7 @@ cfg.ikv_train_capacity = _IKV_CAPACITY
 cfg.ikv_train_min_capacity = (_IKV_CAPACITY + 1) // 2 if _USE_IKV else 0
 cfg.ikv_index_root_name = _IKV_INDEX_ROOT
 cfg.kv_retention = dict(cfg.kv_retention)
-cfg.kv_retention.update(version=2, video_capacity=_IKV_VIDEO_CAPACITY, action_capacity=_IKV_ACTION_CAPACITY, tactile_capacity=_IKV_TACTILE_CAPACITY, query_weight=0.0, action_query_weight=0.0, tactile_query_weight=0.0, visual_weight=0.0, persistence_weight=0.0, persistence_scale=8.0, class_recency_weight=1.0, class_recency_scale=8.0, contact_scale=8.0, content_threshold=0.9, content_capacity=2048)
+cfg.kv_retention.update(version=2, video_capacity=_IKV_VIDEO_CAPACITY, action_capacity=_IKV_ACTION_CAPACITY, tactile_capacity=_IKV_TACTILE_CAPACITY, query_weight=0.0, action_query_weight=0.0, tactile_query_weight=0.0, visual_weight=0.0, persistence_weight=0.0, persistence_scale=8.0, class_recency_weight=1.0, class_recency_scale=8.0, contact_scale=8.0, content_threshold=0.75, content_capacity=2048)
 cfg.kv_semantic_encoder = {}
 cfg.kv_semantic_provenance = None
 cfg.kv_retention.setdefault('task_weight', 0.0)

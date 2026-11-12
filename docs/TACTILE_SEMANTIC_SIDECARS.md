@@ -1,7 +1,7 @@
 # Native tactile semantic sidecars
 
-Set `features.tactile_semantic_backend="dinov3"` with
-`formula_variant="screenshot_v1"` and `random_weight=0.1`.
+Set `features.tactile_semantic_backend="dinov3"` for native tactile content features. The sole heuristic uses the 0.75 prototype
+gate and no random score mixing; see [the formula contract](HEURISTIC_SPARSE_KV.md).
 
 The builder reads native tactile RGB, runs the same frozen DINO encoder used for
 visual indexing, and pools each sensor to a 4x4 grid matching 8x8 tactile VAE

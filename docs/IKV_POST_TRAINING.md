@@ -10,7 +10,10 @@ The observation encoder, temporal grid, teacher forcing, noise/LR schedules,
 trainable parameters, action/tactile targets and loss weights are shared. IKV
 changes historical condition visibility only. It does not discard current RGB patches.
 DINOv3 visual/tactile features remain independent index metadata. Contact duration
-and retention formulas are unchanged. See SCREENSHOT_HEURISTIC.md and
+uses world-time steps. Stage 1 samples independent Uniform[0,2] weights for
+recency/contact/prototype terms per masking decision, alongside the existing
+slot-quota sampler. Inference fixes all three weights at 1, with threshold 0.75
+and no score normalization or random mixing. See HEURISTIC_SPARSE_KV.md and
 TACTILE_SEMANTIC_SIDECARS.md.
 
 ## Task CLI

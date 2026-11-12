@@ -22,8 +22,8 @@ class RetentionConfig:
     archive_directory: str = ""
     version: int = 2
     score_backend: str = "formula"
-    formula_variant: str = "screenshot_v1"
-    random_weight: float = 0.1
+    formula_variant: str = "stage1_heuristic"
+    random_weight: float = 0.0
     sys2_endpoint: str = ""
     sys2_task: str = ""
     sys2_timeout: float = 300.0
@@ -39,7 +39,7 @@ class RetentionConfig:
     class_recency_scale: float = 8.0
     task_weight: float = 0.0
     contact_scale: float = 8.0
-    content_threshold: float = 0.9
+    content_threshold: float = 0.75
     content_capacity: int = 2048
     top_k: int = 128
     time_scale: float = 8.0
@@ -60,9 +60,9 @@ class RetentionConfig:
         if self.version != 2:
             raise ValueError("only multimodal retention version 2 is supported")
         if self.score_backend == "formula" and (
-                self.formula_variant != "screenshot_v1" or self.random_weight != 0.1
-                or self.class_recency_scale != 8 or self.content_threshold != 0.9):
-            raise ValueError("formula uses screenshot scoring with fixed 10% random mixing")
+                self.formula_variant != "stage1_heuristic" or self.random_weight != 0.0
+                or self.class_recency_scale != 8 or self.content_threshold != 0.75):
+            raise ValueError("formula uses stage1_heuristic: threshold 0.75, decay 8, no random mixing")
         if self.score_backend not in ("formula", "qwen_sys2"):
             raise ValueError("score_backend must be formula or qwen_sys2")
         if self.score_backend == "qwen_sys2":

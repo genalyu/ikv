@@ -274,7 +274,7 @@ class Trainer:
         if bool(getattr(self.config, 'use_ikv_training', False)):
             retention = dict(getattr(self.config, 'kv_retention', {}))
             execution = getattr(self.config, 'ikv_train_execution', 'recurrent')
-            input_dict['ikv_training'] = dict(capacity=self.config.ikv_train_capacity, retention=retention, execution=execution, block_size=int(getattr(self.config, 'ikv_train_block_size', 128)), compact_attention=bool(getattr(self.config, 'ikv_train_compact_attention', False)), compact_max_packed_keys=int(getattr(self.config, 'ikv_train_compact_max_packed_keys', 65536)), sample_capacity=bool(getattr(self.config, 'ikv_train_sample_capacity', False)), min_capacity=int(getattr(self.config, 'ikv_train_min_capacity', (self.config.ikv_train_capacity + 1) // 2)))
+            input_dict['ikv_training'] = dict(capacity=self.config.ikv_train_capacity, retention=retention, execution=execution, sample_heuristic_weights=True, block_size=int(getattr(self.config, 'ikv_train_block_size', 128)), compact_attention=bool(getattr(self.config, 'ikv_train_compact_attention', False)), compact_max_packed_keys=int(getattr(self.config, 'ikv_train_compact_max_packed_keys', 65536)), sample_capacity=bool(getattr(self.config, 'ikv_train_sample_capacity', False)), min_capacity=int(getattr(self.config, 'ikv_train_min_capacity', (self.config.ikv_train_capacity + 1) // 2)))
             if os.getenv('IKV_HISTORY_PLAN_CACHE', '0') == '1':
                 if int(getattr(self.config, 'max_latent_frames', 0)) > 0:
                     raise ValueError('IKV history decision cache requires full trajectories')

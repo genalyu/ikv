@@ -4,6 +4,7 @@ from array import array
 import torch
 import torch.nn.functional as F
 from .global_kv_retention import GlobalKVRetention, _max_cosine
+from .heuristic_score import heuristic_scores
 
 
 class ContentHistory:
@@ -162,6 +163,7 @@ class MultimodalKVRetention(GlobalKVRetention):
         self.data["contact_present"] = torch.zeros(capacity, dtype=torch.bool, device=self.device)
         self.history = ContentHistory(config, self.device)
         self.tactile_history = ContentHistory(config, self.device)
+        self.training_weights = None
         self._frame_clock = float("-inf")
         self._frames_since_management = 0
         self._managed_once = False
@@ -180,7 +182,8 @@ class MultimodalKVRetention(GlobalKVRetention):
         return (super().snapshot(), self.history.snapshot(),
                 None if self.archive is None else self.archive.snapshot(),
                 (self._frame_clock, self._frames_since_management, self._managed_once),
-                self.tactile_history.snapshot())
+                self.tactile_history.snapshot(),
+                None if self.training_weights is None else self.training_weights.clone())
 
     def restore(self, state):
         super().restore(state[0])
@@ -189,6 +192,7 @@ class MultimodalKVRetention(GlobalKVRetention):
             self.archive.restore(state[2])
         self._frame_clock, self._frames_since_management, self._managed_once = state[3]
         self.tactile_history.restore(state[4])
+        self.training_weights = None if state[5] is None else state[5].clone()
 
     def _new_observation_frames(self, rows):
         # Only real visual latent frames advance cadence. Action/tactile forwards
@@ -259,38 +263,25 @@ class MultimodalKVRetention(GlobalKVRetention):
             "task": d["task_relevance"][slots] * real_video,
         }
 
-    def normalized_heuristic(self, slots, *, t0=None, reference=None):
-        """Screenshot formula, with a stateless UID/time-keyed random mixture."""
-        d, c = self.data, self.config
+    def heuristic_scores(self, slots, *, t0=None, reference=None):
+        """Raw three-term score; inference always uses unit weights."""
+        d = self.data
         anchor = self.t0 if t0 is None else t0
         times = d["world_time_id"][slots]
-        age = torch.zeros_like(times) if anchor is None else (anchor-times).clamp_min(0)
+        if anchor is None:
+            anchor = times.max() if len(times) else 0.
         kind = d["kind"][slots]
-        raw = torch.exp(-age / 8.0)
         video, touch = kind == 0, kind == 2
-        raw = raw + video * torch.exp(-d["contact_duration"][slots] / 8.0)
+        novelty = torch.zeros_like(times)
         for selected, history, features in (
                 (video, self.history, d["dino"]),
                 (touch, self.tactile_history, d["neoforce"])):
             real = selected & d["observation_flag"][slots]
             if real.any():
-                raw[real] += history.class_recency(features[slots[real]], times[real])
-        # Fixed theoretical bounds avoid candidate-set dependent min/max scaling.
-        return raw / torch.where(video, 3.0, 2.0)
-
-    def screenshot_scores(self, slots, *, t0=None, reference=None):
-        normalized = self.normalized_heuristic(slots, t0=t0)
-        d, c = self.data, self.config
-        anchor = self.t0 if t0 is None else t0
-        # Integer avalanche hash: same token/decision/seed across ranks, slot
-        # permutations and activation-checkpoint recomputation. No global RNG use.
-        clock = 0 if anchor is None else int(round(float(anchor) * 1024))
-        x = (d["token_uid"][slots] + c.seed * 104729 + clock * 1009) & 0xffffffff
-        x = ((x ^ (x >> 16)) * 0x45d9f3b) & 0xffffffff
-        x = ((x ^ (x >> 16)) * 0x45d9f3b) & 0xffffffff
-        x = x ^ (x >> 16)
-        random = (x.to(torch.float64) + 0.5) / 4294967296.0
-        return (1-c.random_weight) * normalized + c.random_weight * random.to(normalized.dtype)
+                novelty[real] = history.class_recency(features[slots[real]], times[real])
+        weights = (1., 1., 1.) if self.training_weights is None else self.training_weights
+        return heuristic_scores(times, anchor, video, d["contact_duration"][slots],
+                                novelty, weights=weights)
 
     @torch.no_grad()
     def scores(self, slots, **kwargs):
@@ -302,7 +293,7 @@ class MultimodalKVRetention(GlobalKVRetention):
             return result  # action has no importance score
         if self.config.score_backend == "qwen_sys2":
             return self.data["sys2_score"][slots]
-        return self.screenshot_scores(slots, **kwargs)
+        return self.heuristic_scores(slots, **kwargs)
 
     def add_usage(self, measurements):
         sensory_measurements = []
@@ -403,7 +394,7 @@ class MultimodalKVRetention(GlobalKVRetention):
         self.data["contact_present"][slots] = contact
         self.data["contact_time"][slots] = rows["world_time_id"].masked_fill(~contact, -torch.inf)
         self.data["contact_duration"][slots] = rows["duration"] * contact
-        if self.config.formula_variant == "screenshot_v1" and "contact_duration" in rows:
+        if "contact_duration" in rows:
             duration = rows["contact_duration"]
             if not torch.isfinite(duration).all() or (duration<0).any():
                 raise ValueError("explicit contact duration must be finite and nonnegative")
