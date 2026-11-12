@@ -1,0 +1,12 @@
+{
+  "vpp2": {
+    "base_commit": "a103a1e1784d3e45014549a82238894d3ed85959",
+    "patch": "vpp2.patch",
+    "sha256": "c842af038d860cc17e2fcdffbf35b330b5ff51d4eff08e91aa9b496d7baa673c"
+  },
+  "hwm0": {
+    "base_commit": "1ddc01bd90396ef37f8345697caf5b7c0fd882d9",
+    "patch": "hwm0.patch",
+    "sha256": "4bb6958cf27238dfe08dd3ccf7dbbe386cd22e3fd03917499ad924ad9cafa8b8"
+  }
+}

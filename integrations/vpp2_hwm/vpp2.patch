@@ -1,0 +1,1258 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -22,5 +22,6 @@
+ 
+ # Internal development artifacts live outside the release repository.
+ /results/
+-/tests/
++/tests/*
++!/tests/test_ikv.py
+ /tools/
+--- /dev/null
++++ b/configs/robodojo/formula_example.yaml
+@@ -0,0 +1,9 @@
++# Formula backend; choose window_refresh or incremental_reuse.
++history_mode: incremental_reuse
++ikv:
++  backend: formula
++  source_root: ${oc.env:IKV_CORE_SOURCE}
++  encoder_path: ${oc.env:IKV_DINO_ASSETS}
++  device: cuda:0
++  max_bytes: 68719476736
++  max_prototypes: 4096
+--- /dev/null
++++ b/configs/robodojo/ikv_example.yaml
+@@ -0,0 +1,10 @@
++# Merge into RoboDojoVPP2Policy / get_model arguments.
++# Switch between off, window_refresh, incremental_reuse only after reset.
++history_mode: incremental_reuse
++ikv:
++  source_root: ${oc.env:IKV_SCORER_SOURCE_ROOT}
++  checkpoint: ${oc.env:IKV_SCORER_CHECKPOINT}
++  encoder_path: ${oc.env:IKV_SCORER_ENCODER_PATH}
++  device: cuda
++  max_bytes: 68719476736
++
+--- /dev/null
++++ b/docs/ikv.md
+@@ -0,0 +1,152 @@
++# VPP2 IKV inference modes
++
++This implementation lives on server `.239` in
++`${IKV_DEPLOY_ROOT}/video-prediction-policy-2`.
++It uses the sibling `ikv_runtime` package; it does not use a local checkout.
++
++| `history_mode` | RGB encoded for policy inference each replan | KV consumed by Action |
++|---|---|---|
++| `off` (default) | Native anchor plus history8 | Native freshly computed video cache |
++| `window_refresh` | Same native nine-frame window | Scorer-selected real historical/current KV replaces the three condition slots |
++| `incremental_reuse` | Current three-camera observation only | New current KV joins the entire archive; scorer selects the same three-slot budget |
++
++For 240x416 input the condition budget is 1,170 KV tokens per layer.
++The 780 future-video KV tokens are always computed in the current request.
++The action-visible cache therefore keeps 1,950 video tokens. Empty warmup
++memory positions are zero padded and masked, never fabricated as observations.
++
++## Configuration
++
++Merge `configs/robodojo/ikv_example.yaml` into the arguments passed to
++`RoboDojoVPP2Policy` / `get_model`. Supply real scorer source, checkpoint and
++encoder paths. All three are required: there is no recency/random fallback.
++The production environment must provide the scorer's Qwen3.5-compatible
++Transformers/encoder dependencies. The existing runtime310 environment used
++for CPU adapter tests has Transformers 4.57 and is not sufficient to load the
++real Qwen3.5 encoder by itself. A validated server-only overlay is now available
++at `${IKV_DEPLOY_ROOT}/scorer-test-deps`: Transformers
++5.14.1, huggingface-hub 1.5.0 and safetensors 0.8.0. It leaves the shared
++runtime unchanged. The scorer uses its own 0.8B encoder; it does not silently reuse the policy VAE.
++
++Set the import path before launching the existing policy runner:
++
++```sh
++export PYTHONPATH=${IKV_DEPLOY_ROOT}/scorer-test-deps:${IKV_DEPLOY_ROOT}/test-deps:${IKV_DEPLOY_ROOT}:${IKV_DEPLOY_ROOT}/video-prediction-policy-2/src
++```
++
++The side-chat/DM05 spelling `incremental` is accepted as an alias for
++`incremental_reuse`. Unlike DM05's common per-frame representation, these
++VPP2 modes construct different temporal candidates, so changing modes requires
++an episode reset.
++
++The modes can be changed through `set_history_mode(...)` only after resetting
++all environments. `reset_env(i)` clears only that environment's archive,
++scorer features and anchor CLIP cache. Scorer forks share frozen model weights
++and keep separate observation features.
++
++## What is computed
++
++`window_refresh` preserves the native Video forward. Per-layer normalized keys
++are captured directly before RoPE for archival; the selected keys are rotated into the existing
++condition positions before Action reads them. If the complete fresh window
++is selected in place, the original native cache tensors are used exactly.
++
++`incremental_reuse` keeps the native five-latent noise draw so the future
++slots retain their original random samples. It places the independently
++encoded current observation at native condition slot 2, then evaluates only
++slot 2 and future slots 3/4 as Transformer queries. Slots 0/1 contain no
++historical RGB input and are not Transformer queries. At every layer, selected
++archived/current keys and values plus fresh future keys and values form the
++attention key side. A rectangular mask accounts for the smaller query side.
++The same selected plan is used by all layers and the Action branch sees it
++from its first denoising step.
++
++The episode-first CLIP features are computed once and reused. They retain
++the native anchor conditioning without re-encoding historical RGB each round.
++
++KV keys are real model attention keys, not image embeddings. The bank stores
++all candidates, including candidates not selected this round. Its configured
++CPU byte limit raises an error before publishing a new archive rather than
++silently evicting candidates. The archive commits only after inference yields
++finite, correctly shaped actions; exceptions abort staged KV.
++
++## Limits and interpretation
++
++This is a new inference algorithm, not an equivalence claim for the native
++bidirectional Video transformer. Archived KV retain their old context and
++noise dependence. Single-frame VAE encoding also differs from the original
++nine-frame temporal VAE input. Check performance against `off` and
++`window_refresh` using the same seeds and task splits.
++
++Scorer regions map the resized T-shaped grid back to head/left-wrist/right-wrist
++camera rectangles. A native temporal latent's nominal group of RGB sources is
++used for score mapping; this is not an exact VAE receptive-field inversion.
++Source slot is part of candidate identity, so padded warmup groups remain
++distinct even when all RGB source timestamps are zero.
++
++The initial implementation supports batch 1 per call, direct per-layer Video
++KV, five video latents and bidirectional video attention. It rejects alternate
++first-frame routes, fixed/shared source layers, token-projection cache modes
++and diagnostic video generation. PP is a separate deployment adaptation.
++
++## Verification
++
++The CPU tests execute actual small MoT/DiT blocks without model weights:
++
++```sh
++cd ${IKV_DEPLOY_ROOT}/video-prediction-policy-2
++PYTHONPATH=${IKV_DEPLOY_ROOT}/scorer-test-deps:${IKV_DEPLOY_ROOT}/test-deps:${IKV_DEPLOY_ROOT}:src \
++  python \
++  -m unittest discover -s tests -v
++```
++
++They cover warmup identity, native-cache bitwise parity when all fresh KV are
++selected, old-KV retrieval, current/future query and cache lengths, camera-region
++mapping, RoPE relocation, abort and environment isolation. Full checkpoint GPU
++inference and RoboDojo success-rate evaluation remain to be run.
++
++
++Incremental warmup keeps real memory at the right end of the three-latent
++condition prefix. With one observed frame, its keys and queries both use native
++temporal slot 2; with two frames, their memory occupies slots 1 and 2. Empty
++earlier slots are zero and masked. This only places padding: it does not protect
++any candidate from scoring, change the memory budget, or move the two freshly
++computed future-video slots. The shared CPU archive remains independent of this
++VPP2 consumer layout.
++
++The independent **real** Qwen3.5 encoder and trained 10.9M SFT scorer were also
++validated on the server's 4090, using two synthetic RGB observations. Image
++features were encoded once per observation, repeated task scoring reused its
++text features, and new subtask/memory feedback triggered a new text encoding.
++Both the model SHA and the `:linear-patch-v1` contract were checked.
++
++Evidence and the exact isolated environment are stored on `.239`:
++
++- `${IKV_DEPLOY_ROOT}/REAL_ENCODER_SMOKE.json`
++- `${IKV_DEPLOY_ROOT}/validation-assets/SCORER_VALIDATION_ENV.json`
++
++This validates the actual scorer/encoder bridge. Full VPP2 checkpoint GPU
++inference, PP deployment and RoboDojo success-rate evaluation are separate
++remaining checks.
++
++
++## Canonical heuristic inference
++
++Set `ikv.backend: formula`, with `source_root` pointing to the current IKV
++core and `encoder_path` to verified raw DINOv3 assets. The new formula is the
++un-normalized sum of recency, visual contact decay and prototype-gated class
++recency, all weights one, threshold 0.75, decay 8 world/control steps. There
++is no random mixture. The bridge converts adapter seconds back to world steps
++explicitly (VPP2: 25 Hz; HWM: native control clock). DINO uses its own frozen
++encoder and maps its 14x14 scores to native KV provenance by area and temporal
++support. It does not share the Planner encoder.
++
++Native RGB-only requests have no contact-duration sidecar; their absent-contact
++value is d=0. The bridge accepts validated per-sensor contact durations (world
++steps) when a caller supplies them; it never guesses contact from RGB.
++Formula scoring has no instruction/subtask/semantic-memory term, so HWM formula
++runs require `planner_mode: lower_only`. Native Planner still runs normally.
++The learned backend retains its independent `interactive` option. Both history
++update modes remain available for formula runs. Feature caching and class-index
++reuse are episode-local and use only causal real observations. Prototype overflow
++fails explicitly rather than silently evicting classes.
+--- /dev/null
++++ b/src/vpp2/ikv.py
+@@ -0,0 +1,292 @@
++"""VPP2 inference-only IKV adapters.
++
++Raw model keys are archived before RoPE. The scorer selects token candidates;
++it never replaces the RGB input with selected frames. Imports are lazy so the
++released baseline requires no IKV dependencies.
++"""
++from __future__ import annotations
++
++import json
++from collections import OrderedDict
++
++import numpy as np
++import torch
++
++HISTORY_MODES = ("off", "window_refresh", "incremental_reuse")
++
++
++def validate_history_mode(value):
++    value = str(value)
++    if value == "incremental":
++        value = "incremental_reuse"
++    if value not in HISTORY_MODES:
++        raise ValueError(f"history_mode must be one of {HISTORY_MODES}, got {value!r}")
++    return value
++
++
++def apply_rotary(keys, frequencies, heads, *, inverse=False):
++    """Rotate [batch, sequence, heads * head_dim], without changing values."""
++    shape = keys.shape
++    if len(shape) != 3 or shape[-1] % heads or shape[-1] // heads % 2:
++        raise ValueError("Expected [B,N,H*D] keys with even head dimension")
++    x = keys.to(torch.float64).reshape(shape[0], shape[1], heads, -1, 2)
++    x = torch.view_as_complex(x)
++    freqs = frequencies.to(device=keys.device)
++    if inverse:
++        freqs = freqs.conj()
++    return torch.view_as_real(x * freqs).reshape(shape).to(keys.dtype)
++
++
++def tshape_regions(frame_ids, row, column, height, width):
++    """Map a composed-image patch to weighted original-camera rectangles.
++
++    Original T-shape canvas is 480x880: head 480x640, then two 240x240
++    wrists stacked vertically. Resize to 240x416 preserves these fractions.
++    Regions describe nominal VAE frame groups, not an exact receptive field.
++    """
++    from ikv_runtime import Region
++
++    y0, y1 = row / height, (row + 1) / height
++    x0, x1 = column / width, (column + 1) / width
++    regions = []
++    patch_area = (y1 - y0) * (x1 - x0)
++    cameras = (
++        (0, 0.0, 0.0, 1.0, 8.0 / 11.0),
++        (1, 0.0, 8.0 / 11.0, 0.5, 1.0),
++        (2, 0.5, 8.0 / 11.0, 1.0, 1.0),
++    )
++    for sensor, cy0, cx0, cy1, cx1 in cameras:
++        iy0, ix0, iy1, ix1 = max(y0, cy0), max(x0, cx0), min(y1, cy1), min(x1, cx1)
++        if iy1 <= iy0 or ix1 <= ix0:
++            continue
++        area_weight = (iy1 - iy0) * (ix1 - ix0) / patch_area / len(frame_ids)
++        box = ((iy0 - cy0) / (cy1 - cy0), (ix0 - cx0) / (cx1 - cx0),
++               (iy1 - cy0) / (cy1 - cy0), (ix1 - cx0) / (cx1 - cx0))
++        for frame_id in frame_ids:
++            regions.append(Region(frame_id=str(frame_id), sensor=sensor, box=box,
++                                  weight=area_weight))
++    return tuple(regions)
++
++
++class VPP2IKVRuntime:
++    """One isolated environment; its scorer fork shares frozen model weights."""
++
++    def __init__(self, *, mode, scorer, expected_layers, env_id=0,
++                 max_bytes=64 * 1024**3):
++        from ikv_runtime import ArchiveBank
++
++        self.mode = validate_history_mode(mode)
++        if self.mode == "off":
++            raise ValueError("Do not construct an IKV runtime for baseline mode")
++        self.scorer = scorer
++        self.env_id = int(env_id)
++        self.episode = 0
++        self.bank = ArchiveBank(expected_layers=int(expected_layers), max_bytes=int(max_bytes))
++        self.frames = OrderedDict()
++        self.anchor = None
++        self.anchor_clip = None
++        self.last_diagnostics = None
++        self.last_step = None
++
++    def frame_id(self, step):
++        return f"vpp2/e{self.env_id}/ep{self.episode}/t{int(step):010d}"
++
++    def observe(self, step, images):
++        step = int(step)
++        captured = {int(sensor): np.array(rgb, dtype=np.uint8, copy=True)
++                    for sensor, rgb in images.items()}
++        if set(captured) != {0, 1, 2}:
++            raise ValueError("VPP2 scorer needs head=0, left wrist=1, right wrist=2")
++        if step in self.frames:
++            if any(not np.array_equal(captured[sensor], self.frames[step][sensor])
++                   for sensor in captured):
++                raise ValueError("An observation timestamp cannot change its RGB contents")
++            return
++        if self.last_step is not None and step <= self.last_step:
++            raise ValueError("Observation timestamps must increase within an episode")
++        self.last_step = step
++        self.frames[step] = captured
++        if self.anchor is None:
++            self.anchor = (step, captured)
++        limit = 177 if self.mode == "window_refresh" else 1
++        while len(self.frames) > limit:
++            self.frames.popitem(last=False)
++
++    def request(self, *, task, step, selected_steps=None, anchor_image=None):
++        if self.mode == "window_refresh":
++            if selected_steps is None or len(selected_steps) != 9:
++                raise ValueError("window_refresh needs the native nine-frame source metadata")
++            source_groups = [[selected_steps[0]], selected_steps[1:5], selected_steps[5:9]]
++        else:
++            source_groups = [[int(step)]]
++        for source_step in sorted({int(s) for group in source_groups for s in group}):
++            images = self.frames.get(source_step)
++            if images is None and self.anchor is not None and self.anchor[0] == source_step:
++                images = self.anchor[1]
++            if images is None:
++                raise RuntimeError(f"Missing raw scorer observation at step {source_step}")
++            self.scorer.register_frame(self.frame_id(source_step), source_step / 25.0, images)
++        return VPP2IKVRequest(self, str(task), int(step), source_groups, anchor_image)
++
++    def reset(self):
++        self.bank.reset()
++        self.scorer.reset()
++        self.frames.clear()
++        self.anchor = None
++        self.anchor_clip = None
++        self.last_diagnostics = None
++        self.last_step = None
++        self.episode += 1
++
++
++class VPP2IKVRequest:
++    def __init__(self, runtime, task, step, source_groups, anchor_image):
++        self.runtime = runtime
++        self.mode = runtime.mode
++        self.task = task
++        self.step = step
++        self.source_groups = source_groups
++        self.anchor_image = anchor_image
++        self.tx = None
++        self.pending_clip = None
++        self.prepared = False
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, traceback):
++        if self.tx is not None:
++            if exc_type is None:
++                try:
++                    self.tx.commit()
++                except BaseException:
++                    self.tx.abort()
++                    raise
++                if self.pending_clip is not None:
++                    self.runtime.anchor_clip = self.pending_clip
++                self.runtime.last_diagnostics = {
++                    "mode": self.mode, "step": self.step, "budget": self.budget,
++                    "fresh_tokens": self.fresh_count,
++                    "selected_ids": list(self.tx.selected_ids),
++                    "valid_tokens": int(self.tx.valid_mask.sum().item()),
++                    "query_tokens": self.query_count,
++                    "cache_tokens": self.cache_count,
++                }
++            else:
++                self.tx.abort()
++        elif exc_type is None:
++            raise RuntimeError("IKV request exited without running the KV adapter")
++        return False
++
++    def get_anchor_clip(self, model):
++        cached = self.runtime.anchor_clip
++        if cached is None:
++            if self.anchor_image is None:
++                raise ValueError("incremental_reuse needs the episode anchor for initial CLIP encoding")
++            cached = model._encode_clip_fea_from_image(self.anchor_image)
++            self.pending_clip = cached.detach().cpu()
++        return cached.to(device=model.device, dtype=model.torch_dtype)
++
++    def condition_latents(self, encoded):
++        if self.mode != "incremental_reuse":
++            if encoded.shape[2] != 3:
++                raise ValueError("window_refresh expects the native three condition latents")
++            return encoded
++        if encoded.shape[2] != 1:
++            raise ValueError("incremental_reuse must encode exactly the current RGB frame")
++        # Current belongs to native slot 2; slots 0/1 are never transformer queries.
++        result = encoded.new_zeros(encoded.shape[:2] + (3,) + encoded.shape[3:])
++        result[:, :, 2:3] = encoded
++        return result
++
++    def prepare(self, video_pre, attention_mask, *, heads):
++        from ikv_runtime import Candidate
++
++        if self.prepared:
++            raise RuntimeError("An IKV transaction can prefill only once")
++        frames, height, width = video_pre["meta"]["grid_size"]
++        if frames != 5 or video_pre["tokens"].shape[0] != 1:
++            raise ValueError("VPP2 IKV requires batch1 and the native five-latent video layout")
++        self.heads = int(heads)
++        self.tokens_per_frame = height * width
++        self.budget = 3 * self.tokens_per_frame
++        self.cache_count = 5 * self.tokens_per_frame
++        self.fresh_count = len(self.source_groups) * self.tokens_per_frame
++        self.target_freqs = video_pre["freqs"][:self.budget]
++        candidates = []
++        for group_index, group in enumerate(self.source_groups):
++            source_slot = group_index if self.mode == "window_refresh" else 2
++            frame_ids = [self.runtime.frame_id(s) for s in group]
++            group_key = ",".join(str(int(s)) for s in group)
++            for row in range(height):
++                for column in range(width):
++                    uid = (f"vpp2/e{self.runtime.env_id}/ep{self.runtime.episode}/"
++                           f"{self.mode}/slot{source_slot}/g{group_key}/r{row:04d}/c{column:04d}")
++                    candidates.append(Candidate(
++                        uid=uid, time=max(group) / 25.0,
++                        regions=tshape_regions(frame_ids, row, column, height, width),
++                        provenance=json.dumps({"mode": self.mode, "source_steps": group,
++                                               "source_slot": source_slot,
++                                               "grid": [height, width],
++                                               "mapping": "nominal_vae_time_group"},
++                                              sort_keys=True)))
++        self.fresh_ids = tuple(candidate.uid for candidate in candidates)
++        self.tx = self.runtime.bank.begin(
++            candidates, budget=self.budget,
++            score_fn=lambda all_candidates: self.runtime.scorer.score(
++                all_candidates, self.task, query_time=self.step / 25.0))
++        # The current query is always in native temporal slot 2. During
++        # warmup, align real memory to the end of the condition prefix so a
++        # lone current frame keeps that same phase instead of moving to slot 0.
++        # This changes padding placement only; it protects no candidate IDs.
++        self.padding_left = (self.budget - len(self.tx.selected_ids)
++                             if self.mode == "incremental_reuse" else 0)
++        self.model_valid_mask = (torch.arange(self.budget) >= self.padding_left
++                                 if self.mode == "incremental_reuse"
++                                 else self.tx.valid_mask.clone())
++        valid = self.model_valid_mask.to(device=attention_mask.device)
++        action_mask = attention_mask.clone()
++        action_mask[:, :self.budget] &= valid[None, :]
++        prepared = dict(video_pre)
++        if self.mode == "incremental_reuse":
++            start = 2 * self.tokens_per_frame
++            prepared["tokens"] = video_pre["tokens"][:, start:]
++            prepared["freqs"] = video_pre["freqs"][start:]
++            prepared["context_mask"] = video_pre["context_mask"][:, start:]
++            video_mask = action_mask[start:self.cache_count, :self.cache_count]
++        else:
++            video_mask = attention_mask[:self.cache_count, :self.cache_count]
++        self.query_count = prepared["tokens"].shape[1]
++        self.prepared = True
++        return prepared, video_mask, action_mask
++
++    def layer(self, layer_idx, keys, values, *, raw_keys=None):
++        if not self.prepared:
++            raise RuntimeError("prepare must run before a KV layer")
++        if raw_keys is None or raw_keys.shape != keys.shape:
++            raise ValueError("IKV requires the model's actual normalized pre-RoPE keys")
++        fresh_v = values[:, :self.fresh_count]
++        selected_k, selected_v, _valid = self.tx.layer(
++            int(layer_idx), raw_keys[:, :self.fresh_count], fresh_v, seq_dim=1)
++        if self.padding_left:
++            # ArchiveBank returns a valid prefix plus right padding. Repack
++            # only this model's consumer view before assigning destination RoPE.
++            count = len(self.tx.selected_ids)
++            selected_k = torch.cat((torch.zeros_like(selected_k[:, :self.padding_left]),
++                                    selected_k[:, :count]), dim=1)
++            selected_v = torch.cat((torch.zeros_like(selected_v[:, :self.padding_left]),
++                                    selected_v[:, :count]), dim=1)
++        if self.mode == "window_refresh" and self.tx.selected_ids == self.fresh_ids:
++            # Preserve bitwise native inference when the plan selects the entire
++            # fresh window in place; avoid an unnecessary BF16 RoPE round trip.
++            cache_k, cache_v = keys, values
++        else:
++            relocated_k = apply_rotary(selected_k, self.target_freqs, self.heads)
++            cache_k = torch.cat((relocated_k, keys[:, self.fresh_count:]), dim=1)
++            cache_v = torch.cat((selected_v, values[:, self.fresh_count:]), dim=1)
++        if cache_k.shape[1] != self.cache_count:
++            raise RuntimeError("IKV changed the native action-visible cache capacity")
++        if self.mode == "incremental_reuse":
++            return cache_k, cache_v, cache_k, cache_v
++        return keys, values, cache_k, cache_v
++
+--- a/src/vpp2/models/wan21_14b/mot.py
++++ b/src/vpp2/models/wan21_14b/mot.py
+@@ -197,6 +197,7 @@
+         x: torch.Tensor,
+         freqs: torch.Tensor,
+         t_mod: torch.Tensor,
++        raw_key_callback=None,
+     ) -> tuple[
+         torch.Tensor,
+         torch.Tensor,
+@@ -238,6 +239,8 @@
+         k = block.self_attn.norm_k(block.self_attn.k(attn_input))
+         v = block.self_attn.v(attn_input)
+ 
++        if raw_key_callback is not None:
++            raw_key_callback(k)
+         q = rope_apply(q, freqs, block.num_heads)
+         k = rope_apply(k, freqs, block.num_heads)
+ 
+@@ -336,6 +339,7 @@
+         return_final_tokens: bool = False,
+         max_layers: Optional[int] = None,
+         video_feature_callback: Optional[Callable[[int, torch.Tensor], None]] = None,
++        ikv_context=None,
+     ) -> list[dict[str, torch.Tensor]] | tuple[list[dict[str, torch.Tensor]], torch.Tensor]:
+         """Prefill video branch once and cache K/V or raw tokens for action.
+ 
+@@ -364,7 +368,8 @@
+             raise ValueError(
+                 f"`video_attention_mask` must be 2D [S,S], got shape {tuple(video_attention_mask.shape)}"
+             )
+-        if video_attention_mask.shape[0] != video_attention_mask.shape[1]:
++        if (video_attention_mask.shape[0] != video_attention_mask.shape[1]
++                and (ikv_context is None or ikv_context.mode != "incremental_reuse")):
+             raise ValueError(
+                 f"`video_attention_mask` must be square, got shape {tuple(video_attention_mask.shape)}"
+             )
+@@ -388,6 +393,8 @@
+         kv_cache: list[dict[str, torch.Tensor]] = []
+         for layer_idx in range(layer_count):
+             block = expert.blocks[layer_idx]
++            # Capture normalized model K before RoPE, without projecting twice.
++            raw_keys = [] if ikv_context is not None else None
+             # Build video Q/K/V from current layer input tokens.
+             (
+                 q,
+@@ -405,12 +412,18 @@
+                 x=x,
+                 freqs=video_freqs,
+                 t_mod=video_t_mod,
+-            )
+-            # Video prefill uses only video self-attention mask.
++                raw_key_callback=None if raw_keys is None else raw_keys.append,
++            )
++            attention_k, attention_v, cache_k, cache_v = k, v, k, v
++            if ikv_context is not None:
++                attention_k, attention_v, cache_k, cache_v = ikv_context.layer(
++                    layer_idx, k, v, raw_keys=raw_keys[0])
++            # Window refresh preserves native video attention. Incremental reuse
++            # has only current/future queries and selected memory keys.
+             mixed = self._mixed_attention(
+                 q_cat=q,
+-                k_cat=k,
+-                v_cat=v,
++                k_cat=attention_k,
++                v_cat=attention_v,
+                 attention_mask=video_attention_mask,
+                 num_heads=expert.num_heads,
+             )
+@@ -419,7 +432,7 @@
+                 if self.use_fixed_video_layers is None or layer_idx == self.use_fixed_video_layers:
+                     cache_entry.update({"tokens": x, "freqs": video_freqs})
+             elif self.use_fixed_video_layers is None or layer_idx == self.use_fixed_video_layers:
+-                cache_entry.update({"k": k, "v": v})
++                cache_entry.update({"k": cache_k, "v": cache_v})
+ 
+             # Update video tokens for the next layer and persist its action input.
+             x = self._apply_post_with_optional_checkpoint(
+--- a/src/vpp2/models/wan21_14b/vpp2.py
++++ b/src/vpp2/models/wan21_14b/vpp2.py
+@@ -1013,7 +1013,10 @@
+         allow_trainable_video: bool = False,
+         action_visible_video_frames: Optional[int] = None,
+         max_video_layers: Optional[int] = None,
++        ikv_context=None,
+     ):
++        if ikv_context is not None and (return_video_prediction or max_video_layers is not None):
++            raise ValueError("IKV requires complete action-only video prefill")
+         if latents.ndim != 5:
+             raise ValueError(
+                 f"Action-only video context must be [B,C,T,H,W], got shape {tuple(latents.shape)}"
+@@ -1101,6 +1104,10 @@
+                 device=video_pre["tokens"].device,
+                 action_visible_video_frames=visible_frames,
+             )
++            video_attention_mask = attention_mask[:video_seq_len, :video_seq_len]
++            if ikv_context is not None:
++                video_pre, video_attention_mask, attention_mask = ikv_context.prepare(
++                    video_pre, attention_mask, heads=self.video_expert.num_heads)
+             with checkpoint_context:
+                 prefill_kwargs = {
+                     "video_tokens": video_pre["tokens"],
+@@ -1110,8 +1117,10 @@
+                         "context": video_pre["context"],
+                         "mask": video_pre["context_mask"],
+                     },
+-                    "video_attention_mask": attention_mask[:video_seq_len, :video_seq_len],
++                    "video_attention_mask": video_attention_mask,
+                 }
++                if ikv_context is not None:
++                    prefill_kwargs["ikv_context"] = ikv_context
+                 if return_video_prediction:
+                     if max_video_layers is not None:
+                         raise ValueError(
+@@ -1467,8 +1476,22 @@
+         return_full_video: bool = False,
+         full_video_num_inference_steps: Optional[int] = None,
+         condition_observation_video: Optional[torch.Tensor] = None,
++        ikv_context=None,
+     ) -> dict[str, Any]:
+         self.eval()
++        if ikv_context is not None:
++            if self.training or self.mot.use_video_tokens or self.mot.use_fixed_video_layers is not None:
++                raise ValueError("IKV supports inference with direct per-layer Video KV only")
++            if (return_one_step_video or return_full_video
++                    or getattr(self, "action_clean_first_frame_start_layer", None) is not None
++                    or getattr(self, "action_clean_first_frame_timestep_cutoff", None) is not None):
++                raise ValueError("IKV is incompatible with diagnostic video generation and alternate first-frame routes")
++            if (self.action_visible_video_frames != 5
++                    or self.video_expert.video_attention_mask_mode != "bidirectional"):
++                raise ValueError("IKV requires the released RoboDojo five-latent bidirectional layout")
++            if ikv_context.mode == "incremental_reuse" and (
++                    condition_video is not None or condition_observation_video is not None):
++                raise ValueError("incremental_reuse accepts only the current RGB observation")
+         allowed_action_modes = {"bidirectional", "first_frame_causal", "three_frame"}
+         if (
+             str(getattr(self.video_expert, "video_attention_mask_mode", ""))
+@@ -1536,7 +1559,9 @@
+             condition_latents = self._encode_input_image_latents_tensor(
+                 input_image=input_image, tiled=tiled
+             )
+-            clip_fea = self._encode_clip_fea_from_image(input_image)
++            clip_fea = (ikv_context.get_anchor_clip(self)
++                        if ikv_context is not None and ikv_context.mode == "incremental_reuse"
++                        else self._encode_clip_fea_from_image(input_image))
+         else:
+             if condition_video.ndim == 4:
+                 condition_video = condition_video.unsqueeze(0)
+@@ -1570,6 +1595,8 @@
+                 tiled=tiled,
+             )
+             clip_fea = self._encode_clip_fea_from_video(condition_video[:, :, :1])
++        if ikv_context is not None:
++            condition_latents = ikv_context.condition_latents(condition_latents)
+         first_frame_latents = condition_latents[:, :, :1]
+         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+         use_prompt = prompt is not None
+@@ -1630,6 +1657,7 @@
+             if capture_video_prediction
+             or (first_frame_route_enabled and first_frame_kv_source == "noisy_cache_prefix")
+             else clean_start_layer,
++            ikv_context=ikv_context,
+         )
+         video_prediction = None
+         if capture_video_prediction:
+--- a/src/vpp2/policy.py
++++ b/src/vpp2/policy.py
+@@ -1,6 +1,7 @@
+ """EE16 RoboDojo policy: T-shaped RGB, history8, cached-video Euler action inference."""
+ 
+ from collections import deque
++from contextlib import nullcontext
+ from pathlib import Path
+ from typing import Any, Dict, Optional
+ import numpy as np
+@@ -11,6 +12,7 @@
+ from PIL import Image
+ from .data import DEFAULT_PROMPT
+ from .checkpoint_compat import action_config
++from .ikv import VPP2IKVRuntime, validate_history_mode
+ from .datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+ 
+ ROBODOJO_TSHAPE_VIDEO_SIZE = (240, 416)
+@@ -153,7 +155,18 @@
+         sigma_shift=1.0,
+         seed=1,
+         replan_steps=24,
++        history_mode="off",
++        ikv_config=None,
++        ikv_scorer=None,
+     ):
++        self._history_mode = validate_history_mode(history_mode)
++        self._ikv_config = dict(ikv_config or {})
++        self._ikv_scorer_template = ikv_scorer
++        if self._history_mode != "off" and ikv_scorer is None:
++            required = {"source_root", "encoder_path"} if self._ikv_config.get("backend") == "formula" else {"source_root", "checkpoint", "encoder_path"}
++            missing = required - self._ikv_config.keys()
++            if missing:
++                raise ValueError(f"IKV requires explicit scorer configuration: {sorted(missing)}")
+         checkpoint_path = Path(checkpoint_path).resolve()
+         payload = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
+         cfg = OmegaConf.create(action_config(payload))
+@@ -238,6 +251,7 @@
+         self._inference_index_by_env = {}
+         self._inference_index = 0
+         self._request_context = {}
++        self._ikv_by_env = {}
+ 
+     _PER_ENV_STATE = (
+         "_history_by_env",
+@@ -245,7 +259,45 @@
+         "_history_step_by_env",
+         "_latest_image_by_env",
+         "_inference_index_by_env",
++        "_ikv_by_env",
+     )
++
++    @property
++    def history_mode(self):
++        return self._history_mode
++
++    def set_history_mode(self, mode):
++        mode = validate_history_mode(mode)
++        if mode == self._history_mode:
++            return
++        if any(getattr(self, name, {}) for name in self._PER_ENV_STATE):
++            raise RuntimeError("Reset every environment before changing history_mode")
++        if mode != "off" and self._ikv_scorer_template is None:
++            required = {"source_root", "encoder_path"} if self._ikv_config.get("backend") == "formula" else {"source_root", "checkpoint", "encoder_path"}
++            missing = required - self._ikv_config.keys()
++            if missing:
++                raise ValueError(f"IKV requires explicit scorer configuration: {sorted(missing)}")
++        self._history_mode = mode
++
++    def _ikv_runtime(self, env_idx):
++        env_idx = int(env_idx)
++        if env_idx not in self._ikv_by_env:
++            if self._ikv_scorer_template is None:
++                from ikv_runtime import make_scorer
++                cfg = self._ikv_config
++                self._ikv_scorer_template = make_scorer(cfg, world_time_hz=25)
++            self._ikv_by_env[env_idx] = VPP2IKVRuntime(
++                mode=self.history_mode, scorer=self._ikv_scorer_template.fork(),
++                expected_layers=self.model.mot.num_layers, env_id=env_idx,
++                max_bytes=self._ikv_config.get("max_bytes", 64 * 1024**3))
++        return self._ikv_by_env[env_idx]
++
++    def _capture_ikv_observation(self, observation, env_idx):
++        images = observation["observation"]
++        self._ikv_runtime(env_idx).observe(
++            self._history_step_by_env[int(env_idx)],
++            {sensor: _as_uint8_hwc(images[name]["rgb"])
++             for sensor, name in enumerate(("head_camera", "left_camera", "right_camera"))})
+ 
+     def set_request_context(self, context: Dict[str, Any]) -> None:
+         self._request_context = dict(context or {})
+@@ -273,6 +325,8 @@
+         self._latest_image_by_env[env_idx] = image
+         if self.history_condition_frames > 0:
+             self._record_history_frame(image, env_idx)
++        if self.history_mode != "off":
++            self._capture_ikv_observation(observation, env_idx)
+ 
+     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
+         state = np.asarray(state, dtype=np.float32)
+@@ -301,7 +355,8 @@
+         env_idx = int(env_idx)
+         history = self._history_by_env.get(env_idx)
+         if history is None:
+-            history = deque(maxlen=self.history_buffer_size)
++            history = deque(maxlen=1 if self.history_mode == "incremental_reuse"
++                            else self.history_buffer_size)
+             self._history_by_env[env_idx] = history
+             step = 0
+             self._history_anchor_by_env[env_idx] = _normalized_to_uint8(image)
+@@ -386,9 +441,11 @@
+             image = self._compose_observation_image(observation)
+             if self.history_condition_frames > 0:
+                 self._record_history_frame(image, env_idx)
++        if self.history_mode != "off":
++            self._capture_ikv_observation(observation, env_idx)
+         history_condition = None
+         history_metadata = None
+-        if self.history_condition_frames > 0:
++        if self.history_condition_frames > 0 and self.history_mode != "incremental_reuse":
+             (history_condition, history_metadata) = self._build_history_condition(
+                 image=image, env_idx=env_idx
+             )
+@@ -418,16 +475,30 @@
+         }
+         if history_condition is not None:
+             infer_kwargs["condition_video"] = history_condition
+-        with torch.no_grad():
+-            prediction = self.model.infer_action(**infer_kwargs)
+-        action = self._denormalize_action(prediction["action"])[0]
+-        if action.ndim != 2 or action.shape[1] != self.output_action_dim:
+-            raise ValueError(
+-                f"Model returned an invalid RoboDojo action chunk: expected [T,{self.output_action_dim}], got {action.shape}."
+-            )
+-        return action
++        request = None
++        if self.history_mode != "off":
++            anchor = self._history_anchor_by_env[env_idx]
++            anchor_image = _uint8_to_normalized([anchor]).squeeze(1).unsqueeze(0)
++            request = self._ikv_runtime(env_idx).request(
++                task=instruction, step=self._history_step_by_env[env_idx],
++                selected_steps=None if history_metadata is None else history_metadata["selected_steps"],
++                anchor_image=anchor_image)
++            infer_kwargs["ikv_context"] = request
++        with request if request is not None else nullcontext():
++            with torch.no_grad():
++                prediction = self.model.infer_action(**infer_kwargs)
++            action = self._denormalize_action(prediction["action"])[0]
++            if action.ndim != 2 or action.shape[1] != self.output_action_dim:
++                raise ValueError(
++                    f"Model returned an invalid RoboDojo action chunk: expected [T,{self.output_action_dim}], got {action.shape}."
++                )
++            if request is not None and not np.isfinite(action).all():
++                raise ValueError("Nonfinite IKV actions; archive transaction aborted")
++            return action
+ 
+     def reset(self) -> None:
++        for runtime in self._ikv_by_env.values():
++            runtime.reset()
+         self._inference_index = 0
+         for name in self._PER_ENV_STATE:
+             state = getattr(self, name, None)
+@@ -436,6 +507,9 @@
+ 
+     def reset_env(self, env_idx: int) -> None:
+         """Clear the episode state of one environment only."""
++        runtime = self._ikv_by_env.get(int(env_idx))
++        if runtime is not None:
++            runtime.reset()
+         for name in self._PER_ENV_STATE:
+             state = getattr(self, name, None)
+             if state is not None:
+@@ -454,4 +528,6 @@
+         sigma_shift=args.get("sigma_shift") or 1,
+         seed=args.get("seed", 1),
+         replan_steps=args.get("replan_steps") or 24,
++        history_mode=args.get("history_mode", "off"),
++        ikv_config=args.get("ikv"),
+     )
+--- /dev/null
++++ b/tests/test_ikv.py
+@@ -0,0 +1,426 @@
++import unittest
++from types import SimpleNamespace
++
++import numpy as np
++import torch
++from torch import nn
++
++from vpp2.ikv import VPP2IKVRuntime, apply_rotary, tshape_regions
++from vpp2.models.wan21_14b.mot import MoT
++from vpp2.models.wan21_14b.wan_video_dit import DiTBlock
++
++
++class FakeScorer:
++    def __init__(self):
++        self.frames = {}
++        self.calls = 0
++
++    def register_frame(self, frame_id, timestamp, images):
++        self.frames[frame_id] = (timestamp, images)
++
++    def score(self, candidates, task, query_time, subtask="", memory=""):
++        self.calls += 1
++        # Explicit test fixture: prefer old memories even when current is fresh.
++        return {candidate.uid: -candidate.time for candidate in candidates}
++
++    def reset(self):
++        self.frames.clear()
++
++    def fork(self):
++        return FakeScorer()
++
++
++class TinyExpert(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.num_heads = 2
++        self.attn_head_dim = 4
++        self.use_video_tokens = False
++        self.use_gradient_checkpointing = False
++        self.blocks = nn.ModuleList([
++            DiTBlock(hidden_dim=8, attn_head_dim=4, num_heads=2, ffn_dim=16)
++            for _ in range(2)
++        ])
++
++
++def make_pre(seed=0, height=2, width=3):
++    generator = torch.Generator().manual_seed(seed)
++    count = 5 * height * width
++    phase = torch.arange(count, dtype=torch.float64)[:, None, None]
++    phase = phase * torch.tensor([0.13, 0.31], dtype=torch.float64)[None, None, :]
++    freqs = torch.polar(torch.ones_like(phase), phase)
++    return {
++        "tokens": torch.randn((1, count, 8), generator=generator),
++        "freqs": freqs,
++        "t_mod": torch.zeros(1, 6, 8),
++        "context": torch.zeros(1, 1, 8),
++        "context_mask": torch.ones(1, count, 1, dtype=torch.bool),
++        "meta": {"grid_size": (5, height, width), "tokens_per_frame": height * width,
++                 "batch_size": 1},
++    }
++
++
++def joint_mask(count, action_tokens=2):
++    mask = torch.ones(count + action_tokens, count + action_tokens, dtype=torch.bool)
++    mask[:count, count:] = False
++    return mask
++
++
++def run_prefill(model, pre, mask, request=None):
++    if request is not None:
++        pre, video_mask, action_mask = request.prepare(pre, mask, heads=2)
++    else:
++        video_mask, action_mask = mask[:pre["tokens"].shape[1], :pre["tokens"].shape[1]], mask
++    cache = model.prefill_video_cache(
++        video_tokens=pre["tokens"], video_freqs=pre["freqs"],
++        video_t_mod=pre["t_mod"], video_context_payload=None,
++        video_attention_mask=video_mask, ikv_context=request)
++    return cache, video_mask, action_mask
++
++
++class VPP2IKVTests(unittest.TestCase):
++    def setUp(self):
++        torch.manual_seed(15)
++        self.model = MoT({"video": TinyExpert(), "action": TinyExpert()},
++                         mot_checkpoint_mixed_attn=False).eval()
++        self.rgb = {camera: np.zeros((8, 8, 3), dtype=np.uint8) for camera in range(3)}
++
++    def runtime(self, mode, env_id=0):
++        return VPP2IKVRuntime(mode=mode, scorer=FakeScorer(), expected_layers=2, env_id=env_id)
++
++    def test_rope_relocation_preserves_raw_keys(self):
++        pre = make_pre()
++        raw = torch.randn(1, 6, 8)
++        first = apply_rotary(raw, pre["freqs"][:6], 2)
++        restored = apply_rotary(first, pre["freqs"][:6], 2, inverse=True)
++        relocated = apply_rotary(restored, pre["freqs"][12:18], 2)
++        torch.testing.assert_close(relocated,
++                                   apply_rotary(raw, pre["freqs"][12:18], 2),
++                                   atol=5e-7, rtol=5e-7)
++
++    def test_tshape_regions_include_boundary_cameras_with_unit_mass(self):
++        for row in range(15):
++            for column in range(26):
++                regions = tshape_regions(["a", "b", "c", "d"], row, column, 15, 26)
++                self.assertAlmostEqual(sum(region.weight for region in regions), 1.0)
++                self.assertTrue(all(0 <= x <= 1 for region in regions for x in region.box))
++        mixed = tshape_regions(["a"], 7, 18, 15, 26)
++        self.assertEqual({region.sensor for region in mixed}, {0, 1, 2})
++
++    def test_window_warmup_duplicate_rgb_groups_have_distinct_native_slots(self):
++        runtime = self.runtime("window_refresh")
++        runtime.observe(0, self.rgb)
++        pre = make_pre()
++        mask = joint_mask(30)
++        native, _, _ = run_prefill(self.model, pre, mask)
++        with runtime.request(task="move", step=0, selected_steps=[0]*9) as request:
++            selected, _, action_mask = run_prefill(self.model, pre, mask, request)
++            self.assertEqual(len(set(request.tx.selected_ids)), 18)
++        self.assertEqual(len(runtime.bank.candidate_ids), 18)
++        for baseline_layer, selected_layer in zip(native, selected):
++            self.assertTrue(torch.equal(baseline_layer["k"], selected_layer["k"]))
++            self.assertTrue(torch.equal(baseline_layer["v"], selected_layer["v"]))
++        torch.testing.assert_close(mask, action_mask)
++
++    def test_incremental_reuses_archived_kv_and_keeps_native_future_capacity(self):
++        runtime = self.runtime("incremental_reuse")
++        first_raw = None
++        for turn, step in enumerate((0, 25, 50, 75)):
++            runtime.observe(step, self.rgb)
++            pre = make_pre(seed=turn)
++            with runtime.request(task="move", step=step) as request:
++                cache, video_mask, action_mask = run_prefill(
++                    self.model, pre, joint_mask(30), request)
++                self.assertEqual(video_mask.shape, (18, 30))
++                self.assertEqual(cache[0]["k"].shape, (1, 30, 8))
++                self.assertEqual(int(request.tx.valid_mask.sum()), min(6*(turn+1), 18))
++                self.assertTrue(video_mask[:, 18:].all())
++                self.assertTrue(action_mask[30:, 18:30].all())
++                if turn == 0:
++                    first_raw = apply_rotary(cache[0]["k"][:, 12:18], pre["freqs"][12:18], 2,
++                                             inverse=True)
++                if turn == 3:
++                    self.assertTrue(all("/g75/" not in uid for uid in request.tx.selected_ids))
++                    retrieved = apply_rotary(cache[0]["k"][:, :6], pre["freqs"][:6], 2,
++                                             inverse=True)
++                    torch.testing.assert_close(first_raw, retrieved, atol=1e-6, rtol=1e-6)
++                    # Future positions remain the current call's unmodified KV,
++                    # rather than being drawn from old action-visible caches.
++                    native_current_only, _, _ = run_prefill(self.model, pre, joint_mask(30))
++                    torch.testing.assert_close(cache[0]["k"][:, 18:],
++                                               native_current_only[0]["k"][:, 18:])
++            self.assertEqual(runtime.last_diagnostics["query_tokens"], 18)
++            self.assertEqual(runtime.last_diagnostics["cache_tokens"], 30)
++        self.assertEqual(len(runtime.bank.candidate_ids), 24)
++        self.assertEqual(runtime.scorer.calls, 1)
++        # Frames not selected this time still have committed per-layer payloads.
++        self.assertTrue(any("/g75/" in uid for uid in runtime.bank.candidate_ids))
++
++    def test_incremental_warmup_right_aligns_current_phase_and_masks_empty_slots(self):
++        runtime = self.runtime("incremental_reuse")
++        first_raw = first_values = None
++        for turn, step in enumerate((0, 25)):
++            runtime.observe(step, self.rgb)
++            pre = make_pre(seed=turn+100)
++            native, _, _ = run_prefill(self.model, pre, joint_mask(30))
++            with runtime.request(task="move", step=step) as request:
++                cache, video_mask, action_mask = run_prefill(
++                    self.model, pre, joint_mask(30), request)
++                empty = 12 - turn*6
++                self.assertEqual(request.padding_left, empty)
++                self.assertFalse(video_mask[:, :empty].any())
++                self.assertFalse(action_mask[:, :empty].any())
++                self.assertTrue(video_mask[:, empty:30].all())
++                self.assertTrue((cache[0]["k"][:, :empty] == 0).all())
++                self.assertTrue((cache[0]["v"][:, :empty] == 0).all())
++                # Current Q and current K retain the same native frame-2 phase.
++                torch.testing.assert_close(cache[0]["k"][:, 12:18], native[0]["k"][:, 12:18])
++                torch.testing.assert_close(cache[0]["v"][:, 12:18], native[0]["v"][:, 12:18])
++                torch.testing.assert_close(cache[0]["k"][:, 18:], native[0]["k"][:, 18:])
++                torch.testing.assert_close(cache[0]["v"][:, 18:], native[0]["v"][:, 18:])
++                if turn == 0:
++                    first_raw = apply_rotary(cache[0]["k"][:, 12:18], pre["freqs"][12:18],
++                                             2, inverse=True)
++                    first_values = cache[0]["v"][:, 12:18].clone()
++                else:
++                    torch.testing.assert_close(cache[0]["k"][:, 6:12],
++                        apply_rotary(first_raw, pre["freqs"][6:12], 2), atol=1e-6, rtol=1e-6)
++                    torch.testing.assert_close(cache[0]["v"][:, 6:12], first_values)
++
++    def test_failed_prefill_aborts_and_reset_isolates_environments(self):
++        first, second = self.runtime("incremental_reuse", 0), self.runtime("incremental_reuse", 1)
++        for runtime in (first, second):
++            runtime.observe(0, self.rgb)
++            with runtime.request(task="move", step=0) as request:
++                run_prefill(self.model, make_pre(), joint_mask(30), request)
++        existing_ids = first.bank.candidate_ids
++        first.observe(25, self.rgb)
++        with self.assertRaisesRegex(RuntimeError, "injected failure"):
++            with first.request(task="move", step=25) as request:
++                prepared, _, _ = request.prepare(make_pre(1), joint_mask(30), heads=2)
++                keys = torch.zeros_like(prepared["tokens"])
++                request.layer(0, keys, keys, raw_keys=keys)
++                raise RuntimeError("injected failure")
++        self.assertEqual(first.bank.candidate_ids, existing_ids)
++        first.reset()
++        self.assertEqual(first.bank.candidate_ids, ())
++        self.assertEqual(len(second.bank.candidate_ids), 6)
++        self.assertEqual(len(second.scorer.frames), 1)
++
++    def test_archive_contains_exact_pre_rope_keys_in_bfloat16(self):
++        model = self.model.to(torch.bfloat16)
++        runtime = self.runtime("incremental_reuse")
++        runtime.observe(0, self.rgb)
++        pre = make_pre()
++        pre["tokens"] = pre["tokens"].to(torch.bfloat16)
++        pre["t_mod"] = pre["t_mod"].to(torch.bfloat16)
++        captured = []
++        original = model._build_expert_attention_io
++        def checked(*args, raw_key_callback=None, **kwargs):
++            def capture(raw):
++                captured.append(raw.detach().clone())
++                if raw_key_callback is not None:
++                    raw_key_callback(raw)
++            return original(*args, raw_key_callback=capture, **kwargs)
++        model._build_expert_attention_io = checked
++        with runtime.request(task="move", step=0) as request:
++            run_prefill(model, pre, joint_mask(30), request)
++            fresh_ids = request.fresh_ids
++        for layer, raw in enumerate(captured):
++            actual = torch.stack([runtime.bank._layers[layer][uid][0]
++                                  for uid in fresh_ids], dim=1)
++            self.assertTrue(torch.equal(actual, raw[:, :6]))
++
++    def test_observation_identity_cannot_change_on_retry(self):
++        runtime = self.runtime("incremental_reuse")
++        runtime.observe(0, self.rgb)
++        runtime.observe(0, self.rgb)
++        changed = {sensor: np.ones((8, 8, 3), dtype=np.uint8) for sensor in range(3)}
++        with self.assertRaisesRegex(ValueError, "RGB contents"):
++            runtime.observe(0, changed)
++        runtime.observe(25, changed)
++        with self.assertRaisesRegex(ValueError, "timestamps must increase"):
++            runtime.observe(0, self.rgb)
++
++    def test_incremental_encodes_one_current_condition_at_slot_two(self):
++        runtime = self.runtime("incremental_reuse")
++        runtime.observe(0, self.rgb)
++        request = runtime.request(task="move", step=0)
++        current = torch.randn(1, 16, 1, 4, 6)
++        condition = request.condition_latents(current)
++        self.assertEqual(condition.shape, (1, 16, 3, 4, 6))
++        self.assertTrue((condition[:, :, :2] == 0).all())
++        torch.testing.assert_close(condition[:, :, 2:3], current)
++        with self.assertRaisesRegex(ValueError, "exactly the current"):
++            request.condition_latents(torch.zeros(1, 16, 3, 4, 6))
++
++
++class CountingVAE(nn.Module):
++    temporal_downsample_factor = 4
++
++    def __init__(self):
++        super().__init__()
++        self.frames_seen = []
++
++    def encode(self, videos, device, **kwargs):
++        encoded = []
++        for video in videos:
++            self.frames_seen.append(video.shape[1])
++            selected = video[:, ::4].mean(dim=0, keepdim=True)
++            pooled = torch.nn.functional.adaptive_avg_pool2d(
++                selected.permute(1, 0, 2, 3),
++                (video.shape[-2] // 8, video.shape[-1] // 8))
++            encoded.append(pooled.permute(1, 0, 2, 3).repeat(16, 1, 1, 1).to(device))
++        return encoded
++
++
++class CountingCLIP(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.calls = 0
++
++    def forward(self, videos):
++        self.calls += 1
++        return torch.stack([torch.ones(257, 1280, device=video.device,
++                                       dtype=video.dtype) * video.mean()
++                            for video in videos])
++
++
++def tiny_policy_model():
++    from vpp2.models.wan21_14b.vpp2 import VPP2
++    from vpp2.models.wan21_14b.wan_video_dit import WanVideoDiT
++    from vpp2.models.wan21_14b.action_dit import ActionDiT
++
++    torch.manual_seed(13)
++    video = WanVideoDiT(hidden_dim=24, num_heads=2, attn_head_dim=12,
++                        ffn_dim=48, freq_dim=8, text_dim=8, num_layers=2,
++                        video_attention_mask_mode="bidirectional")
++    action = ActionDiT(hidden_dim=24, action_dim=16, num_heads=2, attn_head_dim=12,
++                       ffn_dim=48, freq_dim=8, text_dim=8, num_layers=2, eps=1e-6)
++    mot = MoT({"video": video, "action": action}, mot_checkpoint_mixed_attn=False)
++    return VPP2(video, action, mot, CountingVAE(), clip_encoder=CountingCLIP(),
++                text_dim=8, proprio_dim=16, action_visible_video_frames=5).eval()
++
++
++class FullInferenceTests(unittest.TestCase):
++    def setUp(self):
++        self.rgb = {sensor: np.zeros((8, 8, 3), dtype=np.uint8) for sensor in range(3)}
++        self.image = torch.zeros(1, 3, 32, 48)
++
++    def kwargs(self):
++        return dict(prompt=None, input_image=self.image, action_horizon=4,
++                    context=torch.zeros(1, 2, 8), context_mask=torch.ones(1, 2, dtype=torch.bool),
++                    proprio=torch.zeros(1, 16), seed=12, video_seed=42,
++                    num_video_frames=17, num_inference_steps=10)
++
++    def test_real_infer_action_window_parity_and_incremental_encoder_counts(self):
++        model = tiny_policy_model()
++        kwargs = self.kwargs()
++        condition = self.image.unsqueeze(2).repeat(1, 1, 9, 1, 1)
++        baseline = model.infer_action(**kwargs, condition_video=condition)["action"]
++        runtime = VPP2IKVRuntime(mode="window_refresh", scorer=FakeScorer(), expected_layers=2)
++        runtime.observe(0, self.rgb)
++        with runtime.request(task="move", step=0, selected_steps=[0]*9,
++                             anchor_image=self.image) as request:
++            window = model.infer_action(**kwargs, condition_video=condition,
++                                        ikv_context=request)["action"]
++        self.assertTrue(torch.equal(baseline, window))
++        self.assertEqual(model.vae.frames_seen, [9, 9])
++
++        incremental = VPP2IKVRuntime(mode="incremental_reuse", scorer=FakeScorer(), expected_layers=2)
++        model.vae.frames_seen.clear()
++        model.clip_encoder.calls = 0
++        action_calls = []
++        original = model._predict_action_noise_with_cache
++        def checked_action(**call):
++            action_calls.append(call["video_seq_len"])
++            self.assertEqual(call["video_kv_cache"][0]["k"].shape[1], 30)
++            return original(**call)
++        model._predict_action_noise_with_cache = checked_action
++        for step in (0, 25):
++            incremental.observe(step, self.rgb)
++            with incremental.request(task="move", step=step, anchor_image=self.image) as request:
++                result = model.infer_action(**kwargs, ikv_context=request)
++            self.assertEqual(result["action"].shape, (4, 16))
++            self.assertTrue(torch.isfinite(result["action"]).all())
++        self.assertEqual(model.vae.frames_seen, [1, 1])
++        self.assertEqual(model.clip_encoder.calls, 1)
++        self.assertEqual(action_calls, [30]*20)
++        self.assertEqual(incremental.last_diagnostics["query_tokens"], 18)
++
++    def test_get_model_exposes_switch_without_code_changes(self):
++        from unittest.mock import patch
++        from vpp2.policy import get_model
++        for mode in ("off", "window_refresh", "incremental_reuse"):
++            with patch("vpp2.policy.RoboDojoVPP2Policy") as constructor:
++                args = {"checkpoint_path": "policy.pt", "wan_model_dir": "wan",
++                        "history_mode": mode,
++                        "ikv": {"source_root": "scorer", "checkpoint": "score.pt",
++                                "encoder_path": "encoder"}}
++                get_model(args)
++                self.assertEqual(constructor.call_args.kwargs["history_mode"], mode)
++                self.assertEqual(constructor.call_args.kwargs["ikv_config"], args["ikv"])
++        with patch("vpp2.policy.RoboDojoVPP2Policy") as constructor:
++            get_model({"checkpoint_path": "policy.pt", "wan_model_dir": "wan"})
++            self.assertEqual(constructor.call_args.kwargs["history_mode"], "off")
++
++    def test_policy_routes_current_only_and_aborts_nan_actions(self):
++        from vpp2.policy import RoboDojoVPP2Policy
++        policy = RoboDojoVPP2Policy.__new__(RoboDojoVPP2Policy)
++        policy._history_mode = "incremental_reuse"
++        policy._ikv_config = {}
++        policy._ikv_scorer_template = FakeScorer()
++        policy.model = tiny_policy_model()
++        policy.model.encode_prompt = lambda prompt: (torch.zeros(1, 2, 8),
++                                                     torch.ones(1, 2, dtype=torch.bool))
++        for name in policy._PER_ENV_STATE:
++            setattr(policy, name, {})
++        policy._inference_index = 0
++        policy._request_context = {}
++        policy.history_condition_frames = 8
++        policy.history_stride = 25
++        policy.history_buffer_size = 177
++        policy.action_horizon = 4
++        policy.output_action_dim = 16
++        policy.base_seed = 12
++        policy.video_seed_offset = 30
++        policy.visual_planning_output_root = None
++        policy.visual_planning_full_steps = 10
++        policy.negative_prompt = ""
++        policy.text_cfg_scale = 1.0
++        policy.num_inference_steps = 10
++        policy.sigma_shift = 1.0
++        policy.rand_device = "cpu"
++        policy.tiled = False
++        policy.num_video_frames = 17
++        policy._compose_observation_image = lambda observation: self.image
++        policy._normalize_state = lambda state: torch.zeros(1, 16)
++        policy._denormalize_action = lambda action: action.numpy()[None]
++        def forbidden_window(*args, **kwargs):
++            raise AssertionError("incremental path requested historical RGB")
++        policy._build_history_condition = forbidden_window
++        obs = {"env_idx": 0, "joint_action": {"vector": np.zeros(16)},
++               "observation": {name: {"rgb": self.rgb[sensor]}
++                               for sensor, name in enumerate(
++                                   ("head_camera", "left_camera", "right_camera"))}}
++        policy.observe(obs)
++        result = policy._infer_action_chunk(obs, "move")
++        self.assertEqual(result.shape, (4, 16))
++        bank = policy._ikv_by_env[0].bank
++        original_ids = bank.candidate_ids
++        policy.observe(obs)
++        policy.model._predict_action_noise_with_cache = lambda **kwargs: torch.full_like(
++            kwargs["latents_action"], float("nan"))
++        with self.assertRaisesRegex(ValueError, "Nonfinite IKV actions"):
++            policy._infer_action_chunk(obs, "move")
++        self.assertEqual(bank.candidate_ids, original_ids)
++        with self.assertRaisesRegex(RuntimeError, "Reset every environment"):
++            policy.set_history_mode("window_refresh")
++        policy.reset()
++        policy.set_history_mode("window_refresh")
++        self.assertEqual(policy.history_mode, "window_refresh")
++
++
++if __name__ == "__main__":
++    unittest.main()
++

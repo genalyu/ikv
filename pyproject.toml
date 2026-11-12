@@ -59,7 +59,7 @@ homepage = "https://github.com/neoteai/N0-TWAM"
 repository = "https://github.com/neoteai/N0-TWAM"
 
 [tool.setuptools.packages.find]
-include = ["n0_twam*"]
+include = ["n0_twam*", "ikv_runtime*"]
 
 [tool.black]
 line-length = 88

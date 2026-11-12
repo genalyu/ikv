@@ -1,0 +1,1349 @@
+--- /dev/null
++++ b/policy/HWM_0_preview/IKV.md
+@@ -0,0 +1,85 @@
++# HWM IKV deployment and experimental modes
++
++The default `ikv.history_mode: off` keeps the original inference path. Enabling IKV requires the sibling `ikv_runtime` package on `PYTHONPATH` (or installed from its source) and real learned scorer assets. The scorer uses its own pinned Qwen3.5-0.8B encoder; it never shares weights or features with the native HWM Planner. There is no heuristic fallback when scorer files or revisions are incompatible.
++
++## Two independent switches
++
++Set these fields under `ikv` in `deploy.yml`:
++
++| `history_mode` | `planner_mode` | Behavior |
++| --- | --- | --- |
++| `window_refresh` | `lower_only` | Re-encode the original lower-model history window and the native Planner history. Score lower-model KV using the task alone. |
++| `incremental_reuse` | `lower_only` | Encode each new observation; reuse historical KV and cached native Planner image features. Planner history and semantic behavior remain native; lower KV scoring is task-only. |
++| `window_refresh` | `interactive` | Scorer retrieves historical head images for Planner; Planner freshly encodes those images. Updated subtask and semantic memory condition a second scorer call for lower KV. The lower native history window is independently refreshed. |
++| `incremental_reuse` | `interactive` | Same two-stage Planner/scorer interaction, reusing cached historical Planner image features and lower-model KV. Only new observations are encoded. |
++
++`incremental` is accepted as an alias for `incremental_reuse`, matching the DM05 side implementation's naming. Unlike DM05's same-format frame archive, HWM's two modes intentionally archive different native representations (packed temporal history versus current-head tokens), so switching modes requires an episode reset. `off` requires `planner_mode: lower_only`. The scorer's separate immutable image feature cache is used in both enabled history modes, but scores are recomputed using current context. `interactive` first uses the previous subtask/memory for coarse image retrieval, then the newly produced subtask/merged memory for fine KV scoring; it introduces no circular same-round dependency. Planner's learned WORLD/ACTION outputs still condition the model through its existing interfaces; they are not substituted for scorer encoder features.
++
++Example configuration (replace all three paths with actual assets):
++
++```yaml
++ikv:
++  history_mode: incremental_reuse
++  planner_mode: interactive
++  source_root: /path/to/scorer/source
++  checkpoint: /path/to/selected/scorer-head.pt
++  encoder_path: /path/to/pinned/Qwen3.5-0.8B
++  device: cuda:0
++  max_bytes: 68719476736
++  max_frames: 2048
++```
++
++Python callers may use `model.set_ikv_modes(history_mode="window_refresh", planner_mode="lower_only")`. Switching either axis resets all episode state. Restart client episodes at step zero after any mode change or server reset. An enabled mode cannot silently resume an episode for which the server has no archive.
++
++## What is retained and selected
++
++The lower-model historical capacity follows the original packing warmup: 0 slots for no history, 80 for 1–3 historical RGB observations, 160 for 4–7, 180 for 8–15, and 186 for 16–20. All current candidates and archived candidates are jointly scored; no arbitrary 80/106 protection split is imposed. Selection is a single stable ID plan across every layer. Missing rows are right-padded and masked, never counted as real observations.
++
++`window_refresh` archives actual pre-RoPE K/V at the native packed-history positions, including native spatial scales and temporal supports. Temporal VAE support metadata conservatively includes its causal RGB prefix. `incremental_reuse` instead archives each round's actual current-head K/V (80 positions) and later reads those as historical KV. It does not reconstruct old temporal VAE latents or run old historical queries. This is a different memory representation from native multi-frame history packing; it is not numerically equivalent to refreshing the original window. Deep historical states preserve the context in which they were created.
++
++Keys are stored before RoPE. Retrieval preserves each token's native spatial position and pooled complex frequency, shifting temporal phase into the current round's coordinates without assuming pooled RoPE has unit magnitude. The original directed mask remains in place: actions do not directly attend historical slots; history influences actions through video states. Selected KV are inserted before the first attention of the first denoising step and reused through that action chunk. Archive commits occur only after finite actions have been validated; failed inference aborts the KV transaction and does not publish semantic updates.
++
++## Native Planner image encoding
++
++In `incremental_reuse`, each new standalone head view is encoded and cached alongside that round's current three-camera mosaic. A head-only image and a mosaic crop do not have equivalent visual features. Old head features are then reused without re-encoding their RGB. The original Qwen language-model prompt/query prefill is still recomputed; this feature cache does not make the hybrid/recurrent Planner a persistent ordinary KV transformer.
++
++Strict current-only incremental operation requires `replan_steps` to equal the native history sampling interval (30 steps for this checkpoint), no skipped observation boundaries, and an episode starting at step zero. Otherwise unseen intermediate historical head frames could require old RGB encoding, so the implementation rejects the request. Window refresh supports the native configured replanning cadence.
++
++The updated `ContextClient` adds a stable client/slot identity for resetting server-side archives between episodes. Baseline ignores this additive field. RPC retries with identical inputs reuse the completed result; changed semantic context, state, or RGB under the same step is rejected. Legacy repeated `get_action` after its own committed semantic update also reuses the result.
++
++## Validation and limits
++
++CPU tests execute actual small HWM video/action DiT blocks, including first-step selection influence, per-layer archival, native-mask preservation, source position relocation, all native budget transitions, and transaction abort. The off path matches the original git source bitwise in these fixtures; selecting all fresh native members matches native output within numerical tolerance. Driver tests cover all four combinations, VAE/Planner cache routing, task-only versus interactive scoring, RPC/legacy replay, episode reset, and NaN rollback.
++
++Run from an environment with PyTorch, NumPy, Pillow and PyYAML:
++
++```bash
++PYTHONPATH=/path/to/ikv_runtime/parent:/path/to/HWM_0_preview \
++  python -m unittest discover -s /path/to/HWM_0_preview/tests -p 'test_hwm*.py' -v
++```
++
++These are code/integration tests, not full-checkpoint inference or RoboDojo results. The HWM checkpoint and its native Qwen/extension dependencies are still required. This adapter does not itself add pipeline-parallel weight partitioning. Full two-4090 PP loading, peak VRAM, latency and benchmark validation must be performed separately before running the requested evaluations.
++
++`max_bytes` caps archived K/V only. RGB and both encoders' feature caches are additional memory; `max_frames` is an explicit retention guard. The implementation fails rather than silently drop RGB still referenced by live archived KV. Archived image features and raw observations are episode-local and cleared on reset.
++
++
++## Canonical heuristic inference
++
++Set `ikv.backend: formula`, with `source_root` pointing to the current IKV
++core and `encoder_path` to verified raw DINOv3 assets. The new formula is the
++un-normalized sum of recency, visual contact decay and prototype-gated class
++recency, all weights one, threshold 0.75, decay 8 world/control steps. There
++is no random mixture. The bridge converts adapter seconds back to world steps
++explicitly (VPP2: 25 Hz; HWM: native control clock). DINO uses its own frozen
++encoder and maps its 14x14 scores to native KV provenance by area and temporal
++support. It does not share the Planner encoder.
++
++Native RGB-only requests have no contact-duration sidecar; their absent-contact
++value is d=0. The bridge accepts validated per-sensor contact durations (world
++steps) when a caller supplies them; it never guesses contact from RGB.
++Formula scoring has no instruction/subtask/semantic-memory term, so HWM formula
++runs require `planner_mode: lower_only`. Native Planner still runs normally.
++The learned backend retains its independent `interactive` option. Both history
++update modes remain available for formula runs. Feature caching and class-index
++reuse are episode-local and use only causal real observations. Prototype overflow
++fails explicitly rather than silently evicting classes.
+--- a/policy/HWM_0_preview/README.md
++++ b/policy/HWM_0_preview/README.md
+@@ -124,3 +124,7 @@
+ 
+ Keep all files together and pass `./HWM-0-Preview-RoboDojo` as `ckpt_name`.
+ All evaluation seeds can share this directory.
++
++## IKV variants
++
++The original path remains the default. The optional [IKV adapter](IKV.md) exposes independent `ikv.history_mode` (`window_refresh` / `incremental_reuse`) and `ikv.planner_mode` (`lower_only` / `interactive`) switches. The learned scorer retains its separate Qwen3.5-0.8B encoder; native HWM Planner weights are unchanged. See the linked configuration, reset/cadence requirements, tests, and current full-model/PP validation limits before deployment.
+--- a/policy/HWM_0_preview/deploy.yml
++++ b/policy/HWM_0_preview/deploy.yml
+@@ -15,3 +15,14 @@
+ replan_steps: null
+ flow_shift: null
+ inference_batch_size: 4
++
++# Independent experiment axes. Enable only after supplying real scorer assets.
++ikv:
++  history_mode: off       # off | window_refresh | incremental_reuse (alias: incremental)
++  planner_mode: lower_only # lower_only | interactive
++  source_root: ""         # Source tree containing training/parallel_scorer
++  checkpoint: ""          # Learned scorer head checkpoint, SFT or RL
++  encoder_path: ""        # Independent pinned Qwen3.5-0.8B encoder directory
++  device: cuda:0
++  max_bytes: 68719476736  # KV archive cap only; excludes RGB/feature caches
++  max_frames: 2048        # Explicit per-episode RGB retention guard
+--- /dev/null
++++ b/policy/HWM_0_preview/formula_example.yml
+@@ -0,0 +1,11 @@
++# Merge into deploy.yml; replace the two paths with local verified assets.
++ikv:
++  backend: formula
++  history_mode: incremental_reuse
++  planner_mode: lower_only
++  source_root: /path/to/ikv
++  encoder_path: /path/to/verified/dinov3-assets
++  device: cuda:0
++  max_bytes: 68719476736
++  max_frames: 2048
++  max_prototypes: 4096
+--- a/policy/HWM_0_preview/hwm/model/denoising.py
++++ b/policy/HWM_0_preview/hwm/model/denoising.py
+@@ -195,6 +195,7 @@
+     action_kv: list[tuple[torch.Tensor, torch.Tensor]]
+     world_kv: list[tuple[torch.Tensor, torch.Tensor]]
+     static_kv: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
++    ikv: object | None = None
+ 
+ 
+ def prepare_cache(network, text, world_queries, action_context, history):
+@@ -360,12 +361,20 @@
+             if skip and column > 0:
+                 v_part = torch.cat((cache.static_kv[index][column - 1], v_part), dim=2)
+             joined.append(torch.cat((v_part, a_part), dim=2))
++        # The historical K/V replacement is active before the FIRST SDPA.
++        # Incremental mode has no historical queries; its old K/V are read-only.
++        if cache is not None and cache.ikv is not None and not skip:
++            selected_key, selected_value = cache.ikv.layer(
++                index, video_qkv[1], video_qkv[2], history_count
++            )
++            joined[1] = torch.cat((selected_key, joined[1][:, :, history_count:]), 2)
++            joined[2] = torch.cat((selected_value, joined[2][:, :, history_count:]), 2)
+         if cache is not None and not skip:
++            static_count = (
++                cache.ikv.budget if cache.ikv is not None else history_count
++            ) + cfg.tokens_per_frame
+             cache.static_kv.append(
+-                tuple(
+-                    x[:, :, : history_count + cfg.tokens_per_frame].clone()
+-                    for x in joined[1:]
+-                )
++                tuple(x[:, :, :static_count].clone() for x in joined[1:])
+             )
+         attended = (
+             F.scaled_dot_product_attention(*joined, attn_mask=mask)
+@@ -447,6 +456,7 @@
+     flow_shift: float | None = None,
+     use_kv_cache: bool = True,
+     noise: tuple[torch.Tensor, torch.Tensor] | None = None,
++    ikv_request=None,
+ ):
+     """Return the configured horizon of normalized absolute joint actions and denoised video latents.
+ 
+@@ -504,9 +514,11 @@
+     action_context = torch.cat((action_queries, state_token), dim=1)
+     cache = (
+         prepare_cache(network, text, world_queries, action_context, history)
+-        if use_kv_cache and num_inference_steps > 1
++        if (use_kv_cache and num_inference_steps > 1) or ikv_request is not None
+         else None
+     )
++    if ikv_request is not None:
++        ikv_request.prepare(cache)
+     for timestep, delta in zip(times, deltas, strict=True):
+         video_velocity, action_velocity = joint_velocity(
+             network,
+--- /dev/null
++++ b/policy/HWM_0_preview/hwm/model/ikv.py
+@@ -0,0 +1,269 @@
++"""Episode-scoped HWM IKV. Scorer and native Planner encoders stay separate.
++
++incremental_reuse archives current-head KV, not a reconstruction of temporal
++history-pack KV. Native history capacity/masks are retained; representation and
++context freshness deliberately differ from window_refresh.
++"""
++from collections import OrderedDict
++from dataclasses import dataclass
++import hashlib
++import math
++
++import numpy as np
++import torch
++
++from .denoising import axis_rope, joint_mask, rotate, video_rope
++
++
++@dataclass(frozen=True)
++class IKVOptions:
++    backend: str = "learned"
++    max_prototypes: int = 4096
++    history_mode: str = "off"
++    planner_mode: str = "lower_only"
++    source_root: str = ""
++    checkpoint: str = ""
++    encoder_path: str = ""
++    device: str = "cuda:0"
++    max_bytes: int = 64 * 1024**3
++    max_frames: int = 2048
++
++    @classmethod
++    def parse(cls, value):
++        value = {} if value is None else value
++        if not isinstance(value, dict):
++            raise ValueError("ikv must be a mapping")
++        unknown = set(value) - set(cls.__dataclass_fields__)
++        if unknown:
++            raise ValueError(f"Unknown IKV options: {sorted(unknown)}")
++        value = dict(value)
++        if value.get("history_mode") == "incremental":
++            value["history_mode"] = "incremental_reuse"
++        options = cls(**value)
++        if options.backend not in {"learned", "formula"}:
++            raise ValueError("Unknown IKV backend")
++        if options.backend == "formula" and options.planner_mode == "interactive":
++            raise ValueError("Formula has no Planner-feedback term; use lower_only")
++        if options.history_mode not in {"off", "window_refresh", "incremental_reuse"}:
++            raise ValueError("Invalid IKV history_mode")
++        if options.planner_mode not in {"lower_only", "interactive"}:
++            raise ValueError("Invalid IKV planner_mode")
++        if options.history_mode == "off" and options.planner_mode != "lower_only":
++            raise ValueError("interactive requires an enabled IKV history_mode")
++        if type(options.max_bytes) is not int or options.max_bytes <= 0:
++            raise ValueError("max_bytes must be positive")
++        if type(options.max_frames) is not int or options.max_frames < 21:
++            raise ValueError("max_frames must be at least 21")
++        return options
++
++
++def native_history_budget(history_count, cfg):
++    """Count the actual native packing layout without running the VAE."""
++    if history_count == 0:
++        return 0
++    length = history_count // cfg.temporal_stride + 1
++    gh, gw = cfg.head_grid
++    kernels = cfg.m["history_kernels"]
++    ph, pw = cfg.m["patch_size"][1:]
++    def size(n, kernel):
++        kt, kh, kw = kernel
++        return math.ceil(n / kt) * math.ceil(gh / (kh // ph)) * math.ceil(gw / (kw // pw))
++    total = size(1, kernels[0]) * (2 if length > 1 else 1)
++    near = max(1, length - 1 - cfg.history["near_latents"])
++    if length > 2:
++        total += size(length - 1 - near, kernels[1])
++    if near > 1:
++        total += size(near - 1, kernels[2])
++    return total
++
++
++class HWMRequest:
++    """One selection plan, before the first attention, shared by every layer."""
++    def __init__(self, episode, step, history_offsets, mode, subtask, memory):
++        self.episode = episode
++        self.cfg = episode.cfg
++        self.step = step
++        self.offsets = history_offsets
++        self.mode = mode
++        self.subtask, self.memory = subtask, memory
++        self.budget = native_history_budget(len(history_offsets), self.cfg)
++        self.tx = None
++        self.fresh = []
++        self.positions = {}
++        self.selected_freqs = None
++        self.valid_mask = None
++        self.layers_seen = set()
++
++    def _head_candidates(self):
++        from ikv_runtime import Candidate, Region
++        cfg, step = self.cfg, self.step
++        gh, gw = cfg.head_grid
++        frame_id = self.episode.frame_id(step)
++        candidates = []
++        for y in range(gh):
++            for x in range(gw):
++                candidates.append(Candidate(
++                    uid=f"current_head:{frame_id}:{y}:{x}",
++                    time=step / cfg.history["control_clock_hz"],
++                    regions=(Region(frame_id, 0, (y/gh, x/gw, (y+1)/gh, (x+1)/gw)),),
++                    provenance="hwm_current_head_incremental_v1",
++                ))
++        freqs = video_rope(torch.tensor([0.0]), gh, gw, cfg).reshape(-1, cfg.m["head_dim"] // 2)
++        return candidates, freqs
++
++    def _packed_candidates(self, packed):
++        from ikv_runtime import Candidate, Region
++        cfg = self.cfg
++        if packed is None:
++            return [], torch.empty(0, cfg.m["head_dim"] // 2, dtype=torch.complex64)
++        stride = cfg.temporal_stride
++        count = stride * (len(self.offsets) // stride)
++        raw_steps = [self.step + offset for offset in self.offsets] + [self.step]
++        raw_steps = [raw_steps[0], *raw_steps[-count:]] if count else [raw_steps[0]]
++        # Wan uses temporal convolutions: use a conservative causal prefix for
++        # scorer provenance, rather than claiming each latent sees only four RGBs.
++        supports = [raw_steps[:1]] + [raw_steps[:i+1] for i in range(stride, len(raw_steps), stride)]
++        length = len(supports)
++        groups = [(cfg.m["history_kernels"][0], [slice(0, 1)])]
++        if length > 1:
++            groups[0][1].append(slice(length-1, length))
++        near = max(1, length-1-cfg.history["near_latents"])
++        if length > 2:
++            groups.append((cfg.m["history_kernels"][1], [slice(near, length-1)]))
++        if near > 1:
++            groups.append((cfg.m["history_kernels"][2], [slice(1, near)]))
++        gh, gw = cfg.head_grid
++        ph, pw = cfg.m["patch_size"][1:]
++        candidates = []
++        for kernel, spans in groups:
++            kt, kh, kw = kernel
++            sy, sx = kh // ph, kw // pw
++            for span in spans:
++                selected = supports[span]
++                for begin in range(0, len(selected), kt):
++                    frames = sorted(set(s for support in selected[begin:begin+kt] for s in support))
++                    for y in range(0, gh, sy):
++                        for x in range(0, gw, sx):
++                            box = (y/gh, x/gw, min(y+sy, gh)/gh, min(x+sx, gw)/gw)
++                            regions = tuple(Region(self.episode.frame_id(s), 0, box, 1/len(frames)) for s in frames)
++                            signature = repr((frames, tuple(kernel), y, x)).encode()
++                            uid = "packed:" + hashlib.sha256(signature).hexdigest()[:24]
++                            candidates.append(Candidate(uid, max(frames)/cfg.history["control_clock_hz"], regions, "hwm_historypack_v1_causal_support"))
++        if len(candidates) != packed[0].shape[1]:
++            raise RuntimeError("History metadata does not match native packing")
++        return candidates, packed[1][0, :, 0].detach().cpu()
++
++    def prepare(self, cache):
++        if self.mode == "incremental_reuse":
++            self.fresh, frequencies = self._head_candidates()
++        else:
++            self.fresh, frequencies = self._packed_candidates(cache.packed)
++        self.positions = dict(self.episode.positions)
++        self.positions.update({candidate.uid: (frequencies[i], self.step) for i, candidate in enumerate(self.fresh)})
++        def scores(candidates):
++            return self.episode.scorer.score(candidates, task=self.episode.task,
++                query_time=self.step/self.cfg.history["control_clock_hz"],
++                subtask=self.subtask, memory=self.memory)
++        self.tx = self.episode.bank.begin(self.fresh, self.budget, score_fn=scores)
++        selected_freqs = []
++        time_width = self.cfg.rope["video_axes"][0] // 2
++        for uid in self.tx.selected_ids:
++            freq, origin_step = self.positions[uid]
++            freq = freq.clone()
++            shift = (origin_step-self.step) / self.cfg.latent_time_steps
++            freq[:time_width] *= axis_rope(torch.tensor([shift]), self.cfg.rope["video_axes"][0], self.cfg.rope["base"])[0]
++            selected_freqs.append(freq)
++        self.valid_mask = torch.as_tensor(self.tx.valid_mask, dtype=torch.bool, device=cache.mask.device)
++        while len(selected_freqs) < self.budget:
++            selected_freqs.append(torch.ones(self.cfg.m["head_dim"]//2, dtype=torch.complex64))
++        self.selected_freqs = (torch.stack(selected_freqs)[None, :, None].to(cache.mask.device)
++            if selected_freqs else torch.empty(1, 0, 1, self.cfg.m["head_dim"]//2, dtype=torch.complex64, device=cache.mask.device))
++        mask = joint_mask(self.budget, cache.mask.device, self.cfg).clone()
++        mask[..., :self.budget] &= self.valid_mask
++        if self.mode == "incremental_reuse":
++            mask = mask[:, :, self.budget:, :]
++        cache.mask = mask
++        cache.ikv = self
++
++    def layer(self, index, raw_key, raw_value, history_queries):
++        if index in self.layers_seen:
++            raise RuntimeError("IKV layer was populated twice")
++        cfg = self.cfg
++        n = len(self.fresh)
++        start = 0 if self.mode == "window_refresh" else history_queries
++        def extract(value):
++            return value[:, start:start+n].unflatten(-1, (cfg.m["heads"], cfg.m["head_dim"])).transpose(1, 2).contiguous()
++        selected_key, selected_value, valid = self.tx.layer(index, extract(raw_key), extract(raw_value), seq_dim=2)
++        if not torch.equal(torch.as_tensor(valid, device=self.valid_mask.device), self.valid_mask):
++            raise RuntimeError("IKV selection differs across layers")
++        self.layers_seen.add(index)
++        flat = selected_key.transpose(1, 2).flatten(2)
++        return rotate(flat, self.selected_freqs, cfg), selected_value
++
++    def commit(self):
++        self.tx.commit()
++        live = {candidate.uid for candidate in self.episode.bank.candidates}
++        self.episode.positions = {uid: value for uid, value in self.positions.items() if uid in live}
++
++    def abort(self):
++        if self.tx is not None:
++            self.tx.abort()
++
++
++class EpisodeIKV:
++    def __init__(self, key, cfg, options, scorer, task):
++        from ikv_runtime import ArchiveBank
++        self.key, self.cfg, self.options, self.task = key, cfg, options, task
++        self.scorer = scorer
++        self.bank = ArchiveBank(expected_layers=cfg.m["layers"], max_bytes=options.max_bytes)
++        self.positions = {}
++        self.frames = OrderedDict()
++        self.planner_features = OrderedDict()
++        self.last_step = -1
++        self.last_result = None
++        self.last_input_digest = None
++        self.last_input_semantics = None
++
++    def frame_id(self, step):
++        return f"{self.key}:{step}"
++
++    def register(self, step, current, history):
++        cfg = self.cfg
++        for frame, offset in zip(*history, strict=True):
++            self._register_head(step+offset, frame)
++        head = current[:cfg.observation.height]
++        self._register_head(step, head)
++        h, w = cfg.observation.height, cfg.observation.width
++        self.scorer.register_frame(self.frame_id(step), step/cfg.history["control_clock_hz"],
++            {0:head, 1:current[h:, :w//2], 2:current[h:, w//2:]})
++        # KV references retained in the archive must keep their scorer frames.
++        needed = {r.frame_id for c in self.bank.candidates for r in c.regions}
++        needed.update(self.frame_id(step+offset) for offset in history[1])
++        needed.add(self.frame_id(step))
++        while len(self.frames) > self.options.max_frames:
++            victim = next((s for s in self.frames if self.frame_id(s) not in needed), None)
++            if victim is None:
++                raise RuntimeError("IKV RGB retention cap reached by live archive; increase max_frames or reduce max_bytes")
++            del self.frames[victim]
++            self.planner_features.pop((self.frame_id(victim), "head"), None)
++
++    def _register_head(self, step, head):
++        if step in self.frames:
++            if not np.array_equal(self.frames[step], head):
++                raise ValueError("Frame ID reused with different image pixels")
++            return
++        self.scorer.register_frame(self.frame_id(step), step/self.cfg.history["control_clock_hz"], {0:head})
++        self.frames[step] = np.asarray(head).copy()
++
++    def planner_history(self, step, native_history, subtask, memory):
++        if self.options.planner_mode == "lower_only":
++            return native_history
++        from ikv_runtime import Candidate, Region
++        frames = [s for s in self.frames if s < step]
++        candidates = [Candidate(f"planner:{self.frame_id(s)}", s/self.cfg.history["control_clock_hz"],
++            (Region(self.frame_id(s), 0, (0., 0., 1., 1.)),), "hwm_planner_head") for s in frames]
++        scores = self.scorer.score(candidates, task=self.task,
++            query_time=step/self.cfg.history["control_clock_hz"], subtask=subtask, memory=memory)
++        count = min(len(native_history[0]), self.cfg.history["max_frames"])
++        selected = sorted(sorted(zip(frames, candidates), key=lambda x:(-scores[x[1].uid], x[0]))[:count])
++        return [self.frames[s] for s, _ in selected], [s-step for s, _ in selected]
+--- a/policy/HWM_0_preview/hwm/model/planner.py
++++ b/policy/HWM_0_preview/hwm/model/planner.py
+@@ -12,7 +12,7 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def planner_message(instruction, memory, subtask, current, history, cfg):
++def planner_message(instruction, memory, subtask, current, history, cfg, history_offsets=None):
+     if not isinstance(instruction, str) or not instruction.strip():
+         raise ValueError("Planner requires a nonempty instruction")
+     prompt = cfg.conditioning["planner_prompt"].format(
+@@ -23,9 +23,13 @@
+         content.append(
+             {
+                 "type": "text",
+-                "text": cfg.conditioning["history_prompt"].format(
+-                    interval_seconds=cfg.history["sample_interval_steps"]
+-                    / cfg.history["control_clock_hz"]
++                "text": (
++                    cfg.conditioning["history_prompt"].format(
++                        interval_seconds=cfg.history["sample_interval_steps"] / cfg.history["control_clock_hz"]
++                    ) if history_offsets is None else
++                    "Retrieved head-camera memories, oldest to newest; ages in seconds: "
++                    + ", ".join(f"{-offset/cfg.history['control_clock_hz']:.3f}" for offset in history_offsets)
++                    + ". These observations are not uniformly spaced."
+                 ),
+             }
+         )
+@@ -187,46 +191,67 @@
+         )[0]
+ 
+     @torch.no_grad()
+-    def _images_many(self, inputs, history_counts):
++    def _images_many(self, inputs, history_counts, caches=None, image_keys=None):
++        """Cache native pre-pooling image features, never scorer features/LLM KV."""
+         device = self.network.world_queries.device
+-        grids = torch.cat([x["image_grid_thw"] for x in inputs])
+-        pixels = torch.cat([x["pixel_values"] for x in inputs])
+-        lengths = grids.prod(-1).tolist()
+-        features, cursor = [], 0
+-        for start in range(0, len(grids), self.vision_encode_batch_size):
+-            end = cursor + sum(lengths[start : start + self.vision_encode_batch_size])
++        caches = [None] * len(inputs) if caches is None else caches
++        image_keys = [[None] * (n+1) for n in history_counts] if image_keys is None else image_keys
++        features, grids, pending = [], [], []
++        for row, count, cache, keys in zip(inputs, history_counts, caches, image_keys, strict=True):
++            row_grids = row["image_grid_thw"]
++            if len(keys) != count+1 or len(row_grids) != count+1:
++                raise ValueError("Planner image cache keys do not match image count")
++            cursor = 0
++            for grid, key in zip(row_grids, keys, strict=True):
++                length = int(grid.prod())
++                pixels = row["pixel_values"][cursor:cursor+length]
++                cursor += length
++                index = len(features)
++                cached = None if cache is None or key is None else cache.get(key)
++                expected_tokens = int(grid.prod()) // self.merge_size**2
++                if cached is not None and (cached.ndim != 2 or cached.shape[0] != expected_tokens
++                    or cached.shape[1] != self.config.planner_width):
++                    raise ValueError("Cached Planner feature shape disagrees with native image grid/width")
++                features.append(None if cached is None else cached.to(device=device))
++                grids.append(grid)
++                if cached is None:
++                    pending.append((index, pixels, grid, cache, key))
++        for start in range(0, len(pending), self.vision_encode_batch_size):
++            batch = pending[start:start+self.vision_encode_batch_size]
+             output = self.network.vlm.model.get_image_features(
+-                pixels[cursor:end].to(device=device, dtype=torch.bfloat16),
+-                grids[start : start + self.vision_encode_batch_size].to(device),
+-                return_dict=True,
++                torch.cat([item[1] for item in batch]).to(device=device, dtype=torch.bfloat16),
++                torch.stack([item[2] for item in batch]).to(device), return_dict=True,
+             ).pooler_output
+-            features.extend(output)
+-            cursor = end
+-        groups = {}
+-        first = 0
++            for (index, _, _, cache, key), value in zip(batch, output, strict=True):
++                features[index] = value
++                if cache is not None and key is not None:
++                    cache[key] = value.detach().cpu().clone()
++        grids = torch.stack(grids)
++        groups, first = {}, 0
+         for count in history_counts:
+-            for i in range(first, first + count):
++            for i in range(first, first+count):
+                 _, h, w = grids[i].tolist()
+-                groups.setdefault(
+-                    (h // self.merge_size, w // self.merge_size), []
+-                ).append(i)
+-            first += count + 1
++                groups.setdefault((h//self.merge_size, w//self.merge_size), []).append(i)
++            first += count+1
+         for (h, w), indices in groups.items():
+             values = torch.stack([features[i].reshape(h, w, -1) for i in indices])
+-            values = F.adaptive_avg_pool2d(
+-                values.permute(0, 3, 1, 2).contiguous(), self.pool_grid
+-            )
+-            for i, value in zip(
+-                indices,
+-                values.permute(0, 2, 3, 1).reshape(len(indices), self.pool_tokens, -1),
+-                strict=True,
+-            ):
++            values = F.adaptive_avg_pool2d(values.permute(0, 3, 1, 2).contiguous(), self.pool_grid)
++            for i, value in zip(indices, values.permute(0, 2, 3, 1).reshape(len(indices), self.pool_tokens, -1), strict=True):
+                 features[i] = value
+         result, cursor = [], 0
+         for count in history_counts:
+-            result.append(torch.cat(features[cursor : cursor + count + 1]))
+-            cursor += count + 1
++            result.append(torch.cat(features[cursor:cursor+count+1]))
++            cursor += count+1
+         return result
++
++    @torch.no_grad()
++    def remember_head(self, request, head, cache, key):
++        """Encode the new head view once; mosaic features cannot replace this view."""
++        if key in cache:
++            return
++        message = planner_message(request["instruction"], request["memory"],
++            request["subtask"], head, [], self.config)
++        self._images_many([self._tokens(message)], [0], [cache], [[key]])
+ 
+     def _prefill_group(self, logicals, features, *, use_cache=True, with_queries=False):
+         device = self.network.world_queries.device
+@@ -337,13 +362,16 @@
+                 x["current"],
+                 x["history"],
+                 self.config,
++                x.get("history_offsets"),
+             )
+             for x in requests
+         ]
+         inputs = [self._tokens(x) for x in messages]
+         counts = [len(x["history"]) for x in requests]
+         logical = [self._compact(x, n) for x, n in zip(inputs, counts, strict=True)]
+-        features = self._images_many(inputs, counts)
++        features = self._images_many(inputs, counts,
++            [x.get("feature_cache") for x in requests],
++            [x.get("image_keys", [None]*(n+1)) for x, n in zip(requests, counts, strict=True)])
+         groups = {}
+         for i, x in enumerate(logical):
+             groups.setdefault(x["input_ids"].shape[1], []).append(i)
+--- a/policy/HWM_0_preview/hwm/runtime/client.py
++++ b/policy/HWM_0_preview/hwm/runtime/client.py
+@@ -46,6 +46,7 @@
+         ):
+             raise ValueError("Invalid server replan_steps")
+         self.episodes = {}
++        self.ikv_session_id = uuid4().hex
+         self.pending = None
+         self.sparse_capture = sparse_capture
+ 
+@@ -115,6 +116,7 @@
+                 "config_hash": self.config_hash,
+                 "request_id": request_id,
+                 "episode_id": slot["id"],
++                "ikv_slot_id": f"{self.ikv_session_id}:{index}",
+                 "step": memory.step,
+                 "state_version": slot["version"],
+                 "semantic": memory.semantic,
+--- a/policy/HWM_0_preview/model.py
++++ b/policy/HWM_0_preview/model.py
+@@ -18,6 +18,7 @@
+ from .hwm.model.memory import EpisodeMemory, composite_image, encode_histories
+ from .hwm.model.network import HWM0Preview
+ from .hwm.model.planner import Planner
++from .hwm.model.ikv import IKVOptions, EpisodeIKV, HWMRequest
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -62,12 +63,17 @@
+             "ws_ping_timeout_s",
+             "request_timeout_s",
+             "relay_url",
++            "ikv",
+         }
+         unknown = set(model_cfg) - allowed
+         if unknown:
+             raise ValueError(
+                 f"Unsupported deployment overrides: {sorted(unknown)}; model semantics belong to the bundle config"
+             )
++        self.ikv_options = IKVOptions.parse(model_cfg.get("ikv"))
++        self.ikv_scorer = None
++        if self.ikv_options.history_mode != "off":
++            self._load_ikv_scorer()
+         policy_dir = Path(__file__).resolve().parent
+         root = resolve_checkpoint_root(model_cfg, policy_dir / "checkpoints")
+         assets = root.parent if root.is_file() else root
+@@ -77,6 +83,9 @@
+         self.num_inference_steps = resolved["num_inference_steps"]
+         self.flow_shift = resolved["flow_shift"]
+         self.replan_steps = resolved["replan_steps"]
++        if (self.ikv_options.history_mode == "incremental_reuse" and
++            self.replan_steps != cfg.history["sample_interval_steps"]):
++            raise ValueError("incremental_reuse requires replan_steps equal to the history sampling interval; otherwise unseen intermediate old RGB would need encoding")
+         self.use_kv_cache = model_cfg.get("use_kv_cache", True)
+         if type(self.use_kv_cache) is not bool:
+             raise ValueError("use_kv_cache must be a boolean")
+@@ -182,9 +191,40 @@
+             "replan_steps": self.replan_steps,
+         }
+ 
++    def _load_ikv_scorer(self):
++        from ikv_runtime import make_scorer
++        from dataclasses import asdict
++        self.ikv_scorer = make_scorer(asdict(self.ikv_options),
++            world_time_hz=self.config.history["control_clock_hz"])
++
++    def set_ikv_modes(self, *, history_mode=None, planner_mode=None):
++        """Switch either experimental axis and reset all episode-local state."""
++        from dataclasses import asdict
++        values = asdict(self.ikv_options)
++        if history_mode is not None:
++            values["history_mode"] = history_mode
++        if planner_mode is not None:
++            values["planner_mode"] = planner_mode
++        options = IKVOptions.parse(values)
++        if (options.history_mode == "incremental_reuse" and
++            self.replan_steps != self.config.history["sample_interval_steps"]):
++            raise ValueError("incremental_reuse requires replan_steps equal to the history sampling interval")
++        if options.history_mode != "off" and self.ikv_scorer is None:
++            previous = self.ikv_options
++            self.ikv_options = options
++            try:
++                self._load_ikv_scorer()
++            except Exception:
++                self.ikv_options = previous
++                raise
++        self.ikv_options = options
++        self.reset()
++
+     def reset(self):
+         self.episodes = {}
+         self.single_env_idx = None
++        self._ikv_episodes = {}
++        self._ikv_slots = {}
+ 
+     def update_obs(self, obs):
+         env_idx = int(obs.get("env_idx", 0))
+@@ -299,6 +339,13 @@
+             episode.step = step
+             episode.semantic, episode.subtask = context["semantic"], context["subtask"]
+             episode.cache_valid = context["cache_valid"]
++            if self.ikv_options.history_mode != "off":
++                slot = context.get("ikv_slot_id")
++                if not isinstance(slot, str) or not slot:
++                    raise ValueError("IKV needs the updated ContextClient ikv_slot_id for episode reset isolation")
++                episode.ikv_episode_id = context["episode_id"]
++                episode.ikv_slot_id = slot
++                episode.ikv_state_version = context["state_version"]
+             indices.append(index)
+             episodes.append(episode)
+             histories.append((list(frames), offsets))
+@@ -353,6 +400,8 @@
+         )
+ 
+     def _predict(self, all_episodes, all_histories, indices):
++        if self.ikv_options.history_mode != "off":
++            return self._predict_ikv(all_episodes, all_histories, indices)
+         result = []
+         for start in range(0, len(indices), self.inference_batch_size):
+             active = indices[start : start + self.inference_batch_size]
+@@ -474,3 +523,123 @@
+                 )
+                 result.append(chunk)
+         return result
++
++    def _predict_ikv(self, episodes, histories, indices):
++        """Serialize per-episode transactions; native baseline batching is unchanged."""
++        import copy
++        import hashlib
++        from .hwm.model.memory import merge_memory
++        result = []
++        for e, native_history, index in zip(episodes, histories, indices, strict=True):
++            key = getattr(e, "ikv_episode_id", f"legacy:{index}")
++            slot = getattr(e, "ikv_slot_id", f"legacy:{index}")
++            previous_key = self._ikv_slots.get(slot)
++            if previous_key is not None and previous_key != key:
++                if e.step != 0:
++                    raise ValueError("An IKV episode must start at step zero")
++                self._ikv_episodes.pop(previous_key, None)
++            if key not in self._ikv_episodes:
++                if e.step != 0:
++                    raise ValueError("Missing IKV archive; restart the episode after a server/mode reset")
++                self._ikv_episodes[key] = EpisodeIKV(key, self.config,
++                    self.ikv_options, self.ikv_scorer.fork(), e.instruction)
++            state = self._ikv_episodes[key]
++            self._ikv_slots[slot] = key
++            if state.task != e.instruction or state.options != self.ikv_options:
++                raise ValueError("Task/memory mode changed without resetting IKV episode")
++            logical_context = (e.semantic, e.subtask, e.cache_valid)
++            if (not hasattr(e, "ikv_state_version") and e.step == state.last_step and
++                state.last_result is not None and logical_context == tuple(state.last_result[1:])):
++                # Legacy get_action can repeat after this same object received
++                # our committed semantic update; RPC retries retain old context.
++                logical_context = state.last_input_semantics
++            digest = hashlib.sha256(e.current.tobytes()+e.state.tobytes())
++            digest.update(repr((e.instruction, native_history[1],
++                getattr(e, "ikv_state_version", None), logical_context)).encode())
++            for frame in native_history[0]:
++                digest.update(frame.tobytes())
++            fingerprint = digest.hexdigest()
++            if e.step == state.last_step:
++                if fingerprint != state.last_input_digest:
++                    raise ValueError("IKV replay has changed inputs")
++                chunk, semantic, subtask, cache_valid = copy.deepcopy(state.last_result)
++                e.semantic, e.subtask, e.cache_valid = semantic, subtask, cache_valid
++                result.append(chunk)
++                continue
++            if e.step < state.last_step:
++                raise ValueError("Out-of-order IKV observation")
++            if (self.ikv_options.history_mode == "incremental_reuse" and state.last_step >= 0
++                and e.step != state.last_step+self.replan_steps):
++                raise ValueError("incremental_reuse cannot skip observation boundaries; restart the episode")
++            state.register(e.step, e.current, native_history)
++            retrieved, offsets = state.planner_history(e.step, native_history, e.subtask, e.semantic)
++            planner_request = dict(instruction=e.instruction, memory=e.semantic,
++                subtask=e.subtask, cache_valid=e.cache_valid, current=e.current,
++                history=retrieved)
++            if self.ikv_options.history_mode == "incremental_reuse":
++                planner_request["feature_cache"] = state.planner_features
++                planner_request["image_keys"] = [(state.frame_id(e.step+offset), "head") for offset in offsets]+[None]
++            if self.ikv_options.planner_mode == "interactive":
++                planner_request["history_offsets"] = offsets
++            # Cache the standalone NEW head view now. The current mosaic's
++            # visual embeddings are not equivalent to head-only embeddings.
++            request = None
++            try:
++                with torch.autocast("cuda", dtype=torch.bfloat16):
++                    if self.ikv_options.history_mode == "incremental_reuse":
++                        self.planner.remember_head(planner_request, e.current[:self.config.observation.height],
++                            state.planner_features, (state.frame_id(e.step), "head"))
++                    p = self.planner.batch([planner_request])[0]
++                    if p[2] == "UPDATE":
++                        next_semantic, next_subtask, next_valid = merge_memory(e.semantic, p[3]), p[4], True
++                    elif p[2] == "KEEP" and e.cache_valid:
++                        next_semantic, next_subtask, next_valid = e.semantic, e.subtask, True
++                    else:
++                        raise ValueError("Invalid Planner semantic transition")
++                    text, text_mask = self.model.encode_video_text(self.tokenizer, [e.instruction], [p[4]])
++                    device = self.model.world_queries.device
++                    pixels = torch.from_numpy(e.current.copy()).float().div(255).mul(2).sub(1)
++                    pixels = pixels.permute(2, 0, 1)[None, :, None].to(device=device, dtype=torch.bfloat16)
++                    first = self.model.encode_video(pixels)
++                    history = None
++                    if self.ikv_options.history_mode == "window_refresh":
++                        # Planner retrieval never changes the lower native window.
++                        h = encode_histories(self.model, [e.current], [native_history])[0]
++                        history = None if h is None else tuple(value[None] for value in h)
++                    mean, std = self.statistics["state"]
++                    normalized_state = np.clip((e.state-mean)/(std+self.config.normalization["epsilon"]),
++                        *self.config.normalization["state_clip"])
++                    states = torch.from_numpy(normalized_state[None]).to(device=device, dtype=torch.bfloat16)
++                    interactive = self.ikv_options.planner_mode == "interactive"
++                    request = HWMRequest(state, e.step, native_history[1], self.ikv_options.history_mode,
++                        next_subtask if interactive else "", next_semantic if interactive else "")
++                    values, _ = sample_actions(self.model, first, text, text_mask,
++                        p[0], p[1], states, history,
++                        num_inference_steps=self.num_inference_steps, flow_shift=self.flow_shift,
++                        use_kv_cache=self.use_kv_cache, noise=draw_noise(first, self.config), ikv_request=request)
++                mean, std = self.statistics["action"]
++                actions = values[0].float().cpu().numpy()*(std+self.config.normalization["epsilon"])+mean
++                if not np.isfinite(actions).all():
++                    raise ValueError("Policy generated nonfinite actions")
++                chunk = []
++                for row in actions[:self.replan_steps]:
++                    command, cursor = {}, 0
++                    for name, size in self.layout:
++                        command[name] = row[cursor:cursor+size].copy()
++                        cursor += size
++                    chunk.append(command)
++                # Publish KV and semantic state only after all actions validate.
++                request.commit()
++                e.semantic, e.subtask, e.cache_valid = next_semantic, next_subtask, next_valid
++                state.last_step, state.last_input_digest = e.step, fingerprint
++                state.last_input_semantics = logical_context
++                state.last_result = copy.deepcopy((chunk, e.semantic, e.subtask, e.cache_valid))
++                logger.info("HWM IKV episode=%s step=%d history=%s planner=%s budget=%d selected=%d",
++                    key, e.step, self.ikv_options.history_mode, self.ikv_options.planner_mode,
++                    request.budget, len(request.tx.selected_ids))
++                result.append(chunk)
++            except Exception:
++                if request is not None:
++                    request.abort()
++                raise
++        return result
+--- /dev/null
++++ b/policy/HWM_0_preview/tests/test_hwm_ikv.py
+@@ -0,0 +1,296 @@
++"""CPU execution tests on real HWM DiT blocks; no pretrained weights needed."""
++import importlib.util
++import subprocess
++import sys
++import types
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++import torch
++from torch import nn
++from hwm.model.ikv import IKVOptions, EpisodeIKV, HWMRequest
++from hwm.model.network import VideoDiT, ActionDiT
++from hwm.model.denoising import sample_actions
++
++
++def tiny_config():
++    return SimpleNamespace(
++        temporal_stride=4, spatial_stride=16, channels=2, planner_width=6,
++        head_grid=(2,2), tokens_per_frame=6, video_tokens=18,
++        grid=(3,3,2), latent_time_steps=24, video_shape=(2,3,6,4),
++        observation=SimpleNamespace(height=64,width=64),
++        history={"max_frames":20,"near_latents":2,"control_clock_hz":30,"sample_interval_steps":30},
++        rope={"video_axes":[4,2,2],"base":10000},
++        backbones={"text":{"d_model":6}},
++        sampler={"frequency_base":10000,"timestep_scale":1000},
++        inference_defaults={"num_inference_steps":3,"flow_shift":5.},
++        m={"history_kernels":[(1,2,2),(2,4,4),(4,8,8)],"patch_size":(1,2,2),
++           "head_dim":8,"heads":1,"video_width":8,"action_width":8,
++           "video_ffn_width":16,"action_ffn_width":16,"time_width":8,
++           "action_dim":2,"state_dim":2,"action_horizon":3,"world_queries":2,
++           "norm_eps":1e-6,"layers":2})
++
++
++class Scorer:
++    def __init__(self, prefer_old=False): self.prefer_old=prefer_old; self.calls=[]
++    def score(self,candidates,task,query_time,subtask="",memory=""):
++        self.calls.append((subtask,memory))
++        return {c.uid: (-c.time if self.prefer_old else c.time) for c in candidates}
++    def register_frame(self,*args,**kwargs):pass
++
++
++def fixture():
++    torch.manual_seed(4)
++    cfg=tiny_config()
++    network=nn.Module()
++    network.config=cfg
++    network.video=VideoDiT(cfg);network.action=ActionDiT(cfg)
++    network.state_projection=nn.Linear(2,6)
++    network.world_queries=nn.Parameter(torch.zeros(1,2,6))
++    for parameter in network.parameters(): nn.init.normal_(parameter,mean=0,std=.12)
++    network.eval()
++    inputs=(network,torch.randn(1,2,1,6,4),torch.randn(1,4,6),
++        torch.ones(1,4,dtype=torch.bool),torch.randn(1,2,6),torch.randn(1,3,6),torch.randn(1,2))
++    noise=(torch.randn(1,2,3,6,4),torch.randn(1,3,2))
++    return network,cfg,inputs,noise
++
++
++class NativeIKVTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.threads=torch.get_num_threads();torch.set_num_threads(1)
++    @classmethod
++    def tearDownClass(cls):torch.set_num_threads(cls.threads)
++
++    def test_off_path_matches_unmodified_source_bitwise(self):
++        _,cfg,args,noise=fixture()
++        root=Path(__file__).resolve().parents[3]
++        source=subprocess.check_output(["git","-C",str(root),"show","HEAD:policy/HWM_0_preview/hwm/model/denoising.py"],text=True)
++        module=types.ModuleType("hwm_native_reference")
++        sys.modules[module.__name__]=module
++        exec(compile(source,"<native git HEAD>","exec"),module.__dict__)
++        history=(torch.randn(1,2,2,4,4),torch.tensor([[-5.,0.]]))
++        for steps in (1,3):
++            actual=sample_actions(*args,history,noise=noise,num_inference_steps=steps)
++            expected=module.sample_actions(*args,history,noise=noise,num_inference_steps=steps)
++            for left,right in zip(actual,expected):self.assertTrue(torch.equal(left,right))
++
++    def test_window_refresh_all_native_members_agrees_with_native_output(self):
++        _,cfg,args,noise=fixture()
++        state=EpisodeIKV("native",cfg,IKVOptions(history_mode="window_refresh"),Scorer(),"task")
++        history=(torch.randn(1,2,2,4,4),torch.tensor([[-5.,0.]]))
++        request=HWMRequest(state,120,[-120,-90,-60,-30],"window_refresh","","")
++        actual=sample_actions(*args,history,noise=noise,ikv_request=request)
++        expected=sample_actions(*args,history,noise=noise)
++        for left,right in zip(actual,expected):torch.testing.assert_close(left,right,rtol=2e-5,atol=2e-6)
++        self.assertEqual(request.layers_seen,{0,1})
++        request.commit();self.assertEqual(len(state.bank.candidates),8)
++
++    def test_incremental_selection_changes_first_denoise_step_and_persists_real_layers(self):
++        _,cfg,args,noise=fixture()
++        outputs=[]
++        for prefer_old in (True,False):
++            state=EpisodeIKV("episode",cfg,IKVOptions(history_mode="incremental_reuse"),Scorer(prefer_old),"task")
++            first=HWMRequest(state,0,[],"incremental_reuse","","")
++            sample_actions(*args,noise=noise,num_inference_steps=1,ikv_request=first)
++            first.commit()
++            self.assertEqual(len(state.bank.candidates),4)
++            fresh=list(args);fresh[1]=args[1]+2
++            second=HWMRequest(state,30,[-30],"incremental_reuse","","")
++            output=sample_actions(*fresh,noise=noise,num_inference_steps=1,ikv_request=second)
++            outputs.append(output)
++            ids=second.tx.selected_ids
++            self.assertTrue(all((":0:" if prefer_old else ":30:") in uid for uid in ids))
++            self.assertEqual(second.layers_seen,{0,1})
++            second.commit();self.assertEqual(len(state.bank.candidates),8)
++        self.assertGreater(float((outputs[0][1]-outputs[1][1]).abs().max()),1e-7)
++        self.assertGreater(float((outputs[0][0]-outputs[1][0]).abs().max()),1e-9)
++
++    def test_failed_request_does_not_publish_partial_layer_kv(self):
++        _,cfg,args,noise=fixture()
++        state=EpisodeIKV("rollback",cfg,IKVOptions(history_mode="incremental_reuse"),Scorer(),"task")
++        request=HWMRequest(state,0,[],"incremental_reuse","","")
++        original=request.layer
++        def fail(index,*values):
++            if index==1:raise RuntimeError("injected second-stage failure")
++            return original(index,*values)
++        request.layer=fail
++        with self.assertRaisesRegex(RuntimeError,"second-stage"):
++            sample_actions(*args,noise=noise,ikv_request=request)
++        request.abort()
++        self.assertEqual(state.bank.candidates,())
++        self.assertEqual(state.positions,{})
++        retry=HWMRequest(state,0,[],"incremental_reuse","","")
++        sample_actions(*args,noise=noise,ikv_request=retry);retry.commit()
++        self.assertEqual(len(state.bank.candidates),4)
++
++
++if __name__=="__main__":unittest.main()
++
++
++class DriverTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.threads=torch.get_num_threads();torch.set_num_threads(1)
++    @classmethod
++    def tearDownClass(cls):torch.set_num_threads(cls.threads)
++
++    def driver(self,history_mode,planner_mode):
++        # Compile the real Model class while injecting only optional deployment
++        # dependencies; this executes the exact server driver methods.
++        import ast
++        import logging
++        import numpy as np
++        import hwm
++        from hwm.model.memory import encode_histories
++        from hwm.model.denoising import draw_noise,pack_history_batch,joint_mask
++        package=types.ModuleType("hwm_driver_fixture");package.__path__=[]
++        sys.modules[package.__name__]=package
++        sys.modules[package.__name__+".hwm"]=hwm
++        module=types.ModuleType("hwm_driver_fixture.model")
++        module.__package__=package.__name__
++        sys.modules[module.__name__]=module
++        root=Path(__file__).resolve().parents[1]
++        tree=ast.parse((root/"model.py").read_text())
++        definition=next(node for node in tree.body if isinstance(node,ast.ClassDef) and node.name=="Model")
++        module.__dict__.update(dict(ModelTemplate=object,torch=torch,np=np,
++            IKVOptions=IKVOptions,EpisodeIKV=EpisodeIKV,HWMRequest=HWMRequest,
++            encode_histories=encode_histories,draw_noise=draw_noise,
++            logger=logging.getLogger("hwm_test")))
++        exec(compile(ast.Module(body=[definition],type_ignores=[]),str(root/"model.py"),"exec"),module.__dict__)
++        owner=module.Model.__new__(module.Model)
++        net,cfg,args,noise=fixture();net=net.to(torch.bfloat16)
++        cfg.normalization={"epsilon":1e-6,"state_clip":(-5,5)}
++        owner.config=cfg;owner.model=net;owner.tokenizer=None
++        owner.ikv_options=IKVOptions(history_mode=history_mode,planner_mode=planner_mode)
++        owner.num_inference_steps=2;owner.flow_shift=5.;owner.replan_steps=30
++        owner.use_kv_cache=True;owner.layout=[("joints",2)]
++        owner.statistics={name:(np.zeros(2,dtype=np.float32),np.ones(2,dtype=np.float32)) for name in ("state","action")}
++        class Bridge(Scorer):
++            def fork(self):return Bridge(self.prefer_old)
++        owner.ikv_scorer=Bridge();owner.reset()
++        owner.vae_calls=[];owner.sample_calls=[];owner.nan_actions=False
++        def encode(pixels):
++            owner.vae_calls.append(tuple(pixels.shape))
++            h=6 if pixels.shape[-2]==96 else 4
++            t=(pixels.shape[2]-1)//4+1
++            return torch.ones(1,2,t,h,4,dtype=torch.bfloat16)*float(pixels.float().mean())
++        net.encode_video=encode
++        net.encode_video_text=lambda *args:(torch.zeros(1,4,6,dtype=torch.bfloat16),torch.ones(1,4,dtype=torch.bool))
++        class Planning:
++            def __init__(self):self.requests=[];self.head_encodes=[]
++            def remember_head(self,request,head,cache,key):
++                if key not in cache:self.head_encodes.append(key);cache[key]=torch.zeros(4,6)
++            def batch(self,requests):
++                self.requests.extend(requests)
++                return [(torch.zeros(1,2,6,dtype=torch.bfloat16),torch.zeros(1,3,6,dtype=torch.bfloat16),
++                    "UPDATE","observed clue","current subtask") for request in requests]
++        owner.planner=Planning()
++        def sample(network,first,text,mask,world,action,state,history=None,*,ikv_request,**kwargs):
++            packed=None if history is None else pack_history_batch(net.video.history_packing,history,cfg)
++            c=SimpleNamespace(packed=packed,mask=joint_mask(0 if packed is None else packed[0].shape[1],torch.device("cpu"),cfg))
++            ikv_request.prepare(c)
++            n=(0 if packed is None else packed[0].shape[1])+cfg.video_tokens
++            for layer in range(cfg.m["layers"]):
++                raw=torch.ones(1,n,8,dtype=torch.bfloat16)*(layer+1)
++                ikv_request.layer(layer,raw,raw+2,0 if packed is None else packed[0].shape[1])
++            owner.sample_calls.append((history,ikv_request))
++            return torch.full((1,3,2),float("nan") if owner.nan_actions else .5),first
++        module.sample_actions=sample
++        return owner
++
++    def observation(self,step=0,*,key="episode",slot="client:0",version=0,semantic="None.",subtask="None.",cache_valid=False,rpc=True):
++        import numpy as np
++        value=SimpleNamespace(step=step,current=np.full((96,64,3),step//30,dtype=np.uint8),
++            state=np.zeros(2,dtype=np.float32),instruction="task",semantic=semantic,subtask=subtask,cache_valid=cache_valid)
++        if rpc:
++            value.ikv_episode_id=key;value.ikv_slot_id=slot;value.ikv_state_version=version
++        return value
++
++    def test_four_combinations_have_independent_encoder_and_feedback_paths(self):
++        import numpy as np
++        for history in ("window_refresh","incremental_reuse"):
++            for planner in ("lower_only","interactive"):
++                with self.subTest(history=history,planner=planner):
++                    owner=self.driver(history,planner)
++                    first=self.observation();owner._predict_ikv([first],[([],[])],[0])
++                    second=self.observation(30,version=1,semantic=first.semantic,subtask=first.subtask,cache_valid=True)
++                    native=([np.zeros((64,64,3),dtype=np.uint8)],[-30])
++                    owner._predict_ikv([second],[native],[0])
++                    state=owner._ikv_episodes["episode"]
++                    if history=="incremental_reuse":
++                        self.assertEqual(len(owner.vae_calls),2)
++                        self.assertTrue(all(shape[2]==1 and shape[-2]==96 for shape in owner.vae_calls))
++                        self.assertEqual(len(owner.planner.head_encodes),2)
++                        self.assertTrue(all("feature_cache" in r for r in owner.planner.requests))
++                        self.assertIsNone(owner.sample_calls[-1][0])
++                    else:
++                        self.assertEqual(len(owner.vae_calls),3)
++                        self.assertEqual(owner.planner.head_encodes,[])
++                        self.assertTrue(all("feature_cache" not in r for r in owner.planner.requests))
++                        self.assertIsNotNone(owner.sample_calls[-1][0])
++                    if planner=="lower_only":
++                        self.assertTrue(all(call==("","") for call in state.scorer.calls))
++                        self.assertNotIn("history_offsets",owner.planner.requests[-1])
++                    else:
++                        self.assertEqual(state.scorer.calls[-1],("current subtask","observed clue."))
++                        self.assertEqual(owner.planner.requests[-1]["history_offsets"],[-30])
++
++    def test_rpc_replay_reuses_actions_and_rejects_changed_semantics(self):
++        owner=self.driver("incremental_reuse","lower_only")
++        first=self.observation();result=owner._predict_ikv([first],[([],[])],[0])
++        retry=self.observation();again=owner._predict_ikv([retry],[([],[])],[0])
++        self.assertEqual(len(owner.sample_calls),1)
++        torch.testing.assert_close(torch.as_tensor(result[0][0]["joints"]),torch.as_tensor(again[0][0]["joints"]))
++        changed=self.observation(semantic="changed context")
++        with self.assertRaisesRegex(ValueError,"replay has changed"):
++            owner._predict_ikv([changed],[([],[])],[0])
++
++    def test_legacy_get_action_can_repeat_after_own_semantic_commit(self):
++        owner=self.driver("incremental_reuse","lower_only")
++        first=self.observation(rpc=False)
++        owner._predict_ikv([first],[([],[])],[0])
++        owner._predict_ikv([first],[([],[])],[0])
++        self.assertEqual(len(owner.sample_calls),1)
++
++    def test_nan_actions_rollback_kv_and_semantics_and_retry(self):
++        owner=self.driver("incremental_reuse","interactive");owner.nan_actions=True
++        first=self.observation()
++        with self.assertRaisesRegex(ValueError,"nonfinite"):
++            owner._predict_ikv([first],[([],[])],[0])
++        state=owner._ikv_episodes["episode"]
++        self.assertEqual(state.bank.candidates,())
++        self.assertEqual((first.semantic,first.subtask,first.cache_valid),("None.","None.",False))
++        owner.nan_actions=False;owner._predict_ikv([first],[([],[])],[0])
++        self.assertEqual(len(state.bank.candidates),4)
++
++    def test_new_episode_same_client_slot_resets_old_archive(self):
++        owner=self.driver("incremental_reuse","lower_only")
++        owner._predict_ikv([self.observation()],[([],[])],[0])
++        owner._predict_ikv([self.observation(key="next")],[([],[])],[0])
++        self.assertNotIn("episode",owner._ikv_episodes)
++        self.assertEqual(len(owner._ikv_episodes["next"].bank.candidates),4)
++
++
++    def test_incremental_rejects_missing_observation_boundary(self):
++        import numpy as np
++        owner=self.driver("incremental_reuse","lower_only")
++        first=self.observation();owner._predict_ikv([first],[([],[])],[0])
++        skipped=self.observation(60,version=1,semantic=first.semantic,subtask=first.subtask,cache_valid=True)
++        history=([np.zeros((64,64,3),dtype=np.uint8),np.ones((64,64,3),dtype=np.uint8)],[-60,-30])
++        with self.assertRaisesRegex(ValueError,"cannot skip"):
++            owner._predict_ikv([skipped],[history],[0])
++        self.assertEqual(len(owner.vae_calls),1)
++
++
++    def test_dm05_incremental_alias_is_canonical_and_mode_switch_resets(self):
++        options={"history_mode":"incremental","planner_mode":"interactive"}
++        self.assertEqual(IKVOptions.parse(options).history_mode,"incremental_reuse")
++        self.assertEqual(options["history_mode"],"incremental")
++        owner=self.driver("window_refresh","lower_only")
++        owner._predict_ikv([self.observation()],[([],[])],[0])
++        owner.set_ikv_modes(history_mode="incremental",planner_mode="interactive")
++        self.assertEqual(owner.ikv_options.history_mode,"incremental_reuse")
++        self.assertEqual(owner.ikv_options.planner_mode,"interactive")
++        self.assertEqual(owner._ikv_episodes,{})
+--- /dev/null
++++ b/policy/HWM_0_preview/tests/test_hwm_review.py
+@@ -0,0 +1,203 @@
++"""Independent HWM IKV budget, provenance and mask contract checks."""
++import unittest
++from types import SimpleNamespace
++import numpy as np
++import torch
++from hwm.model.ikv import IKVOptions, EpisodeIKV, HWMRequest, native_history_budget
++from hwm.model.network import HistoryProjection
++from hwm.model.denoising import pack_history_batch, joint_mask, video_rope, rotate
++
++
++def config():
++    return SimpleNamespace(
++        temporal_stride=4, spatial_stride=16, channels=2,
++        head_grid=(8,10), tokens_per_frame=120, video_tokens=360,
++        grid=(3,12,10), latent_time_steps=24,
++        observation=SimpleNamespace(height=256,width=320),
++        history={"max_frames":20,"near_latents":2,"control_clock_hz":30},
++        rope={"video_axes":[4,2,2],"base":10000},
++        m={"history_kernels":[(1,2,2),(2,4,4),(4,8,8)],
++           "patch_size":(1,2,2),"head_dim":8,"heads":1,
++           "video_width":8,"action_horizon":48,"layers":1},
++    )
++
++
++class Recorder:
++    def __init__(self):self.calls=[];self.frames={};self.fail=False
++    def register_frame(self,frame_id,time,images):
++        if self.fail:raise RuntimeError("encoder failure")
++        self.frames[frame_id]=(time,images)
++    def score(self,candidates,task,query_time,subtask="",memory=""):
++        self.calls.append(dict(ids=[c.uid for c in candidates],task=task,
++                               time=query_time,subtask=subtask,memory=memory))
++        return {c.uid:-c.time for c in candidates}
++
++
++def cache(cfg, packed=None):
++    n=0 if packed is None else packed[0].shape[1]
++    return SimpleNamespace(packed=packed,mask=joint_mask(n,torch.device("cpu"),cfg))
++
++
++def episode(cfg,mode="incremental_reuse",planner="lower_only"):
++    scorer=Recorder()
++    options=IKVOptions(history_mode=mode,planner_mode=planner)
++    return EpisodeIKV("review",cfg,options,scorer,"place red cup")
++
++
++class HWMReview(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.old_threads=torch.get_num_threads();torch.set_num_threads(1)
++    @classmethod
++    def tearDownClass(cls):torch.set_num_threads(cls.old_threads)
++
++    def test_all_four_enabled_configurations_are_independent(self):
++        for history in ("window_refresh","incremental_reuse"):
++            for planner in ("lower_only","interactive"):
++                with self.subTest(history=history,planner=planner):
++                    value=IKVOptions.parse({"history_mode":history,"planner_mode":planner})
++                    self.assertEqual((value.history_mode,value.planner_mode),(history,planner))
++        self.assertEqual(IKVOptions.parse(None).history_mode,"off")
++        with self.assertRaises(ValueError):IKVOptions.parse({"history_mode":"off","planner_mode":"interactive"})
++        with self.assertRaises(ValueError):IKVOptions.parse({"history_mode":"silently_typo"})
++        with self.assertRaises(ValueError):IKVOptions.parse({"share_encoder":True})
++
++    def test_every_warmup_budget_matches_actual_native_conv_packing(self):
++        cfg=config();projection=HistoryProjection(cfg).eval()
++        expected={0:0,1:80,3:80,4:160,7:160,8:180,15:180,16:186,20:186}
++        self.assertEqual(native_history_budget(0,cfg),0)
++        for count in range(1,21):
++            length=count//4+1
++            latents=torch.randn(1,cfg.channels,length,16,20)
++            times=torch.arange(length,dtype=torch.float32)[None]
++            packed=pack_history_batch(projection,(latents,times),cfg)
++            self.assertEqual(native_history_budget(count,cfg),packed[0].shape[1])
++            if count in expected:self.assertEqual(packed[0].shape[1],expected[count])
++
++    def test_window_metadata_covers_actual_native_tokens_and_causal_sources(self):
++        cfg=config();projection=HistoryProjection(cfg).eval();ep=episode(cfg,"window_refresh")
++        for count in range(1,21):
++            step=count*30
++            offsets=list(range(-count*30,0,30))
++            request=HWMRequest(ep,step,offsets,"window_refresh","","")
++            length=count//4+1
++            packed=pack_history_batch(projection,(torch.zeros(1,2,length,16,20),torch.arange(length)[None]),cfg)
++            candidates,freqs=request._packed_candidates(packed)
++            self.assertEqual(len(candidates),packed[0].shape[1])
++            self.assertEqual(len({c.uid for c in candidates}),len(candidates))
++            self.assertTrue(all(c.time<=step/30 for c in candidates))
++            self.assertTrue(all(sum(r.weight for r in c.regions)>0 for c in candidates))
++            self.assertTrue(torch.equal(freqs,packed[1][0,:,0]))
++
++    def test_incremental_old_keys_keep_spatial_coordinates_and_age_in_native_units(self):
++        cfg=config();ep=episode(cfg)
++        first=HWMRequest(ep,0,[],"incremental_reuse","","")
++        first_cache=cache(cfg);first.prepare(first_cache)
++        raw=torch.arange(360*8,dtype=torch.float32).reshape(1,360,8)/100
++        first.layer(0,raw,raw+7,0);first.commit()
++        self.assertEqual(len(ep.bank.candidates),80)
++        second=HWMRequest(ep,30,[-30],"incremental_reuse","","")
++        second_cache=cache(cfg);second.prepare(second_cache)
++        actual_key,actual_value=second.layer(0,raw+100,raw+200,0)
++        expected_freq=video_rope(torch.tensor([-30/24]),8,10,cfg).reshape(1,80,1,4)
++        torch.testing.assert_close(second.selected_freqs,expected_freq,atol=1e-7,rtol=1e-7)
++        torch.testing.assert_close(actual_key,rotate(raw[:,:80],expected_freq,cfg))
++        torch.testing.assert_close(actual_value,(raw[:,:80]+7).unflatten(-1,(1,8)).transpose(1,2))
++        second.commit()
++        self.assertEqual(len(ep.bank.candidates),160)
++
++    def test_incremental_mask_allows_video_history_but_never_action_history(self):
++        cfg=config();ep=episode(cfg)
++        # One native history frame provides an 80-slot budget, while the
++        # incremental query stream contains only current/future video and action.
++        req=HWMRequest(ep,30,[-30],"incremental_reuse","","")
++        c=cache(cfg);req.prepare(c)
++        mask=c.mask
++        self.assertEqual(tuple(mask.shape),(1,1,408,488))
++        self.assertTrue(bool(mask[0,0,:80,:80].all()))
++        self.assertFalse(bool(mask[0,0,80:120,:80].any()))
++        self.assertFalse(bool(mask[0,0,360:,:80].any()))
++        self.assertTrue(bool(mask[0,0,360:,80:].all()))
++        req.abort()
++
++    def test_registration_failure_is_retryable_without_partial_rgb_publication(self):
++        cfg=config();ep=episode(cfg)
++        ep.scorer.fail=True
++        image=np.zeros((256,320,3),dtype=np.uint8)
++        with self.assertRaisesRegex(RuntimeError,"encoder failure"):ep._register_head(0,image)
++        self.assertNotIn(0,ep.frames)
++        ep.scorer.fail=False;ep._register_head(0,image)
++        self.assertIn(ep.frame_id(0),ep.scorer.frames)
++
++    def test_lower_only_preserves_native_planner_history_without_scoring(self):
++        cfg=config();ep=episode(cfg,planner="lower_only")
++        native=([np.zeros((256,320,3),dtype=np.uint8)],[-30])
++        self.assertIs(ep.planner_history(30,native,"pick","seen"),native)
++        self.assertEqual(ep.scorer.calls,[])
++
++    def test_interactive_planner_can_retrieve_older_than_native_twenty_seconds(self):
++        cfg=config();ep=episode(cfg,planner="interactive")
++        for step in range(0,931,30):
++            ep._register_head(step,np.full((256,320,3),step//30,dtype=np.uint8))
++        native_steps=list(range(330,930,30))
++        native=([ep.frames[s] for s in native_steps],[s-930 for s in native_steps])
++        frames,offsets=ep.planner_history(930,native,"find cup","cup was red")
++        self.assertEqual(len(frames),20)
++        self.assertEqual(offsets[0],-930)
++        self.assertLess(offsets[0],-600)
++        self.assertEqual(ep.scorer.calls[-1]["subtask"],"find cup")
++        self.assertEqual(ep.scorer.calls[-1]["memory"],"cup was red")
++        self.assertEqual(offsets,sorted(offsets))
++
++
++class NativeVision:
++    def __init__(self):self.batches=[]
++    def get_image_features(self,pixels,grids,return_dict=True):
++        self.batches.append(grids.detach().cpu().clone())
++        values=[];cursor=0
++        for grid in grids:
++            count=int(grid.prod());color=float(pixels[cursor,0])
++            n=count//4
++            values.append(torch.arange(n*3,dtype=torch.float32).reshape(n,3)+color)
++            cursor+=count
++        return SimpleNamespace(pooler_output=values)
++
++
++def visual_input(grids,colors):
++    tensors=[torch.full((int(torch.tensor(g).prod()),1),float(color)) for g,color in zip(grids,colors)]
++    return {"image_grid_thw":torch.tensor(grids),"pixel_values":torch.cat(tensors)}
++
++
++class PlannerFeatureReview(unittest.TestCase):
++    def test_native_features_are_cached_before_pooling_and_reused_without_scorer(self):
++        from hwm.model.planner import Planner
++        vision=NativeVision()
++        planner=Planner.__new__(Planner)
++        planner.network=SimpleNamespace(world_queries=torch.zeros(1),
++            vlm=SimpleNamespace(model=vision))
++        planner.config=SimpleNamespace(planner_width=3)
++        planner.vision_encode_batch_size=128
++        planner.merge_size=2;planner.pool_grid=(4,4);planner.pool_tokens=16
++        features={}
++        # Current mosaic and standalone head are distinct native images.
++        planner._images_many([visual_input([[1,16,24]],[10])],[0],[features],[[('f0','mosaic')]])
++        planner._images_many([visual_input([[1,16,16]],[10])],[0],[features],[[('f0','head')]])
++        self.assertEqual(features[('f0','mosaic')].shape[0],96)
++        self.assertEqual(features[('f0','head')].shape[0],64)
++        request=visual_input([[1,16,16],[1,16,24]],[10,20])
++        keys=[[('f0','head'),('f1','mosaic')]]
++        result=planner._images_many([request],[1],[features],keys)[0]
++        # Only f1 mosaic was encoded in the third call.
++        self.assertEqual([len(x) for x in vision.batches],[1,1,1])
++        self.assertEqual(vision.batches[-1].tolist(),[[1,16,24]])
++        self.assertEqual(result.shape,(112,3))
++        self.assertEqual(features[('f0','head')].shape[0],64)
++        again=planner._images_many([request],[1],[features],keys)[0]
++        self.assertEqual(len(vision.batches),3)
++        self.assertTrue(torch.equal(result,again))
++        native=planner._images_many([request],[1])[0]
++        self.assertTrue(torch.equal(native,result))
++        self.assertEqual(len(vision.batches[-1]),2)
++
++
++if __name__=="__main__":unittest.main()
